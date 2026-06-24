@@ -154,6 +154,9 @@ The `postmortem/` directory records design decisions and lessons learned. Read
 relevant records before significant workflow, architecture, or integration
 changes.
 
+Name postmortem files with a three-digit sequence number followed by a short
+slug, for example `001-helper-boundary.md`. Do not use date-prefixed filenames.
+
 Write a postmortem when:
 
 - adding or changing a user-visible workflow;

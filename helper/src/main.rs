@@ -8,7 +8,9 @@ use serde_json::{json, Value};
 use std::env;
 use std::path::PathBuf;
 use std::process;
-use ytmusic::{browse, browse_id as browse_detail, search, BrowseTarget};
+use ytmusic::{
+    bootstrap_cache_path, browse, browse_id as browse_detail, continuation, search, BrowseTarget,
+};
 
 const SCHEMA_VERSION: u32 = 1;
 const DEFAULT_DIA_CDP_PORT: u16 = 29317;
@@ -36,6 +38,9 @@ enum Command {
         browse_id: String,
         params: Option<String>,
     },
+    Continuation {
+        token: String,
+    },
     Search {
         query: String,
     },
@@ -47,6 +52,7 @@ struct Options {
     auth_file: Option<PathBuf>,
     limit: usize,
     mock_data: bool,
+    initial_only: bool,
 }
 
 #[derive(Serialize)]
@@ -136,22 +142,43 @@ where
                 }
             })
         }
-        Command::Browse(target) if options.mock_data => mock_browse(target, options.limit),
+        Command::Browse(target) if options.mock_data => {
+            mock_browse(target, options.limit, options.initial_only)
+        }
         Command::Browse(target) => {
-            let auth = AuthConfig::load(required_auth_path(&options)?)?;
-            browse(target, options.limit, &auth)?
+            let (auth, cache_path) = load_auth_with_cache_path(&options)?;
+            browse(
+                target,
+                options.limit,
+                &auth,
+                options.initial_only,
+                Some(&cache_path),
+            )?
         }
         Command::BrowseId { browse_id, .. } if options.mock_data => {
             mock_browse_id(browse_id, options.limit)
         }
         Command::BrowseId { browse_id, params } => {
-            let auth = AuthConfig::load(required_auth_path(&options)?)?;
-            browse_detail(browse_id, params.as_deref(), options.limit, &auth)?
+            let (auth, cache_path) = load_auth_with_cache_path(&options)?;
+            browse_detail(
+                browse_id,
+                params.as_deref(),
+                options.limit,
+                &auth,
+                Some(&cache_path),
+            )?
+        }
+        Command::Continuation { token } if options.mock_data => {
+            mock_continuation(token, options.limit)
+        }
+        Command::Continuation { token } => {
+            let (auth, cache_path) = load_auth_with_cache_path(&options)?;
+            continuation(token, options.limit, &auth, Some(&cache_path))?
         }
         Command::Search { query } if options.mock_data => mock_search(query, options.limit),
         Command::Search { query } => {
-            let auth = AuthConfig::load(required_auth_path(&options)?)?;
-            search(query, options.limit, &auth)?
+            let (auth, cache_path) = load_auth_with_cache_path(&options)?;
+            search(query, options.limit, &auth, Some(&cache_path))?
         }
     };
     serde_json::to_string(&Envelope {
@@ -170,6 +197,14 @@ fn required_auth_path(options: &Options) -> Result<&std::path::Path, String> {
         .ok_or_else(|| "missing --auth FILE".to_string())
 }
 
+fn load_auth_with_cache_path(options: &Options) -> Result<(AuthConfig, PathBuf), String> {
+    let auth_path = required_auth_path(options)?;
+    Ok((
+        AuthConfig::load(auth_path)?,
+        bootstrap_cache_path(auth_path),
+    ))
+}
+
 fn parse_args<I>(args: I) -> Result<Options, String>
 where
     I: IntoIterator,
@@ -184,6 +219,7 @@ where
         "auth" => parse_auth_command(&mut args)?,
         "browse" => parse_browse_command(&mut args)?,
         "browse-id" => parse_browse_id_command(&mut args)?,
+        "continuation" => parse_continuation_command(&mut args)?,
         "search" => parse_search_command(&mut args)?,
         "help" | "--help" | "-h" => return Err(usage()),
         other => return Err(format!("unknown command `{other}`")),
@@ -200,6 +236,7 @@ where
     let mut restart = false;
     let mut yt_dlp = "yt-dlp".to_string();
     let mut browse_params = None;
+    let mut initial_only = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -235,6 +272,7 @@ where
                 }
                 browse_params = Some(value.to_string());
             }
+            "--initial-only" => initial_only = true,
             other => return Err(format!("unknown option `{other}`")),
         }
         index += 1;
@@ -242,7 +280,7 @@ where
 
     let command = match command {
         Command::AuthImportBrowser { .. } => {
-            if input.is_some() || browse_params.is_some() {
+            if input.is_some() || browse_params.is_some() || initial_only {
                 return Err("header import options require `auth import-headers`".to_string());
             }
             if port.is_some() || app.is_some() || restart {
@@ -261,6 +299,7 @@ where
                 || restart
                 || yt_dlp != "yt-dlp"
                 || browse_params.is_some()
+                || initial_only
             {
                 return Err("browser options require `auth import-browser`".to_string());
             }
@@ -270,7 +309,11 @@ where
             }
         }
         Command::AuthImportDia { .. } => {
-            if browser.is_some() || input.is_some() || yt_dlp != "yt-dlp" || browse_params.is_some()
+            if browser.is_some()
+                || input.is_some()
+                || yt_dlp != "yt-dlp"
+                || browse_params.is_some()
+                || initial_only
             {
                 return Err("non-Dia import options require their matching auth action".to_string());
             }
@@ -289,6 +332,7 @@ where
                 || app.is_some()
                 || restart
                 || yt_dlp != "yt-dlp"
+                || initial_only
             {
                 return Err("auth import options require an auth import action".to_string());
             }
@@ -296,6 +340,23 @@ where
                 browse_id,
                 params: browse_params,
             }
+        }
+        Command::Browse(target) => {
+            if browser.is_some()
+                || input.is_some()
+                || output.is_some()
+                || port.is_some()
+                || app.is_some()
+                || restart
+                || yt_dlp != "yt-dlp"
+                || browse_params.is_some()
+            {
+                return Err("auth import options require an auth import action".to_string());
+            }
+            if initial_only && !matches!(target, BrowseTarget::Home) {
+                return Err("--initial-only is only supported for browse home".to_string());
+            }
+            Command::Browse(target)
         }
         other => {
             if browser.is_some()
@@ -306,6 +367,7 @@ where
                 || restart
                 || yt_dlp != "yt-dlp"
                 || browse_params.is_some()
+                || initial_only
             {
                 return Err("auth import options require an auth import action".to_string());
             }
@@ -318,6 +380,7 @@ where
         auth_file,
         limit,
         mock_data,
+        initial_only,
     })
 }
 
@@ -379,6 +442,17 @@ fn parse_browse_id_command(args: &mut Vec<String>) -> Result<Command, String> {
     })
 }
 
+fn parse_continuation_command(args: &mut Vec<String>) -> Result<Command, String> {
+    let Some(token) = args.first().cloned() else {
+        return Err("expected continuation token".to_string());
+    };
+    args.remove(0);
+    if token.trim().is_empty() {
+        return Err("continuation token must not be empty".to_string());
+    }
+    Ok(Command::Continuation { token })
+}
+
 fn parse_search_command(args: &mut Vec<String>) -> Result<Command, String> {
     let Some(query) = args.first().cloned() else {
         return Err("expected search query".to_string());
@@ -404,19 +478,23 @@ fn usage() -> String {
         "  ytm-radio-helper auth import-browser --browser BROWSER --output FILE [--yt-dlp PROGRAM]",
         "  ytm-radio-helper auth import-headers --input FILE --output FILE",
         "  ytm-radio-helper auth import-dia --output FILE [--port N] [--app PATH] [--restart]",
-        "  ytm-radio-helper browse home|explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N]",
-        "  ytm-radio-helper browse home|explore|library|library-songs|library-albums|library-artists|library-playlists|liked --mock [--limit N]",
+        "  ytm-radio-helper browse home --auth FILE [--limit N] [--initial-only]",
+        "  ytm-radio-helper browse home --mock [--limit N] [--initial-only]",
+        "  ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N]",
+        "  ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --mock [--limit N]",
         "  ytm-radio-helper browse-id BROWSE_ID --auth FILE [--params PARAMS] [--limit N]",
         "  ytm-radio-helper browse-id BROWSE_ID --mock [--params PARAMS] [--limit N]",
+        "  ytm-radio-helper continuation TOKEN --auth FILE [--limit N]",
+        "  ytm-radio-helper continuation TOKEN --mock [--limit N]",
         "  ytm-radio-helper search QUERY --auth FILE [--limit N]",
         "  ytm-radio-helper search QUERY --mock [--limit N]",
     ]
     .join("\n")
 }
 
-fn mock_browse(target: &BrowseTarget, limit: usize) -> Value {
+fn mock_browse(target: &BrowseTarget, limit: usize, initial_only: bool) -> Value {
     if matches!(target, BrowseTarget::Home) {
-        return mock_home_browse(limit);
+        return mock_home_browse(limit, initial_only);
     }
     if matches!(target, BrowseTarget::Explore) {
         return mock_explore_browse(limit);
@@ -576,7 +654,7 @@ fn mock_search(query: &str, limit: usize) -> Value {
 }
 
 fn mock_library_browse(limit: usize) -> Value {
-    let songs = mock_browse(&BrowseTarget::LibrarySongs, limit)
+    let songs = mock_browse(&BrowseTarget::LibrarySongs, limit, false)
         .pointer("/sources/0")
         .cloned()
         .unwrap_or(Value::Null);
@@ -617,7 +695,7 @@ fn mock_library_browse(limit: usize) -> Value {
     json!({ "sources": [songs, albums, playlists] })
 }
 
-fn mock_home_browse(limit: usize) -> Value {
+fn mock_home_browse(limit: usize, initial_only: bool) -> Value {
     let item_limit = limit.clamp(1, 2);
     let mut listen_again = vec![json!({
         "type": "track",
@@ -641,15 +719,16 @@ fn mock_home_browse(limit: usize) -> Value {
             "thumbnail-url": null
         }));
     }
-    json!({
-        "sources": [{
+    let mut sources = vec![json!({
             "id": "ytm:home:mock:listen-again",
             "kind": "youtube-music-home-section",
             "title": "Listen again",
             "url": "ytm://home/mock",
             "items": listen_again,
             "continuation": null
-        }, {
+    })];
+    if !initial_only {
+        sources.push(json!({
             "id": "ytm:home:mock:mixed-for-you",
             "kind": "youtube-music-home-section",
             "title": "Mixed for you",
@@ -665,8 +744,42 @@ fn mock_home_browse(limit: usize) -> Value {
                 "thumbnail-url": null
             }],
             "continuation": null
-        }]
+        }));
+    }
+    json!({
+        "sources": sources,
+        "continuation": if initial_only { Some("mock-home-more") } else { None::<&str> }
     })
+}
+
+fn mock_continuation(token: &str, _limit: usize) -> Value {
+    if token == "mock-home-more" {
+        json!({
+            "sources": [{
+                "id": "ytm:home:mock:mixed-for-you",
+                "kind": "youtube-music-home-section",
+                "title": "Mixed for you",
+                "url": "ytm://home/mock",
+                "items": [{
+                    "type": "playlist",
+                    "id": "mock-mix",
+                    "title": "Mock Mix",
+                    "url": "https://music.youtube.com/playlist?list=mock-mix",
+                    "browse-id": "VLmock-mix",
+                    "playlist-id": "mock-mix",
+                    "subtitle": "Playlist",
+                    "thumbnail-url": null
+                }],
+                "continuation": null
+            }],
+            "continuation": null
+        })
+    } else {
+        json!({
+            "sources": [],
+            "continuation": null
+        })
+    }
 }
 
 fn mock_explore_browse(limit: usize) -> Value {
@@ -783,7 +896,33 @@ mod tests {
                 auth_file: None,
                 limit: 2,
                 mock_data: true,
+                initial_only: false,
             }
+        );
+    }
+
+    #[test]
+    fn parses_home_initial_only_command() {
+        let options =
+            parse_args(["browse", "home", "--mock", "--initial-only", "--limit", "2"]).unwrap();
+        assert_eq!(
+            options,
+            Options {
+                command: Command::Browse(BrowseTarget::Home),
+                auth_file: None,
+                limit: 2,
+                mock_data: true,
+                initial_only: true,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_initial_only_for_non_home_browse() {
+        let error = parse_args(["browse", "explore", "--initial-only", "--mock"]).unwrap_err();
+        assert_eq!(
+            error,
+            "--initial-only is only supported for browse home".to_string()
         );
     }
 
@@ -815,6 +954,7 @@ mod tests {
                 auth_file: None,
                 limit: 5,
                 mock_data: true,
+                initial_only: false,
             }
         );
     }
@@ -844,6 +984,24 @@ mod tests {
                 auth_file: None,
                 limit: 2,
                 mock_data: true,
+                initial_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_continuation_command() {
+        let options = parse_args(["continuation", "next-page", "--mock", "--limit", "3"]).unwrap();
+        assert_eq!(
+            options,
+            Options {
+                command: Command::Continuation {
+                    token: "next-page".to_string()
+                },
+                auth_file: None,
+                limit: 3,
+                mock_data: true,
+                initial_only: false,
             }
         );
     }

@@ -47,8 +47,12 @@ and useful.
 
 - Empty startup must show the browser shell and useful import actions, not a URL
   prompt.
-- Tabs should use the stable top-level vocabulary: Home, Explore, Library, and
-  Search.
+- Root views should use the stable top-level vocabulary: Home, Explore, and
+  Library. Search is a command-driven view entered with `/`, not a persistent
+  top-level tab.
+- The browser buffer should use `header-line-format` for the current view and
+  lightweight loading status. The rendered buffer body should start with
+  content, not a tab strip.
 - Section rows should distinguish item type visually while keeping the title
   and metadata aligned for keyboard scanning.
 - Item links should use text properties for actions and data; behavior must not

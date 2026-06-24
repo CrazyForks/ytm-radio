@@ -70,14 +70,17 @@ Load the Emacs package:
 ```
 
 Opening `M-x ytm-radio` does not prompt for a URL when the catalog is empty.
-Use `A` once for login, then `r`, `L`, `/`, or `a` to import account pages,
-search, or add a URL.
+Use `A` once for login, then `H`, `E`, `L`, `/`, or `a` to browse account
+pages, search, or add a URL.
 
 The main `*ytm-radio*` buffer is the YouTube Music browser. It renders Home,
 Explore, Library, Search, and URL-backed pages as vertical Emacs sections with
 compact track/card rows. Home, Explore, and Library sections preserve YouTube
 Music modules such as listen-again, mixed-for-you, albums, playlists, artists,
 and liked music when the web response includes them.
+Home, Explore, and Library use cached sections first and only load asynchronously
+when a view has no cached data or when explicitly refreshed. Home continuation
+pages load lazily when the visible Home buffer reaches the rendered end.
 
 The child frame is a ytr-style now-playing surface. It fits itself to the
 current cover image, shows title, artist, time, and progress, and exposes the
@@ -97,13 +100,23 @@ elsewhere:
       "/absolute/path/to/ytm-radio-helper")
 ```
 
+Run `M-x ytm-radio-doctor` when playback, login import, or account browsing
+does not start. It reports whether the helper, `mpv`, `yt-dlp`, the runtime
+directory, and the auth file are visible from Emacs.
+
 ## Commands
 
 - `M-x ytm-radio` opens the YouTube Music browser buffer.
+- `M-x ytm-radio-doctor` shows a setup diagnostic report.
+- `M-x ytm-radio-home` switches to Home.
+- `M-x ytm-radio-explore` switches to Explore.
+- `M-x ytm-radio-library` switches to Library.
 - `M-x ytm-radio-auth-import` imports a logged-in browser session.
 - `M-x ytm-radio-add-url` adds a YouTube or YouTube Music URL.
 - `M-x ytm-radio-import-ytmusic-library` imports library sources.
 - `M-x ytm-radio-import-ytmusic-home` imports home recommendations.
+- `M-x ytm-radio-more` opens hidden items in the current section.
+- `M-x ytm-radio-load-more-home` imports the next Home continuation page.
 - `M-x ytm-radio-import-ytmusic-explore` imports explore sections.
 - `M-x ytm-radio-import-ytmusic-liked` imports liked songs.
 - `M-x ytm-radio-refresh` refreshes the current browser view.
@@ -112,7 +125,7 @@ elsewhere:
 - `M-x ytm-radio-play-track` selects a known track.
 - `M-x ytm-radio-play-source` selects a known source.
 - `M-x ytm-radio-toggle-pause` toggles mpv pause.
-- `M-x ytm-radio-cycle-repeat` cycles repeat off, list, and one.
+- `M-x ytm-radio-cycle-repeat` cycles repeat off, all, and one.
 - `M-x ytm-radio-toggle-shuffle` toggles shuffle playback.
 - `M-x ytm-radio-stop` stops playback.
 - `M-x ytm-radio-next` plays the next track.
@@ -120,6 +133,8 @@ elsewhere:
 - `M-x ytm-radio-share` copies the current track URL.
 - `M-x ytm-radio-seek-forward` seeks forward.
 - `M-x ytm-radio-seek-backward` seeks backward.
+- `M-x ytm-radio-hide-browser` hides the browser buffer.
+- `M-x ytm-radio-hide-now-playing` hides the now-playing child frame.
 - `M-x ytm-radio-hide` hides ytm-radio UI.
 
 Inside the browser buffer:
@@ -129,16 +144,17 @@ Inside the browser buffer:
 | `A` | Import browser login |
 | `a` | Add URL |
 | `c` | Show cover child frame |
-| `E` | Import YouTube Music explore sections |
-| `L` | Import YouTube Music library |
+| `H` | Switch to Home |
+| `E` | Switch to Explore |
+| `L` | Switch to Library |
 | `i` | Import liked songs |
-| `r` | Import YouTube Music home recommendations |
 | `/` | Search YouTube Music |
-| `RET`, `o`, `l` | Play a track or open the item/source at point |
+| `RET` | Play a track or open the item/source at point |
 | `j`, `k`, `Down`, `Up` | Move between item rows |
+| `m` | Open more items for the current section |
 | `g` | Refresh the current browser view |
 | `TAB`, `S-TAB` | Move between sections |
-| `b`, `h` | Return to the previous browser view |
+| `b` | Return to the previous browser view |
 | `s` | Play source at point, or select a source |
 | `SPC` | Toggle pause |
 | `n` | Next track |
@@ -146,7 +162,7 @@ Inside the browser buffer:
 | `S` | Copy current track URL |
 | `f` | Seek forward |
 | `B` | Seek backward |
-| `q` | Hide ytm-radio UI |
+| `q` | Hide the browser buffer |
 
 Use `M-x imenu` in Home, Explore, or Library to jump between rendered
 sections.
@@ -161,7 +177,7 @@ Inside the now-playing child frame:
 | `r` | Cycle repeat mode |
 | `s` | Toggle shuffle |
 | `S` | Copy current track URL |
-| `q` | Hide ytm-radio UI |
+| `q` | Hide the child frame |
 
 ## Helper Contract
 
@@ -172,17 +188,22 @@ ytm-radio-helper auth check --auth FILE
 ytm-radio-helper auth import-dia --output FILE [--port N] [--app PATH] [--restart]
 ytm-radio-helper auth import-browser --browser BROWSER --output FILE [--yt-dlp PROGRAM]
 ytm-radio-helper auth import-headers --input FILE --output FILE
-ytm-radio-helper browse home|explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N]
-ytm-radio-helper browse home|explore|library|library-songs|library-albums|library-artists|library-playlists|liked --mock [--limit N]
+ytm-radio-helper browse home --auth FILE [--limit N] [--initial-only]
+ytm-radio-helper browse home --mock [--limit N] [--initial-only]
+ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N]
+ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --mock [--limit N]
 ytm-radio-helper browse-id BROWSE_ID --auth FILE [--params PARAMS] [--limit N]
 ytm-radio-helper browse-id BROWSE_ID --mock [--params PARAMS] [--limit N]
+ytm-radio-helper continuation TOKEN --auth FILE [--limit N]
+ytm-radio-helper continuation TOKEN --mock [--limit N]
 ytm-radio-helper search QUERY --auth FILE [--limit N]
 ytm-radio-helper search QUERY --mock [--limit N]
 ```
 
 For `home`, `explore`, and `library`, the helper preserves YouTube Music
-sections and returns each section as a source. Home follows continuation pages so
-modules below the first viewport are included. The limit applies per section.
+sections and returns each section as a source. `browse home --initial-only`
+returns only the first Home page plus a continuation token. `continuation TOKEN`
+loads the next Home section page. The limit applies per section.
 The explicit library subtargets return focused sources for songs, albums,
 artists, playlists, and liked music. `search` returns a source containing mixed
 result items.
@@ -237,10 +258,12 @@ The default output is:
 ```
 
 Runtime data defaults to `~/.ytm-radio/`: `auth.json` stores the helper session,
+`bootstrap-cache.json` stores non-secret YouTube Music client bootstrap data,
 `state.eld` stores imported sources and the last track, and `covers/` caches
-cover images. If default `~/.emacs.d/ytm-radio/auth.json` or `state.eld` files
-already exist from an older checkout, ytm-radio copies them into the new
-directory on first startup.
+cover images. The helper refreshes `bootstrap-cache.json` automatically when it
+is missing, invalid, or older than 12 hours. If default
+`~/.emacs.d/ytm-radio/auth.json` or `state.eld` files already exist from an
+older checkout, ytm-radio copies them into the new directory on first startup.
 
 Browser or macOS Keychain permission prompts may appear during import. Close
 the browser first if its cookie database is locked.
@@ -307,6 +330,10 @@ custom location:
 The auth file may contain account session material. Keep it out of git and
 never store its contents in Emacs state.
 
+Set `YTM_RADIO_TIMINGS=1` before starting Emacs to make the Rust helper print
+bootstrap and YouTube Music request timings to stderr. Successful helper stdout
+remains machine-readable JSON.
+
 ## Protocol References
 
 - [yt-dlp browser cookie extraction](https://github.com/yt-dlp/yt-dlp#filesystem-options)
@@ -328,6 +355,19 @@ Configure mpv's ytdl hook:
 (setq ytm-radio-ytdl-raw-options
       '("cookies-from-browser=chrome"))
 ```
+
+ytm-radio enables a conservative mpv network cache by default for long YouTube
+Music tracks:
+
+```elisp
+(setq ytm-radio-mpv-network-cache-args
+      '("--cache=yes"
+        "--demuxer-readahead-secs=60"
+        "--demuxer-max-bytes=256MiB"))
+```
+
+Set `ytm-radio-mpv-extra-args` to override these values when needed. Extra args
+are passed after the default cache args, so mpv's later option wins.
 
 ## Development
 

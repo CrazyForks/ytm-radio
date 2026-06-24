@@ -1,15 +1,23 @@
 use crate::auth::AuthConfig;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, USER_AGENT};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
+use std::env;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const YTM_ORIGIN: &str = "https://music.youtube.com";
 const HOME_CONTINUATION_PAGE_LIMIT: usize = 8;
+const BOOTSTRAP_CACHE_SCHEMA_VERSION: u32 = 1;
+const BOOTSTRAP_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
+const TIMINGS_ENV: &str = "YTM_RADIO_TIMINGS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowseTarget {
@@ -31,19 +39,29 @@ const LIBRARY_TARGETS: [BrowseTarget; 5] = [
     BrowseTarget::Liked,
 ];
 
-pub fn browse(target: &BrowseTarget, limit: usize, auth: &AuthConfig) -> Result<Value, String> {
+pub fn browse(
+    target: &BrowseTarget,
+    limit: usize,
+    auth: &AuthConfig,
+    initial_only: bool,
+    bootstrap_cache: Option<&Path>,
+) -> Result<Value, String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("cannot create HTTP client: {error}"))?;
-    let bootstrap = bootstrap(&client, auth)?;
+    let bootstrap = bootstrap_with_cache(&client, auth, bootstrap_cache)?;
     if matches!(target, BrowseTarget::Library) {
         return browse_library(&client, auth, &bootstrap, limit);
     }
     let response = request_browse(&client, auth, &bootstrap, target)?;
     if matches!(target, BrowseTarget::Home) {
-        let responses = request_home_continuations(&client, auth, &bootstrap, response)?;
-        Ok(normalize_sectioned_responses(target, limit, &responses))
+        if initial_only {
+            Ok(normalize_sectioned_response(target, limit, &response))
+        } else {
+            let responses = request_home_continuations(&client, auth, &bootstrap, response)?;
+            Ok(normalize_sectioned_responses(target, limit, &responses))
+        }
     } else if matches!(target, BrowseTarget::Explore) {
         Ok(normalize_sectioned_response(target, limit, &response))
     } else {
@@ -51,36 +69,173 @@ pub fn browse(target: &BrowseTarget, limit: usize, auth: &AuthConfig) -> Result<
     }
 }
 
-pub fn browse_id(
-    browse_id: &str,
-    params: Option<&str>,
+pub fn continuation(
+    token: &str,
     limit: usize,
     auth: &AuthConfig,
+    bootstrap_cache: Option<&Path>,
 ) -> Result<Value, String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("cannot create HTTP client: {error}"))?;
-    let bootstrap = bootstrap(&client, auth)?;
-    let response = request_browse_id(&client, auth, &bootstrap, browse_id, params)?;
-    Ok(normalize_browse_id_response(browse_id, limit, &response))
+    let bootstrap = bootstrap_with_cache(&client, auth, bootstrap_cache)?;
+    let response = request_continuation(&client, auth, &bootstrap, token)?;
+    Ok(normalize_sectioned_response(
+        &BrowseTarget::Home,
+        limit,
+        &response,
+    ))
 }
 
-pub fn search(query: &str, limit: usize, auth: &AuthConfig) -> Result<Value, String> {
+pub fn browse_id(
+    browse_id: &str,
+    params: Option<&str>,
+    limit: usize,
+    auth: &AuthConfig,
+    bootstrap_cache: Option<&Path>,
+) -> Result<Value, String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("cannot create HTTP client: {error}"))?;
-    let bootstrap = bootstrap(&client, auth)?;
+    let bootstrap = bootstrap_with_cache(&client, auth, bootstrap_cache)?;
+    let response = request_browse_id(&client, auth, &bootstrap, browse_id, params)?;
+    Ok(normalize_browse_id_response(browse_id, limit, &response))
+}
+
+pub fn search(
+    query: &str,
+    limit: usize,
+    auth: &AuthConfig,
+    bootstrap_cache: Option<&Path>,
+) -> Result<Value, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("cannot create HTTP client: {error}"))?;
+    let bootstrap = bootstrap_with_cache(&client, auth, bootstrap_cache)?;
     let response = request_search(&client, auth, &bootstrap, query)?;
     Ok(normalize_search_response(query, limit, &response))
 }
 
+#[derive(Clone, Debug)]
 struct Bootstrap {
     api_key: String,
     client_version: String,
     visitor_data: Option<String>,
     context: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct BootstrapCache {
+    schema: u32,
+    fetched_at: u64,
+    api_key: String,
+    client_version: String,
+    visitor_data: Option<String>,
+    context: Option<Value>,
+}
+
+impl From<BootstrapCache> for Bootstrap {
+    fn from(cache: BootstrapCache) -> Self {
+        Self {
+            api_key: cache.api_key,
+            client_version: cache.client_version,
+            visitor_data: cache.visitor_data,
+            context: cache.context,
+        }
+    }
+}
+
+pub fn bootstrap_cache_path(auth_path: &Path) -> PathBuf {
+    auth_path.with_file_name("bootstrap-cache.json")
+}
+
+fn bootstrap_with_cache(
+    client: &Client,
+    auth: &AuthConfig,
+    cache_path: Option<&Path>,
+) -> Result<Bootstrap, String> {
+    let Some(cache_path) = cache_path else {
+        let started = Instant::now();
+        let bootstrap = bootstrap(client, auth)?;
+        log_timing("bootstrap-network", started);
+        return Ok(bootstrap);
+    };
+
+    let cache_started = Instant::now();
+    if let Some(cached) = load_bootstrap_cache(cache_path) {
+        log_diagnostic("bootstrap-cache=hit");
+        log_timing("bootstrap-cache-read", cache_started);
+        return Ok(cached);
+    }
+    log_diagnostic("bootstrap-cache=miss");
+
+    let started = Instant::now();
+    let bootstrap = bootstrap(client, auth)?;
+    log_timing("bootstrap-network", started);
+    if let Err(error) = save_bootstrap_cache(cache_path, &bootstrap) {
+        log_diagnostic(&format!("bootstrap-cache-write-error={error}"));
+    }
+    Ok(bootstrap)
+}
+
+fn load_bootstrap_cache(path: &Path) -> Option<Bootstrap> {
+    let content = fs::read_to_string(path).ok()?;
+    let cache: BootstrapCache = serde_json::from_str(&content).ok()?;
+    if cache.schema != BOOTSTRAP_CACHE_SCHEMA_VERSION {
+        return None;
+    }
+    let now = current_timestamp().ok()?;
+    if cache.fetched_at > now || now.saturating_sub(cache.fetched_at) > BOOTSTRAP_CACHE_TTL_SECS {
+        return None;
+    }
+    Some(cache.into())
+}
+
+fn save_bootstrap_cache(path: &Path, bootstrap: &Bootstrap) -> Result<(), String> {
+    let cache = BootstrapCache {
+        schema: BOOTSTRAP_CACHE_SCHEMA_VERSION,
+        fetched_at: current_timestamp()?,
+        api_key: bootstrap.api_key.clone(),
+        client_version: bootstrap.client_version.clone(),
+        visitor_data: bootstrap.visitor_data.clone(),
+        context: bootstrap.context.clone(),
+    };
+    let content = serde_json::to_vec_pretty(&cache)
+        .map_err(|error| format!("cannot encode bootstrap cache: {error}"))?;
+    write_private_bytes(path, &content)
+}
+
+fn write_private_bytes(path: &Path, content: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create `{}`: {error}", parent.display()))?;
+    }
+    write_private_file(path, content)
+}
+
+#[cfg(unix)]
+fn write_private_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| format!("cannot write `{}`: {error}", path.display()))?;
+    file.write_all(content)
+        .map_err(|error| format!("cannot write `{}`: {error}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("cannot set permissions on `{}`: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    fs::write(path, content).map_err(|error| format!("cannot write `{}`: {error}", path.display()))
 }
 
 fn bootstrap(client: &Client, auth: &AuthConfig) -> Result<Bootstrap, String> {
@@ -332,6 +487,7 @@ fn request_youtubei_path(
     if let Some(visitor_data) = &bootstrap.visitor_data {
         insert_header(&mut headers, "x-goog-visitor-id", visitor_data)?;
     }
+    let started = Instant::now();
     let response = client
         .post(format!(
             "{YTM_ORIGIN}/youtubei/v1/{path}?alt=json&key={}",
@@ -345,6 +501,7 @@ fn request_youtubei_path(
     let response_body = response
         .text()
         .map_err(|error| format!("cannot read YouTube Music response: {error}"))?;
+    log_timing(&format!("youtubei-{path}"), started);
     if !status.is_success() {
         let message = serde_json::from_str::<Value>(&response_body)
             .ok()
@@ -514,6 +671,25 @@ fn current_timestamp() -> Result<u64, String> {
         .map_err(|error| format!("system clock error: {error}"))
 }
 
+fn timings_enabled() -> bool {
+    env::var_os(TIMINGS_ENV).is_some()
+}
+
+fn log_timing(label: &str, started: Instant) {
+    if timings_enabled() {
+        eprintln!(
+            "ytm-radio-helper timing {label}={}ms",
+            started.elapsed().as_millis()
+        );
+    }
+}
+
+fn log_diagnostic(message: &str) {
+    if timings_enabled() {
+        eprintln!("ytm-radio-helper {message}");
+    }
+}
+
 fn extract_config_string(html: &str, key: &str) -> Option<String> {
     extract_config_value(html, key)?
         .as_str()
@@ -644,7 +820,15 @@ fn normalize_sectioned_responses(
             })
             .collect()
     };
-    json!({ "sources": sources })
+    let continuation = if matches!(target, BrowseTarget::Home) {
+        responses.last().and_then(find_home_continuation)
+    } else {
+        None
+    };
+    json!({
+        "sources": sources,
+        "continuation": continuation
+    })
 }
 
 fn sectioned_source_metadata(
@@ -1726,6 +1910,10 @@ mod tests {
     use super::*;
     use crate::auth::AuthSource;
     use std::collections::BTreeMap;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn computes_sapisid_hash() {
@@ -1866,6 +2054,47 @@ mod tests {
             Some("0")
         );
         assert!(headers.get("x-goog-pageid").is_none());
+    }
+
+    #[test]
+    fn bootstrap_cache_round_trips_recent_entries() {
+        let directory = temporary_test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let cache_file = directory.join("bootstrap-cache.json");
+        let bootstrap = Bootstrap {
+            api_key: "key".to_string(),
+            client_version: "client-version".to_string(),
+            visitor_data: Some("visitor".to_string()),
+            context: Some(json!({"client": {"hl": "en"}})),
+        };
+
+        save_bootstrap_cache(&cache_file, &bootstrap).unwrap();
+        let loaded = load_bootstrap_cache(&cache_file).expect("bootstrap cache");
+
+        assert_eq!(loaded.api_key, "key");
+        assert_eq!(loaded.client_version, "client-version");
+        assert_eq!(loaded.visitor_data.as_deref(), Some("visitor"));
+        assert_eq!(loaded.context, Some(json!({"client": {"hl": "en"}})));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_cache_ignores_stale_entries() {
+        let directory = temporary_test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let cache_file = directory.join("bootstrap-cache.json");
+        let cache = BootstrapCache {
+            schema: BOOTSTRAP_CACHE_SCHEMA_VERSION,
+            fetched_at: 1,
+            api_key: "key".to_string(),
+            client_version: "client-version".to_string(),
+            visitor_data: None,
+            context: None,
+        };
+        fs::write(&cache_file, serde_json::to_vec(&cache).unwrap()).unwrap();
+
+        assert!(load_bootstrap_cache(&cache_file).is_none());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2635,6 +2864,37 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_home_response_with_top_level_continuation() {
+        let response = json!({
+            "contents": {
+                "sectionListRenderer": {
+                    "contents": [{
+                        "musicCarouselShelfRenderer": {
+                            "header": {
+                                "musicCarouselShelfBasicHeaderRenderer": {
+                                    "title": {"runs": [{"text": "Listen again"}]}
+                                }
+                            },
+                            "contents": []
+                        }
+                    }, {
+                        "continuationItemRenderer": {
+                            "continuationEndpoint": {
+                                "continuationCommand": {"token": "next-page"}
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+        let normalized = normalize_home_responses(12, &[response]);
+        assert_eq!(
+            normalized.get("continuation").and_then(Value::as_str),
+            Some("next-page")
+        );
+    }
+
+    #[test]
     fn normalizes_home_continuation_responses_together() {
         let first = json!({
             "contents": {
@@ -2711,5 +2971,17 @@ mod tests {
             ]),
             innertube_context: None,
         }
+    }
+
+    fn temporary_test_directory() -> std::path::PathBuf {
+        let counter = TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "ytm-radio-ytmusic-test-{}-{nanos}-{counter}",
+            std::process::id()
+        ))
     }
 }

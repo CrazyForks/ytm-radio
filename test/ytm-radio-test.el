@@ -70,27 +70,47 @@
 (ert-deftest ytm-radio-mpv-arguments-include-ytdl-raw-options ()
   "Build mpv arguments with raw ytdl options."
   (let ((ytm-radio-mpv-extra-args '("--really-quiet"))
+        (ytm-radio-mpv-network-cache-args '("--cache=yes"
+                                            "--demuxer-readahead-secs=60"
+                                            "--demuxer-max-bytes=256MiB"))
         (ytm-radio-ytdl-raw-options '("cookies-from-browser=chrome"
                                       "proxy=http://127.0.0.1:8888")))
     (should (equal (ytm-radio--mpv-arguments "sock" "url")
-                   '("--really-quiet"
+                   '("--cache=yes"
+                     "--demuxer-readahead-secs=60"
+                     "--demuxer-max-bytes=256MiB"
+                     "--really-quiet"
                      "--ytdl-raw-options=cookies-from-browser=chrome,proxy=http://127.0.0.1:8888"
                      "--no-video"
                      "--input-ipc-server=sock"
                      "url")))))
 
+(ert-deftest ytm-radio-mpv-extra-args-can-override-cache-defaults ()
+  "Place user mpv args after default network cache args."
+  (let ((ytm-radio-mpv-network-cache-args '("--cache=yes"
+                                            "--demuxer-readahead-secs=60"))
+        (ytm-radio-mpv-extra-args '("--demuxer-readahead-secs=5"))
+        (ytm-radio-ytdl-raw-options nil))
+    (should (equal (seq-take (ytm-radio--mpv-arguments "sock" "url") 3)
+                   '("--cache=yes"
+                     "--demuxer-readahead-secs=60"
+                     "--demuxer-readahead-secs=5")))))
+
 (ert-deftest ytm-radio-render-explains-empty-catalog ()
   "Render an empty catalog with next-step guidance."
   (let ((ytm-radio--state (ytm-radio--make-state))
-        (ytm-radio--player (ytm-radio--make-player)))
+        (ytm-radio--player (ytm-radio--make-player))
+        (ytm-radio--browser-view 'home))
     (with-current-buffer (ytm-radio--buffer)
       (let ((inhibit-read-only t))
         (erase-buffer)))
     (ytm-radio--render)
     (with-current-buffer "*ytm-radio*"
-      (should (string-prefix-p "Home" (buffer-string)))
-      (should (string-match-p "\\`Home[[:space:]]+Explore[[:space:]]+Library[[:space:]]+Search"
-                              (buffer-string)))
+      (should (string-match-p "ytm-radio[[:space:]]+Home"
+                              (substring-no-properties
+                               (ytm-radio--browser-header-line))))
+      (should-not (string-match-p "\\`Home[[:space:]]+Explore"
+                                  (buffer-string)))
       (should-not (string-match-p "\\_<All\\_>" (buffer-string)))
       (should-not (string-match-p "\\`ytm-radio" (buffer-string)))
       (should-not (string-match-p "^No track$" (buffer-string)))
@@ -102,8 +122,8 @@
                "Use login once to import a browser session"
                (buffer-string))))))
 
-(ert-deftest ytm-radio-opens-with-home-import-when-auth-exists ()
-  "Refresh Home on first browser open when account auth is available."
+(ert-deftest ytm-radio-open-uses-cached-home-without-refresh ()
+  "Use cached Home sources on first browser open without refreshing."
   (let* ((stale-home (ytm-radio--make-source
                       :id "ytm:home:stale"
                       :kind 'youtube-music-home-section
@@ -117,16 +137,36 @@
         (ytm-radio--initial-home-refreshed nil)
         (ytm-radio-helper-use-mock-data nil)
         (ytm-radio-helper-auth-file "/tmp/ytm-radio-auth.json")
-        imported)
+        started)
     (cl-letf (((symbol-function 'file-readable-p)
                (lambda (file) (equal file "/tmp/ytm-radio-auth.json")))
               ((symbol-function 'ytm-radio--show-buffer)
                (lambda (_buffer) nil))
-              ((symbol-function 'ytm-radio--import-helper-target)
-               (lambda (target _label)
-                 (setq imported target))))
+              ((symbol-function 'ytm-radio--start-home-load)
+               (lambda (&optional append)
+                 (setq started (if append 'append 'initial)))))
       (ytm-radio)
-      (should (equal imported "home")))))
+      (should-not started))))
+
+(ert-deftest ytm-radio-opens-with-home-import-when-auth-exists-and-no-cache ()
+  "Refresh Home on first browser open when account auth is available and uncached."
+  (let ((ytm-radio--state (ytm-radio--make-state))
+        (ytm-radio--player (ytm-radio--make-player))
+        (ytm-radio--loaded t)
+        (ytm-radio--browser-view 'home)
+        (ytm-radio--initial-home-refreshed nil)
+        (ytm-radio-helper-use-mock-data nil)
+        (ytm-radio-helper-auth-file "/tmp/ytm-radio-auth.json")
+        started)
+    (cl-letf (((symbol-function 'file-readable-p)
+               (lambda (file) (equal file "/tmp/ytm-radio-auth.json")))
+              ((symbol-function 'ytm-radio--show-buffer)
+               (lambda (_buffer) nil))
+              ((symbol-function 'ytm-radio--start-home-load)
+               (lambda (&optional append)
+                 (setq started (if append 'append 'initial)))))
+      (ytm-radio)
+      (should (eq started 'initial)))))
 
 (ert-deftest ytm-radio-migrates-legacy-runtime-files ()
   "Copy default runtime files out of `user-emacs-directory'."
@@ -254,6 +294,80 @@
       (should (search-forward "Listen again" nil t))
       (should-not (search-forward "Listen again" nil t)))))
 
+(ert-deftest ytm-radio-home-continuation-is-not-rendered-as-footer ()
+  "Do not render Home continuation as an explicit control."
+  (let* ((source (ytm-radio--make-source
+                  :id "ytm:home:listen"
+                  :kind 'youtube-music-home-section
+                  :title "Listen again"
+                  :items nil))
+         (ytm-radio--home-continuation "next-page")
+         (ytm-radio--browser-view 'home)
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons (map-elt source :id) source))))
+         (ytm-radio--player (ytm-radio--make-player)))
+    (with-current-buffer (ytm-radio--buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (ytm-radio--render)
+    (with-current-buffer "*ytm-radio*"
+      (should-not
+       (string-match-p "Load more Home sections" (buffer-string))))))
+
+(ert-deftest ytm-radio-home-lazy-load-starts-near-buffer-end ()
+  "Start Home continuation loading when the visible window reaches the end."
+  (let ((ytm-radio--browser-view 'home)
+        (ytm-radio--home-continuation "next-page")
+        (ytm-radio--home-loading nil)
+        (ytm-radio--home-process nil)
+        (ytm-radio-home-lazy-load-margin 1)
+        started)
+    (with-temp-buffer
+      (insert "one\ntwo\nthree\n")
+      (goto-char (point-min))
+      (cl-letf (((symbol-function 'window-live-p)
+                 (lambda (_window) t))
+                ((symbol-function 'window-buffer)
+                 (lambda (_window) (current-buffer)))
+                ((symbol-function 'window-end)
+                 (lambda (_window &optional _update)
+                   (line-beginning-position 3)))
+                ((symbol-function 'get-buffer-window)
+                 (lambda (_buffer &optional _all-frames) 'window))
+                ((symbol-function 'ytm-radio--start-home-load)
+                 (lambda (&optional append)
+                   (setq started append))))
+        (ytm-radio--maybe-lazy-load-home)
+        (should started)))))
+
+(ert-deftest ytm-radio-apply-home-data-replaces-then-appends ()
+  "Replace Home on first page and append continuation pages."
+  (let ((ytm-radio--state (ytm-radio--make-state))
+        (ytm-radio--player (ytm-radio--make-player))
+        (ytm-radio--home-continuation nil)
+        (first '((sources
+                  ((id . "ytm:home:listen")
+                   (kind . "youtube-music-home-section")
+                   (title . "Listen again")
+                   (items . nil)))
+                 (continuation . "next-page")))
+        (next '((sources
+                 ((id . "ytm:home:mixed")
+                  (kind . "youtube-music-home-section")
+                  (title . "Mixed for you")
+                  (items . nil)))
+                (continuation . nil))))
+    (cl-letf (((symbol-function 'ytm-radio--save) #'ignore)
+              ((symbol-function 'ytm-radio--render) #'ignore))
+      (ytm-radio--apply-home-helper-data first nil)
+      (should (assoc "ytm:home:listen" (ytm-radio--sources)))
+      (should (equal ytm-radio--home-continuation "next-page"))
+      (ytm-radio--apply-home-helper-data next t)
+      (should (assoc "ytm:home:listen" (ytm-radio--sources)))
+      (should (assoc "ytm:home:mixed" (ytm-radio--sources)))
+      (should-not ytm-radio--home-continuation))))
+
 (ert-deftest ytm-radio-imenu-indexes-sectioned-views ()
   "Expose Home, Explore, and Library sections through imenu."
   (let* ((home (ytm-radio--make-source
@@ -290,6 +404,46 @@
       (with-current-buffer "*ytm-radio*"
         (should (equal (mapcar #'car (ytm-radio--imenu-create-index))
                        '("Library Songs")))))))
+
+(ert-deftest ytm-radio-select-browser-view-uses-cached-targets ()
+  "Switching views uses cached sources without starting helper loads."
+  (let* ((explore (ytm-radio--make-source
+                   :id "ytm:explore:new"
+                   :kind 'youtube-music-explore-section
+                   :title "New releases"))
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons (map-elt explore :id) explore))))
+         (ytm-radio--player (ytm-radio--make-player))
+         started)
+    (with-current-buffer (ytm-radio--buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (cl-letf (((symbol-function 'ytm-radio--start-helper-target-load)
+               (lambda (&rest _args) (setq started t))))
+      (ytm-radio--select-browser-view 'explore)
+      (should (eq ytm-radio--browser-view 'explore))
+      (should-not started))))
+
+(ert-deftest ytm-radio-select-browser-view-loads-uncached-target-async ()
+  "Switching to uncached Explore or Library starts asynchronous loading."
+  (let ((ytm-radio--state (ytm-radio--make-state))
+        (ytm-radio--player (ytm-radio--make-player))
+        started)
+    (with-current-buffer (ytm-radio--buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (cl-letf (((symbol-function 'ytm-radio--start-helper-target-load)
+               (lambda (target label view)
+                 (setq started (list target label view)))))
+      (ytm-radio--select-browser-view 'explore)
+      (should (equal started '("explore" "explore" explore))))
+    (setq started nil)
+    (cl-letf (((symbol-function 'ytm-radio--start-helper-target-load)
+               (lambda (target label view)
+                 (setq started (list target label view)))))
+      (ytm-radio--select-browser-view 'library)
+      (should (equal started '("library" "library" library))))))
 
 (ert-deftest ytm-radio-render-shows-detail-header-metadata ()
   "Render detail header sources with thumbnail metadata and subtitle."
@@ -448,24 +602,104 @@
     (ytm-radio--render)
     (with-current-buffer "*ytm-radio*"
       (should (string-match-p "Listen again" (buffer-string)))
+      (should-not
+       (string-match-p "youtube-music-home-section" (buffer-string)))
+      (should-not
+       (string-match-p "youtube-music-library" (buffer-string)))
       (should (string-match-p "2 more" (buffer-string)))
       (goto-char (point-min))
-      (search-forward "Search")
+      (search-forward "10 items")
       (let ((newline (point)))
         (should (eq (char-after newline) ?\n))
         (should-not (get-text-property newline 'display))
         (should (equal (get-text-property (1+ newline) 'display)
                        '((height 0.25)))))
+      (should-not (string-match-p "Home[[:space:]]+Explore"
+                                  (buffer-string))))))
+
+(ert-deftest ytm-radio-browser-navigation-uses-view-keys ()
+  "Bind Home, Explore, and Library navigation to direct view keys."
+  (should (eq (lookup-key ytm-radio--mode-map (kbd "H"))
+              #'ytm-radio-home))
+  (should (eq (lookup-key ytm-radio--mode-map (kbd "E"))
+              #'ytm-radio-explore))
+  (should (eq (lookup-key ytm-radio--mode-map (kbd "L"))
+              #'ytm-radio-library))
+  (should (eq (lookup-key ytm-radio--mode-map (kbd "/"))
+              #'ytm-radio-search))
+  (should (eq (lookup-key ytm-radio--mode-map (kbd "b"))
+              #'ytm-radio-back))
+  (should-not (eq (lookup-key ytm-radio--mode-map (kbd "h"))
+                  #'ytm-radio-home))
+  (should-not (eq (lookup-key ytm-radio--mode-map (kbd "e"))
+                  #'ytm-radio-explore))
+  (should-not (lookup-key ytm-radio--mode-map (kbd "o")))
+  (should-not (lookup-key ytm-radio--mode-map (kbd "l"))))
+
+(ert-deftest ytm-radio-source-summary-avoids-redundant-counts ()
+  "Avoid showing duplicate item and track counts."
+  (let* ((track-a (ytm-radio--make-track
+                   :id "a"
+                   :title "A"
+                   :url "https://music.youtube.com/watch?v=a"))
+         (track-b (ytm-radio--make-track
+                   :id "b"
+                   :title "B"
+                   :url "https://music.youtube.com/watch?v=b"))
+         (track-source (ytm-radio--make-source
+                        :id "tracks"
+                        :kind 'youtube-music-home-section
+                        :title "Tracks"
+                        :tracks (list track-a track-b)
+                        :items (list track-a track-b)))
+         (mixed-source (ytm-radio--make-source
+                        :id "mixed"
+                        :kind 'youtube-music-home-section
+                        :title "Mixed"
+                        :tracks (list track-a)
+                        :items (list track-a '((type . "album")
+                                               (title . "Album")))))
+         (item-source (ytm-radio--make-source
+                       :id "items"
+                       :kind 'youtube-music-home-section
+                       :title "Items"
+                       :tracks nil
+                       :items '(((type . "album") (title . "Album"))))))
+    (should (equal (ytm-radio--source-summary track-source) "2 tracks"))
+    (should (equal (ytm-radio--source-summary mixed-source)
+                   "2 items / 1 track"))
+    (should (equal (ytm-radio--source-summary item-source) "1 item"))))
+
+(ert-deftest ytm-radio-more-opens-current-section-hidden-items ()
+  "Open the full current section from any item row with `ytm-radio-more'."
+  (let* ((items (cl-loop for index from 1 to 10
+                         collect `((type . "track")
+                                   (id . ,(format "v%d" index))
+                                   (title . ,(format "Song %d" index))
+                                   (url . ,(format "https://music.youtube.com/watch?v=v%d"
+                                                   index)))))
+         (source (ytm-radio--make-source
+                  :id "ytm:home:listen"
+                  :kind 'youtube-music-home-section
+                  :title "Listen again"
+                  :items items))
+         (ytm-radio--browser-view 'home)
+         (ytm-radio--browser-history nil)
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons (map-elt source :id) source))))
+         (ytm-radio--player (ytm-radio--make-player)))
+    (with-current-buffer (ytm-radio--buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (ytm-radio--render)
+    (with-current-buffer "*ytm-radio*"
       (goto-char (point-min))
-      (search-forward "tracks")
-      (let ((newline (point)))
-        (should (eq (char-after newline) ?\n))
-        (should-not (get-text-property newline 'display))
-        (should (equal (get-text-property (1+ newline) 'display)
-                       '((height 0.25)))))
-      (goto-char (point-min))
-      (search-forward "Home")
-      (should (get-text-property (1- (point)) 'ytm-radio-view)))))
+      (search-forward "Song 1")
+      (ytm-radio-more)
+      (should (eq (ytm-radio--view-kind) 'section))
+      (should (equal (ytm-radio--view-value :source-id)
+                     "ytm:home:listen")))))
 
 (ert-deftest ytm-radio-render-browser-does-not-park-point-at-end ()
   "Keep browser point on content instead of leaving it at end after render."
@@ -528,7 +762,7 @@
   "Render repeat and shuffle in the compact now-playing controls."
   (let ((ytm-radio--player
          (ytm-radio--make-player :status 'playing
-                                 :repeat 'list
+                                 :repeat 'all
                                  :shuffle t)))
     (cl-letf (((symbol-function 'ytm-radio--mdicon)
                (lambda (_name fallback) fallback)))
@@ -537,6 +771,41 @@
       (should-not (member "^" (mapcar #'car (ytm-radio--now-playing-controls))))
       (should (string-match-p "R  <<  ||  >>  S"
                               (ytm-radio--now-playing-controls-text))))))
+
+(ert-deftest ytm-radio-now-playing-controls-use-repeat-and-shuffle-icons ()
+  "Use YouTube Music-style repeat and shuffle state icons."
+  (let (requested-icons)
+    (cl-letf (((symbol-function 'ytm-radio--mdicon)
+               (lambda (name fallback)
+                 (push name requested-icons)
+                 fallback)))
+      (let* ((ytm-radio--player (ytm-radio--make-player))
+             (repeat (ytm-radio--repeat-control))
+             (shuffle (ytm-radio--shuffle-control)))
+        (should (equal (nth 2 repeat) "Repeat off"))
+        (should (eq (nth 3 repeat) 'shadow))
+        (should (equal (nth 2 shuffle) "Shuffle off"))
+        (should (eq (nth 3 shuffle) 'shadow))
+        (should (member "nf-md-repeat" requested-icons))
+        (should (member "nf-md-shuffle_variant" requested-icons)))
+      (setq requested-icons nil)
+      (let* ((ytm-radio--player (ytm-radio--make-player
+                                 :repeat 'all
+                                 :shuffle t))
+             (repeat (ytm-radio--repeat-control))
+             (shuffle (ytm-radio--shuffle-control)))
+        (should (equal (nth 2 repeat) "Repeat all"))
+        (should (eq (nth 3 repeat) 'bold))
+        (should (equal (nth 2 shuffle) "Shuffle on"))
+        (should (eq (nth 3 shuffle) 'bold))
+        (should (member "nf-md-repeat" requested-icons))
+        (should (member "nf-md-shuffle_variant" requested-icons)))
+      (setq requested-icons nil)
+      (let* ((ytm-radio--player (ytm-radio--make-player :repeat 'one))
+             (repeat (ytm-radio--repeat-control)))
+        (should (equal (nth 2 repeat) "Repeat one"))
+        (should (eq (nth 3 repeat) 'bold))
+        (should (member "nf-md-repeat_once" requested-icons))))))
 
 (ert-deftest ytm-radio-now-playing-controls-use-pixel-centering ()
   "Center compact now-playing controls by pixel width on graphic frames."
@@ -555,13 +824,57 @@
         (should (equal (get-text-property (point-min) 'display)
                        '(space :width (30))))))))
 
+(ert-deftest ytm-radio-now-playing-safe-text-width-keeps-extra-column ()
+  "Use the progress-line margin plus one extra column for title text."
+  (let ((ytm-radio--progress-line-safety-columns 2))
+    (cl-letf (((symbol-function 'ytm-radio--now-playing-text-width)
+               (lambda () 20)))
+      (should (= (ytm-radio--now-playing-safe-text-width) 17)))))
+
+(ert-deftest ytm-radio-marquee-text-scrolls-long-title ()
+  "Render long titles as fixed-width marquee slices."
+  (let ((title "abcdefghij"))
+    (should (equal (ytm-radio--marquee-text title 5 0) "abcde"))
+    (should (equal (ytm-radio--marquee-text title 5 2) "cdefg"))
+    (should (= (string-width (ytm-radio--marquee-text title 5 7)) 5))
+    (should (equal (ytm-radio--marquee-text "short" 8 3) "short"))))
+
+(ert-deftest ytm-radio-render-now-playing-gaps-cover-and-title ()
+  "Insert thin padding between the cover and title."
+  (let ((track (ytm-radio--make-track
+                :id "v1"
+                :title "Song"
+                :url "https://music.youtube.com/watch?v=v1"))
+        (ytm-radio--player (ytm-radio--make-player)))
+    (setf (map-elt ytm-radio--player :current-track) track)
+    (with-current-buffer (ytm-radio--now-playing-buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (cl-letf (((symbol-function 'ytm-radio--cover-spec)
+               (lambda (_track) nil))
+              ((symbol-function 'ytm-radio--now-playing-visible-p)
+               (lambda () nil)))
+      (ytm-radio--render-now-playing))
+    (with-current-buffer "*ytm-radio-now-playing*"
+      (goto-char (point-min))
+      (search-forward "[cover]\n")
+      (should (equal (get-text-property (point) 'display)
+                     '((height 0.25)))))))
+
+(ert-deftest ytm-radio-q-bindings-hide-browser-and-now-playing-separately ()
+  "Keep browser quit separate from now-playing child-frame hiding."
+  (should (eq (lookup-key ytm-radio--mode-map (kbd "q"))
+              #'ytm-radio-hide-browser))
+  (should (eq (lookup-key ytm-radio--now-playing-mode-map (kbd "q"))
+              #'ytm-radio-hide-now-playing)))
+
 (ert-deftest ytm-radio-repeat-and-shuffle-commands-update-player ()
   "Toggle repeat and shuffle playback modes."
   (let ((ytm-radio--player (ytm-radio--make-player)))
     (cl-letf (((symbol-function 'ytm-radio--render-now-playing) #'ignore)
               ((symbol-function 'message) #'ignore))
       (ytm-radio-cycle-repeat)
-      (should (eq (map-elt ytm-radio--player :repeat) 'list))
+      (should (eq (map-elt ytm-radio--player :repeat) 'all))
       (ytm-radio-cycle-repeat)
       (should (eq (map-elt ytm-radio--player :repeat) 'one))
       (ytm-radio-cycle-repeat)
@@ -570,6 +883,11 @@
       (should (map-elt ytm-radio--player :shuffle))
       (ytm-radio-toggle-shuffle)
       (should-not (map-elt ytm-radio--player :shuffle)))))
+
+(ert-deftest ytm-radio-repeat-mode-treats-legacy-list-as-all ()
+  "Treat the old repeat list value as repeat all."
+  (let ((ytm-radio--player (ytm-radio--make-player :repeat 'list)))
+    (should (eq (ytm-radio--repeat-mode) 'all))))
 
 (ert-deftest ytm-radio-next-track-honors-repeat-and-shuffle ()
   "Choose next tracks using repeat and shuffle state."
@@ -593,7 +911,7 @@
     (should (ytm-radio--same-track-p (ytm-radio--next-track track-a)
                                      track-b))
     (should-not (ytm-radio--next-track track-b))
-    (setf (map-elt ytm-radio--player :repeat) 'list)
+    (setf (map-elt ytm-radio--player :repeat) 'all)
     (should (ytm-radio--same-track-p (ytm-radio--next-track track-b)
                                      track-a))
     (should (ytm-radio--same-track-p (ytm-radio--previous-track track-a)
@@ -652,10 +970,20 @@
 (ert-deftest ytm-radio-progress-position-refresh-is-throttled ()
   "Throttle frequent position changes instead of rendering each update."
   (let ((ytm-radio--progress-render-timer nil)
+        (ytm-radio--last-rendered-progress-key nil)
+        (ytm-radio--player
+         (ytm-radio--make-player
+          :current-track (ytm-radio--make-track
+                          :id "v1"
+                          :title "Song"
+                          :url "https://music.youtube.com/watch?v=v1")
+          :duration 185))
         (render-count 0))
     (cl-letf (((symbol-function 'ytm-radio--render-now-playing)
                (lambda ()
-                 (cl-incf render-count))))
+                 (cl-incf render-count)))
+              ((symbol-function 'ytm-radio--now-playing-visible-p)
+               (lambda () t)))
       (unwind-protect
           (progn
             (ytm-radio--set-playback-property :position 1)
@@ -663,6 +991,26 @@
             (should (= render-count 0))
             (should (timerp ytm-radio--progress-render-timer)))
         (ytm-radio--cancel-progress-render)))))
+
+(ert-deftest ytm-radio-progress-position-skips-same-display-second ()
+  "Skip progress redraws when the visible playback second has not changed."
+  (let* ((track (ytm-radio--make-track
+                 :id "v1"
+                 :title "Song"
+                 :url "https://music.youtube.com/watch?v=v1"
+                 :duration 185))
+         (ytm-radio--player
+          (ytm-radio--make-player
+           :current-track track
+           :position 1.2
+           :duration 185))
+         (ytm-radio--progress-render-timer nil)
+         (ytm-radio--last-rendered-progress-key
+          (list "v1" 1 185)))
+    (cl-letf (((symbol-function 'ytm-radio--now-playing-visible-p)
+               (lambda () t)))
+      (ytm-radio--set-playback-property :position 1.8)
+      (should-not ytm-radio--progress-render-timer))))
 
 (ert-deftest ytm-radio-helper-json-ignores-success-stderr ()
   "Parse helper stdout JSON while ignoring successful stderr diagnostics."
@@ -682,6 +1030,32 @@
                (ytm-radio--call-helper nil))
               '((sources . nil))))))
       (delete-file script-file))))
+
+(ert-deftest ytm-radio-doctor-report-checks-local-setup ()
+  "Report executable, data directory, and auth file status."
+  (let* ((directory (make-temp-file "ytm-radio-doctor-" t))
+         (program (expand-file-name "program" directory))
+         (auth-file (expand-file-name "auth.json" directory))
+         (ytm-radio-helper-command program)
+         (ytm-radio-mpv-program program)
+         (ytm-radio-yt-dlp-program program)
+         (ytm-radio-data-directory directory)
+         (ytm-radio-helper-auth-file auth-file)
+         (ytm-radio-helper-use-mock-data nil))
+    (unwind-protect
+        (progn
+          (with-temp-file program
+            (insert "#!/bin/sh\n"))
+          (set-file-modes program #o700)
+          (with-temp-file auth-file
+            (insert "{}"))
+          (let ((report (ytm-radio--doctor-report)))
+            (should (string-match-p "^helper[[:space:]]+OK" report))
+            (should (string-match-p "^mpv[[:space:]]+OK" report))
+            (should (string-match-p "^yt-dlp[[:space:]]+OK" report))
+            (should (string-match-p "^data-dir[[:space:]]+OK" report))
+            (should (string-match-p "^auth[[:space:]]+OK" report))))
+      (delete-directory directory t))))
 
 (ert-deftest ytm-radio-progress-bar-renders-unicode ()
   "Render compact Unicode progress bars."
@@ -866,6 +1240,35 @@
                      "--mock"
                      "--limit"
                      "25")))))
+
+(ert-deftest ytm-radio-helper-home-initial-arguments-include-initial-only ()
+  "Build Rust helper arguments for non-blocking Home imports."
+  (let ((ytm-radio-helper-auth-file "/tmp/auth.json")
+        (ytm-radio-helper-use-mock-data t)
+        (ytm-radio-helper-home-limit 12))
+    (should (equal (ytm-radio--helper-browse-arguments "home" t)
+                   '("browse"
+                     "home"
+                     "--auth"
+                     "/tmp/auth.json"
+                     "--mock"
+                     "--initial-only"
+                     "--limit"
+                     "12")))))
+
+(ert-deftest ytm-radio-helper-continuation-arguments-include-limit-and-mock ()
+  "Build Rust helper arguments for Home continuation imports."
+  (let ((ytm-radio-helper-auth-file "/tmp/auth.json")
+        (ytm-radio-helper-use-mock-data t)
+        (ytm-radio-helper-home-limit 12))
+    (should (equal (ytm-radio--helper-continuation-arguments "next-page")
+                   '("continuation"
+                     "next-page"
+                     "--auth"
+                     "/tmp/auth.json"
+                     "--mock"
+                     "--limit"
+                     "12")))))
 
 (ert-deftest ytm-radio-helper-search-arguments-include-limit-and-mock ()
   "Build Rust helper arguments for search imports."
