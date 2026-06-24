@@ -19,22 +19,24 @@ Implemented:
 - play through `mpv --no-video`;
 - pause, next, previous, stop, and seek through mpv IPC;
 - show YouTube Music browse pages in a regular buffer;
-- show the current cover and playback state in a child-frame now-playing view;
+- show the current cover, playback progress, and controls in a child-frame
+  now-playing view;
 - invoke an external Rust account helper;
-- import Dia login cookies through the browser's DevTools protocol;
+- import Dia login cookies and YouTube Music page context through the browser's
+  DevTools protocol;
 - import browser cookies through `yt-dlp` into a private helper auth file;
 - import copied browser request headers into a private helper auth file;
-- make authenticated YouTube Music home/library/liked browse requests;
+- make authenticated YouTube Music home, library, liked, and search requests;
 - normalize live music renderers into playable tracks;
 - preserve non-track YouTube Music items such as albums, artists, playlists,
   and recommendation cards when they are present in browse responses;
+- render Home and Library as Emacs-native section dashboards;
 - import deterministic mock account data;
 - reject unsupported helper JSON schema versions.
 
 Not implemented yet:
 
-- continuation pagination beyond the first response;
-- search and detail pages for albums, artists, playlists, and radios;
+- detail pages for every album, artist, playlist, and radio renderer;
 - encrypted credential storage;
 - local account-data caching;
 - full renderer coverage for every YouTube Music web card type.
@@ -68,15 +70,18 @@ Load the Emacs package:
 ```
 
 Opening `M-x ytm-radio` does not prompt for a URL when the catalog is empty.
-Use the library/home buttons for account data, or the add button for a URL.
+Use `A` once for login, then `r`, `L`, `/`, or `a` to import account pages,
+search, or add a URL.
 
-The main `*ytm-radio*` buffer is the YouTube Music browser: it shows imported
-Home, Library, Liked, and URL-backed pages with tracks and non-track items such
-as albums, artists, playlists, and recommendation cards. Home recommendations
-are grouped by YouTube Music sections such as listen-again and mixed-for-you
-modules. The child frame is a
-ytr-style now-playing surface: it fits itself to the current cover image and
-only shows cover, title, artist, and playback state.
+The main `*ytm-radio*` buffer is the YouTube Music browser. It renders Home,
+Explore, Library, Search, and URL-backed pages as vertical Emacs sections with
+compact track/card rows. Home, Explore, and Library sections preserve YouTube
+Music modules such as listen-again, mixed-for-you, albums, playlists, artists,
+and liked music when the web response includes them.
+
+The child frame is a ytr-style now-playing surface. It fits itself to the
+current cover image, shows title, artist, time, and progress, and exposes the
+core playback controls without turning the child frame into the main browser.
 
 The default helper path points to:
 
@@ -99,12 +104,23 @@ elsewhere:
 - `M-x ytm-radio-add-url` adds a YouTube or YouTube Music URL.
 - `M-x ytm-radio-import-ytmusic-library` imports library sources.
 - `M-x ytm-radio-import-ytmusic-home` imports home recommendations.
+- `M-x ytm-radio-import-ytmusic-explore` imports explore sections.
 - `M-x ytm-radio-import-ytmusic-liked` imports liked songs.
+- `M-x ytm-radio-refresh` refreshes the current browser view.
+- `M-x ytm-radio-search` searches YouTube Music.
 - `M-x ytm-radio-now-playing` shows the cover child frame.
 - `M-x ytm-radio-play-track` selects a known track.
 - `M-x ytm-radio-play-source` selects a known source.
 - `M-x ytm-radio-toggle-pause` toggles mpv pause.
+- `M-x ytm-radio-cycle-repeat` cycles repeat off, list, and one.
+- `M-x ytm-radio-toggle-shuffle` toggles shuffle playback.
 - `M-x ytm-radio-stop` stops playback.
+- `M-x ytm-radio-next` plays the next track.
+- `M-x ytm-radio-previous` plays the previous track.
+- `M-x ytm-radio-share` copies the current track URL.
+- `M-x ytm-radio-seek-forward` seeks forward.
+- `M-x ytm-radio-seek-backward` seeks backward.
+- `M-x ytm-radio-hide` hides ytm-radio UI.
 
 Inside the browser buffer:
 
@@ -113,16 +129,38 @@ Inside the browser buffer:
 | `A` | Import browser login |
 | `a` | Add URL |
 | `c` | Show cover child frame |
+| `E` | Import YouTube Music explore sections |
 | `L` | Import YouTube Music library |
 | `i` | Import liked songs |
 | `r` | Import YouTube Music home recommendations |
-| `/` | Play track |
-| `s` | Play source |
+| `/` | Search YouTube Music |
+| `RET`, `o`, `l` | Play a track or open the item/source at point |
+| `j`, `k`, `Down`, `Up` | Move between item rows |
+| `g` | Refresh the current browser view |
+| `TAB`, `S-TAB` | Move between sections |
+| `b`, `h` | Return to the previous browser view |
+| `s` | Play source at point, or select a source |
 | `SPC` | Toggle pause |
 | `n` | Next track |
 | `p` | Previous track |
+| `S` | Copy current track URL |
 | `f` | Seek forward |
-| `b` | Seek backward |
+| `B` | Seek backward |
+| `q` | Hide ytm-radio UI |
+
+Use `M-x imenu` in Home, Explore, or Library to jump between rendered
+sections.
+
+Inside the now-playing child frame:
+
+| Key | Action |
+| --- | --- |
+| `SPC` | Toggle pause |
+| `n` | Next track |
+| `p` | Previous track |
+| `r` | Cycle repeat mode |
+| `s` | Toggle shuffle |
+| `S` | Copy current track URL |
 | `q` | Hide ytm-radio UI |
 
 ## Helper Contract
@@ -134,14 +172,24 @@ ytm-radio-helper auth check --auth FILE
 ytm-radio-helper auth import-dia --output FILE [--port N] [--app PATH] [--restart]
 ytm-radio-helper auth import-browser --browser BROWSER --output FILE [--yt-dlp PROGRAM]
 ytm-radio-helper auth import-headers --input FILE --output FILE
-ytm-radio-helper browse home|library|liked --auth FILE [--limit N]
-ytm-radio-helper browse home|library|liked --mock [--limit N]
+ytm-radio-helper browse home|explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N]
+ytm-radio-helper browse home|explore|library|library-songs|library-albums|library-artists|library-playlists|liked --mock [--limit N]
+ytm-radio-helper browse-id BROWSE_ID --auth FILE [--params PARAMS] [--limit N]
+ytm-radio-helper browse-id BROWSE_ID --mock [--params PARAMS] [--limit N]
+ytm-radio-helper search QUERY --auth FILE [--limit N]
+ytm-radio-helper search QUERY --mock [--limit N]
 ```
 
-For `home`, the helper preserves YouTube Music sections and returns each
-section as a source. It follows home continuation pages so modules below the
-first viewport are included. The limit applies per section. For `library` and
-`liked`, the helper returns a single source.
+For `home`, `explore`, and `library`, the helper preserves YouTube Music
+sections and returns each section as a source. Home follows continuation pages so
+modules below the first viewport are included. The limit applies per section.
+The explicit library subtargets return focused sources for songs, albums,
+artists, playlists, and liked music. `search` returns a source containing mixed
+result items.
+`browse-id` is used internally by the Emacs UI to expand albums, artists, and
+playlists without sending YouTube Music-only pages through yt-dlp. When YouTube
+Music returns endpoint `params`, the Emacs UI passes them through `--params`
+because some playlist and mix pages reject a bare `browseId`.
 
 Responses use a stable envelope:
 
@@ -176,15 +224,23 @@ For yt-dlp supported browsers, the command:
 4. writes a private JSON file with mode `0600` on Unix;
 5. configures `ytm-radio-helper-auth-file`.
 
-For Dia, the same command dispatches internally to the Dia DevTools path. If
-Dia is already running without the DevTools endpoint, Emacs asks whether it may
-restart Dia once and then retries.
+For Dia, the same command dispatches internally to the Dia DevTools path. The
+helper reads the YouTube Music page's `ytcfg` session context in addition to
+cookies, so Home, Library, and brand-account requests use the same account
+identity as the web page. If Dia is already running without the DevTools
+endpoint, Emacs asks whether it may restart Dia once and then retries.
 
 The default output is:
 
 ```text
-~/.emacs.d/ytm-radio/auth.json
+~/.ytm-radio/auth.json
 ```
+
+Runtime data defaults to `~/.ytm-radio/`: `auth.json` stores the helper session,
+`state.eld` stores imported sources and the last track, and `covers/` caches
+cover images. If default `~/.emacs.d/ytm-radio/auth.json` or `state.eld` files
+already exist from an older checkout, ytm-radio copies them into the new
+directory on first startup.
 
 Browser or macOS Keychain permission prompts may appear during import. Close
 the browser first if its cookie database is locked.
@@ -224,8 +280,8 @@ if browser import fails:
 3. Reload the page or click a library/home item.
 4. Select a `browse` request to `music.youtube.com/youtubei/v1/browse`.
 5. Copy the request headers into a local text file. The file must include the
-   `cookie` header; `user-agent` and `x-goog-authuser` are also used when
-   present.
+   `cookie` header; `user-agent`, `x-goog-authuser`, `x-goog-pageid`,
+   `x-origin`, and `referer` are also used when present.
 6. Run `M-x ytm-radio-auth-import-headers` and pick that file.
 
 The request header file contains account session material. Delete it after
@@ -245,7 +301,7 @@ custom location:
 
 ```elisp
 (setq ytm-radio-helper-auth-file
-      "~/.config/ytm-radio/browser-headers.json")
+      "~/.ytm-radio/browser-headers.json")
 ```
 
 The auth file may contain account session material. Keep it out of git and
@@ -281,5 +337,5 @@ Run all deterministic checks:
 make check
 ```
 
-This byte-compiles Elisp, runs ERT and checkdoc, and runs Rust formatting,
+This byte-compiles Elisp, runs ERT, checkdoc, package-lint, Rust formatting,
 Clippy, and unit tests.

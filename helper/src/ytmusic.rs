@@ -1,21 +1,35 @@
 use crate::auth::AuthConfig;
 use reqwest::blocking::Client;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, ORIGIN, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, USER_AGENT};
 use serde_json::{json, Map, Value};
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
+use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const YTM_ORIGIN: &str = "https://music.youtube.com";
 const HOME_CONTINUATION_PAGE_LIMIT: usize = 8;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowseTarget {
     Home,
+    Explore,
     Library,
+    LibrarySongs,
+    LibraryAlbums,
+    LibraryArtists,
+    LibraryPlaylists,
     Liked,
 }
+
+const LIBRARY_TARGETS: [BrowseTarget; 5] = [
+    BrowseTarget::LibrarySongs,
+    BrowseTarget::LibraryAlbums,
+    BrowseTarget::LibraryArtists,
+    BrowseTarget::LibraryPlaylists,
+    BrowseTarget::Liked,
+];
 
 pub fn browse(target: &BrowseTarget, limit: usize, auth: &AuthConfig) -> Result<Value, String> {
     let client = Client::builder()
@@ -23,19 +37,50 @@ pub fn browse(target: &BrowseTarget, limit: usize, auth: &AuthConfig) -> Result<
         .build()
         .map_err(|error| format!("cannot create HTTP client: {error}"))?;
     let bootstrap = bootstrap(&client, auth)?;
+    if matches!(target, BrowseTarget::Library) {
+        return browse_library(&client, auth, &bootstrap, limit);
+    }
     let response = request_browse(&client, auth, &bootstrap, target)?;
     if matches!(target, BrowseTarget::Home) {
         let responses = request_home_continuations(&client, auth, &bootstrap, response)?;
-        Ok(normalize_home_responses(limit, &responses))
+        Ok(normalize_sectioned_responses(target, limit, &responses))
+    } else if matches!(target, BrowseTarget::Explore) {
+        Ok(normalize_sectioned_response(target, limit, &response))
     } else {
         Ok(normalize_single_source_response(target, limit, &response))
     }
+}
+
+pub fn browse_id(
+    browse_id: &str,
+    params: Option<&str>,
+    limit: usize,
+    auth: &AuthConfig,
+) -> Result<Value, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("cannot create HTTP client: {error}"))?;
+    let bootstrap = bootstrap(&client, auth)?;
+    let response = request_browse_id(&client, auth, &bootstrap, browse_id, params)?;
+    Ok(normalize_browse_id_response(browse_id, limit, &response))
+}
+
+pub fn search(query: &str, limit: usize, auth: &AuthConfig) -> Result<Value, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("cannot create HTTP client: {error}"))?;
+    let bootstrap = bootstrap(&client, auth)?;
+    let response = request_search(&client, auth, &bootstrap, query)?;
+    Ok(normalize_search_response(query, limit, &response))
 }
 
 struct Bootstrap {
     api_key: String,
     client_version: String,
     visitor_data: Option<String>,
+    context: Option<Value>,
 }
 
 fn bootstrap(client: &Client, auth: &AuthConfig) -> Result<Bootstrap, String> {
@@ -58,6 +103,7 @@ fn bootstrap(client: &Client, auth: &AuthConfig) -> Result<Bootstrap, String> {
             || "YouTube Music bootstrap did not contain a client version".to_string(),
         )?,
         visitor_data: extract_config_string(&html, "VISITOR_DATA"),
+        context: extract_config_value(&html, "INNERTUBE_CONTEXT"),
     })
 }
 
@@ -67,23 +113,179 @@ fn request_browse(
     bootstrap: &Bootstrap,
     target: &BrowseTarget,
 ) -> Result<Value, String> {
-    let browse_id = match target {
-        BrowseTarget::Home => "FEmusic_home",
-        BrowseTarget::Library => "FEmusic_liked_videos",
-        BrowseTarget::Liked => "VLLM",
+    let (browse_id, params) = match target {
+        BrowseTarget::Home => ("FEmusic_home", None),
+        BrowseTarget::Explore => ("FEmusic_explore", None),
+        BrowseTarget::Library => ("FEmusic_library_landing", None),
+        BrowseTarget::LibrarySongs => ("FEmusic_liked_videos", None),
+        BrowseTarget::LibraryAlbums => ("FEmusic_liked_albums", None),
+        BrowseTarget::LibraryArtists => ("FEmusic_library_corpus_artists", Some("ggMCCAU=")),
+        BrowseTarget::LibraryPlaylists => ("FEmusic_liked_playlists", None),
+        BrowseTarget::Liked => ("VLLM", None),
     };
-    let body = json!({
-        "context": {
-            "client": {
-                "clientName": "WEB_REMIX",
-                "clientVersion": bootstrap.client_version,
-                "hl": "en"
-            },
-            "user": {}
-        },
+    request_browse_id(client, auth, bootstrap, browse_id, params)
+}
+
+fn request_browse_id(
+    client: &Client,
+    auth: &AuthConfig,
+    bootstrap: &Bootstrap,
+    browse_id: &str,
+    params: Option<&str>,
+) -> Result<Value, String> {
+    let body = browse_id_request_body(auth, bootstrap, browse_id, params);
+    request_youtubei(client, auth, bootstrap, &body)
+}
+
+fn browse_id_request_body(
+    auth: &AuthConfig,
+    bootstrap: &Bootstrap,
+    browse_id: &str,
+    params: Option<&str>,
+) -> Value {
+    let mut body = json!({
+        "context": youtubei_context(auth, bootstrap),
         "browseId": browse_id
     });
-    request_youtubei(client, auth, bootstrap, &body)
+    if let Some(params) = params.filter(|value| !value.trim().is_empty()) {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("params".to_string(), Value::String(params.to_string()));
+        }
+    }
+    body
+}
+
+fn youtubei_context(auth: &AuthConfig, bootstrap: &Bootstrap) -> Value {
+    let auth_context = auth
+        .innertube_context
+        .as_ref()
+        .filter(|value| value.is_object());
+    let mut context = bootstrap
+        .context
+        .clone()
+        .filter(Value::is_object)
+        .or_else(|| auth_context.cloned())
+        .unwrap_or_else(|| json!({}));
+    if let Some(auth_context) = auth_context {
+        merge_auth_context_identity(&mut context, auth_context);
+    }
+    let object = context.as_object_mut().expect("context is an object");
+    if !object.get("client").map(Value::is_object).unwrap_or(false) {
+        object.insert("client".to_string(), Value::Object(Map::new()));
+    }
+    {
+        let client = object
+            .get_mut("client")
+            .and_then(Value::as_object_mut)
+            .expect("client is an object");
+        client
+            .entry("clientName".to_string())
+            .or_insert_with(|| Value::String("WEB_REMIX".to_string()));
+        client.insert(
+            "clientVersion".to_string(),
+            Value::String(bootstrap.client_version.clone()),
+        );
+        client
+            .entry("hl".to_string())
+            .or_insert_with(|| Value::String("en".to_string()));
+    }
+    if !object.get("user").map(Value::is_object).unwrap_or(false) {
+        object.insert("user".to_string(), Value::Object(Map::new()));
+    }
+    if let Some(page_id) = auth
+        .header("x-goog-pageid")
+        .filter(|value| !value.trim().is_empty())
+    {
+        let user = object
+            .get_mut("user")
+            .and_then(Value::as_object_mut)
+            .expect("user is an object");
+        user.entry("onBehalfOfUser".to_string())
+            .or_insert_with(|| Value::String(page_id.to_string()));
+    }
+    {
+        let user = object
+            .get_mut("user")
+            .and_then(Value::as_object_mut)
+            .expect("user is an object");
+        user.entry("lockedSafetyMode".to_string())
+            .or_insert(Value::Bool(false));
+    }
+    context
+}
+
+fn merge_auth_context_identity(context: &mut Value, auth_context: &Value) {
+    let Some(on_behalf_of_user) = auth_context
+        .pointer("/user/onBehalfOfUser")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+    let Some(user) = context_user_object(context) else {
+        return;
+    };
+    user.entry("onBehalfOfUser".to_string())
+        .or_insert_with(|| Value::String(on_behalf_of_user.to_string()));
+}
+
+fn context_user_object(context: &mut Value) -> Option<&mut Map<String, Value>> {
+    let context = context.as_object_mut()?;
+    if !context.get("user").map(Value::is_object).unwrap_or(false) {
+        context.insert("user".to_string(), Value::Object(Map::new()));
+    }
+    context.get_mut("user").and_then(Value::as_object_mut)
+}
+
+fn browse_library(
+    client: &Client,
+    auth: &AuthConfig,
+    bootstrap: &Bootstrap,
+    limit: usize,
+) -> Result<Value, String> {
+    let normalized_sections = thread::scope(|scope| {
+        let handles = LIBRARY_TARGETS
+            .into_iter()
+            .map(|target| {
+                let client = client.clone();
+                scope.spawn(move || {
+                    let response = request_browse(&client, auth, bootstrap, &target)?;
+                    Ok::<Value, String>(normalize_single_source_response(&target, limit, &response))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut sections = Vec::with_capacity(handles.len());
+        for handle in handles {
+            sections.push(
+                handle
+                    .join()
+                    .map_err(|_| "YouTube Music library request thread panicked".to_string())??,
+            );
+        }
+        Ok::<Vec<Value>, String>(sections)
+    })?;
+
+    let mut sources = Vec::new();
+    for normalized in normalized_sections {
+        if let Some(items) = normalized.get("sources").and_then(Value::as_array) {
+            sources.extend(items.iter().cloned());
+        }
+    }
+    Ok(json!({ "sources": sources }))
+}
+
+fn request_search(
+    client: &Client,
+    auth: &AuthConfig,
+    bootstrap: &Bootstrap,
+    query: &str,
+) -> Result<Value, String> {
+    let body = json!({
+        "context": youtubei_context(auth, bootstrap),
+        "query": query
+    });
+    request_youtubei_path(client, auth, bootstrap, "search", &body)
 }
 
 fn request_continuation(
@@ -93,14 +295,7 @@ fn request_continuation(
     continuation: &str,
 ) -> Result<Value, String> {
     let body = json!({
-        "context": {
-            "client": {
-                "clientName": "WEB_REMIX",
-                "clientVersion": bootstrap.client_version,
-                "hl": "en"
-            },
-            "user": {}
-        },
+        "context": youtubei_context(auth, bootstrap),
         "continuation": continuation
     });
     request_youtubei(client, auth, bootstrap, &body)
@@ -110,6 +305,16 @@ fn request_youtubei(
     client: &Client,
     auth: &AuthConfig,
     bootstrap: &Bootstrap,
+    body: &Value,
+) -> Result<Value, String> {
+    request_youtubei_path(client, auth, bootstrap, "browse", body)
+}
+
+fn request_youtubei_path(
+    client: &Client,
+    auth: &AuthConfig,
+    bootstrap: &Bootstrap,
+    path: &str,
     body: &Value,
 ) -> Result<Value, String> {
     let mut headers = base_headers(auth)?;
@@ -129,13 +334,13 @@ fn request_youtubei(
     }
     let response = client
         .post(format!(
-            "{YTM_ORIGIN}/youtubei/v1/browse?alt=json&key={}",
+            "{YTM_ORIGIN}/youtubei/v1/{path}?alt=json&key={}",
             bootstrap.api_key
         ))
         .headers(headers)
         .json(body)
         .send()
-        .map_err(|error| format!("YouTube Music browse request failed: {error}"))?;
+        .map_err(|error| format!("YouTube Music {path} request failed: {error}"))?;
     let status = response.status();
     let response_body = response
         .text()
@@ -239,12 +444,25 @@ fn find_direct_continuation(value: &Value) -> Option<String> {
 fn base_headers(auth: &AuthConfig) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert(ORIGIN, HeaderValue::from_static(YTM_ORIGIN));
+    let origin = auth.header("origin").unwrap_or(YTM_ORIGIN);
+    insert_header(&mut headers, "origin", origin)?;
+    insert_header(
+        &mut headers,
+        "referer",
+        auth.header("referer").unwrap_or(YTM_ORIGIN),
+    )?;
+    insert_header(
+        &mut headers,
+        "x-origin",
+        auth.header("x-origin").unwrap_or(origin),
+    )?;
+    let cookie = auth
+        .header("cookie")
+        .ok_or_else(|| "auth file is missing cookie header".to_string())?;
     insert_header(
         &mut headers,
         "cookie",
-        auth.header("cookie")
-            .ok_or_else(|| "auth file is missing cookie header".to_string())?,
+        &cookie_header_with_consent(cookie, auth.cookie("SOCS").is_some()),
     )?;
     insert_header(
         &mut headers,
@@ -258,6 +476,16 @@ fn base_headers(auth: &AuthConfig) -> Result<HeaderMap, String> {
             .map_err(|error| format!("invalid user-agent header: {error}"))?,
     );
     Ok(headers)
+}
+
+fn cookie_header_with_consent(cookie: &str, has_consent_cookie: bool) -> String {
+    if has_consent_cookie {
+        cookie.to_string()
+    } else if cookie.trim().is_empty() {
+        "SOCS=CAI".to_string()
+    } else {
+        format!("{cookie}; SOCS=CAI")
+    }
 }
 
 fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<(), String> {
@@ -287,53 +515,116 @@ fn current_timestamp() -> Result<u64, String> {
 }
 
 fn extract_config_string(html: &str, key: &str) -> Option<String> {
+    extract_config_value(html, key)?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn extract_config_value(html: &str, key: &str) -> Option<Value> {
     let marker = format!("\"{key}\":");
     let start = html.find(&marker)? + marker.len();
     let remaining = html[start..].trim_start();
+    let end = json_value_end(remaining)?;
+    serde_json::from_str(&remaining[..end]).ok()
+}
+
+fn json_value_end(input: &str) -> Option<usize> {
+    match input.chars().next()? {
+        '"' => json_string_end(input),
+        '{' | '[' => json_compound_end(input),
+        _ => None,
+    }
+}
+
+fn json_string_end(input: &str) -> Option<usize> {
+    if !input.starts_with('"') {
+        return None;
+    }
     let mut escaped = false;
-    let mut end = None;
-    for (index, character) in remaining.char_indices().skip(1) {
+    for (index, character) in input.char_indices().skip(1) {
         match character {
-            '"' if !escaped => {
-                end = Some(index + 1);
-                break;
-            }
+            '"' if !escaped => return Some(index + character.len_utf8()),
             '\\' if !escaped => escaped = true,
             _ => escaped = false,
         }
     }
-    serde_json::from_str(&remaining[..end?]).ok()
+    None
+}
+
+fn json_compound_end(input: &str) -> Option<usize> {
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, character) in input.char_indices() {
+        if in_string {
+            match character {
+                '"' if !escaped => in_string = false,
+                '\\' if !escaped => {
+                    escaped = true;
+                    continue;
+                }
+                _ => {}
+            }
+            escaped = false;
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index + character.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 fn normalize_response(target: &BrowseTarget, limit: usize, response: &Value) -> Value {
-    if matches!(target, BrowseTarget::Home) {
-        return normalize_home_response(limit, response);
+    if matches!(
+        target,
+        BrowseTarget::Home | BrowseTarget::Explore | BrowseTarget::Library
+    ) {
+        return normalize_sectioned_response(target, limit, response);
     }
     normalize_single_source_response(target, limit, response)
 }
 
 #[cfg(test)]
-fn normalize_home_response(limit: usize, response: &Value) -> Value {
-    normalize_home_responses(limit, std::slice::from_ref(response))
+fn normalize_home_responses(limit: usize, responses: &[Value]) -> Value {
+    normalize_sectioned_responses(&BrowseTarget::Home, limit, responses)
 }
 
-fn normalize_home_responses(limit: usize, responses: &[Value]) -> Value {
+fn normalize_sectioned_response(target: &BrowseTarget, limit: usize, response: &Value) -> Value {
+    normalize_sectioned_responses(target, limit, std::slice::from_ref(response))
+}
+
+fn normalize_sectioned_responses(
+    target: &BrowseTarget,
+    limit: usize,
+    responses: &[Value],
+) -> Value {
+    let (parent_id, section_kind, fallback_kind, fallback_title, url) =
+        sectioned_source_metadata(target);
     let mut sections = Vec::new();
     for response in responses {
-        collect_sections(response, &mut sections, limit);
+        collect_browse_sections(response, &mut sections, limit);
     }
     let sources: Vec<Value> = if sections.is_empty() {
         let mut items = Vec::new();
         let mut seen = HashSet::new();
         for response in responses {
-            collect_items(response, &mut items, &mut seen, limit);
+            collect_browse_items(response, &mut items, &mut seen, limit);
         }
         vec![normalized_source(
-            "ytm:home".to_string(),
-            "youtube-music-home",
-            "YouTube Music Home".to_string(),
-            "https://music.youtube.com/",
+            parent_id.to_string(),
+            fallback_kind,
+            fallback_title.to_string(),
+            url,
             items,
             responses.last().and_then(find_home_continuation),
         )]
@@ -343,16 +634,144 @@ fn normalize_home_responses(limit: usize, responses: &[Value]) -> Value {
             .enumerate()
             .map(|(index, section)| {
                 normalized_source(
-                    home_section_id(&section.title, index + 1),
-                    "youtube-music-home-section",
+                    section_id(parent_id, &section.title, index + 1),
+                    section_kind,
                     section.title,
-                    "https://music.youtube.com/",
+                    url,
                     section.items,
                     section.continuation,
                 )
             })
             .collect()
     };
+    json!({ "sources": sources })
+}
+
+fn sectioned_source_metadata(
+    target: &BrowseTarget,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    match target {
+        BrowseTarget::Explore => (
+            "ytm:explore",
+            "youtube-music-explore-section",
+            "youtube-music-explore",
+            "Explore",
+            "https://music.youtube.com/explore",
+        ),
+        BrowseTarget::Library => (
+            "ytm:library",
+            "youtube-music-library-section",
+            "youtube-music-library",
+            "Library",
+            "https://music.youtube.com/library",
+        ),
+        _ => (
+            "ytm:home",
+            "youtube-music-home-section",
+            "youtube-music-home",
+            "YouTube Music Home",
+            "https://music.youtube.com/",
+        ),
+    }
+}
+
+fn normalize_search_response(query: &str, limit: usize, response: &Value) -> Value {
+    let parent_id = format!("ytm:search:{}", short_hash(query));
+    let url = format!(
+        "https://music.youtube.com/search?q={}",
+        url_query_encode(query)
+    );
+    let mut sections = Vec::new();
+    collect_sections(response, &mut sections, limit);
+    if !sections.is_empty() {
+        let sources: Vec<Value> = sections
+            .into_iter()
+            .enumerate()
+            .map(|(index, section)| {
+                normalized_source(
+                    section_id(&parent_id, &section.title, index + 1),
+                    "youtube-music-search-section",
+                    section.title,
+                    &url,
+                    section.items,
+                    section.continuation,
+                )
+            })
+            .collect();
+        return json!({ "sources": sources });
+    }
+
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    collect_items(response, &mut items, &mut seen, limit);
+    json!({
+        "sources": [normalized_source(
+            parent_id,
+            "youtube-music-search",
+            format!("Search: {query}"),
+            &url,
+            items,
+            find_first_string_for_key(response, "continuation")
+        )]
+    })
+}
+
+fn normalize_browse_id_response(browse_id: &str, limit: usize, response: &Value) -> Value {
+    let title = browse_response_title(response).unwrap_or_else(|| browse_id.to_string());
+    let url = format!("https://music.youtube.com/browse/{browse_id}");
+    let mut sections = Vec::new();
+    collect_sections(response, &mut sections, limit);
+    if sections.is_empty() {
+        let mut items = Vec::new();
+        let mut seen = HashSet::new();
+        collect_items(response, &mut items, &mut seen, limit);
+        return json!({
+            "sources": [normalized_source_with_metadata(
+                format!("ytm:browse:{browse_id}"),
+                detail_source_kind(browse_id),
+                title.clone(),
+                &url,
+                items,
+                SourceMetadata {
+                    continuation: find_first_string_for_key(response, "continuation"),
+                    subtitle: browse_response_subtitle(response, &title),
+                    thumbnail_url: browse_response_thumbnail_url(response),
+                },
+            )]
+        });
+    }
+    let mut sources = vec![normalized_source_with_metadata(
+        format!("ytm:browse:{browse_id}:header"),
+        detail_source_kind(browse_id),
+        title.clone(),
+        &url,
+        Vec::new(),
+        SourceMetadata {
+            continuation: None,
+            subtitle: browse_response_subtitle(response, &title),
+            thumbnail_url: browse_response_thumbnail_url(response),
+        },
+    )];
+    sources.extend(sections.into_iter().enumerate().map(|(index, section)| {
+        normalized_source(
+            section_id(
+                &format!("ytm:browse:{browse_id}"),
+                &section.title,
+                index + 1,
+            ),
+            "youtube-music-detail-section",
+            section.title,
+            &url,
+            section.items,
+            section.continuation,
+        )
+    }));
     json!({ "sources": sources })
 }
 
@@ -371,11 +790,41 @@ fn normalize_single_source_response(
             "YouTube Music Home",
             "https://music.youtube.com/",
         ),
+        BrowseTarget::Explore => (
+            "ytm:explore",
+            "youtube-music-explore",
+            "Explore",
+            "https://music.youtube.com/explore",
+        ),
         BrowseTarget::Library => (
+            "ytm:library",
+            "youtube-music-library",
+            "Library",
+            "https://music.youtube.com/library",
+        ),
+        BrowseTarget::LibrarySongs => (
             "ytm:library:songs",
             "youtube-music-library",
             "Library Songs",
             "https://music.youtube.com/library/songs",
+        ),
+        BrowseTarget::LibraryAlbums => (
+            "ytm:library:albums",
+            "youtube-music-library",
+            "Library Albums",
+            "https://music.youtube.com/library/albums",
+        ),
+        BrowseTarget::LibraryArtists => (
+            "ytm:library:artists",
+            "youtube-music-library",
+            "Library Artists",
+            "https://music.youtube.com/library/artists",
+        ),
+        BrowseTarget::LibraryPlaylists => (
+            "ytm:library:playlists",
+            "youtube-music-library",
+            "Library Playlists",
+            "https://music.youtube.com/library/playlists",
         ),
         BrowseTarget::Liked => (
             "ytm:library:liked",
@@ -396,6 +845,19 @@ fn normalize_single_source_response(
     })
 }
 
+fn detail_source_kind(browse_id: &str) -> &'static str {
+    match browse_id {
+        id if id.starts_with("MPRE") => "youtube-music-album",
+        id if id.starts_with("UC") => "youtube-music-artist",
+        id if id.starts_with("MPSP") => "youtube-music-podcast",
+        id if id.starts_with("MPED") => "youtube-music-episode",
+        id if id.starts_with("VL") || id.starts_with("PL") || id.starts_with("RD") => {
+            "youtube-music-playlist"
+        }
+        _ => "youtube-music-detail",
+    }
+}
+
 fn normalized_source(
     id: String,
     kind: &str,
@@ -404,14 +866,134 @@ fn normalized_source(
     items: Vec<Value>,
     continuation: Option<String>,
 ) -> Value {
+    normalized_source_with_metadata(
+        id,
+        kind,
+        title,
+        url,
+        items,
+        SourceMetadata {
+            continuation,
+            ..Default::default()
+        },
+    )
+}
+
+#[derive(Default)]
+struct SourceMetadata {
+    continuation: Option<String>,
+    subtitle: Option<String>,
+    thumbnail_url: Option<String>,
+}
+
+fn normalized_source_with_metadata(
+    id: String,
+    kind: &str,
+    title: String,
+    url: &str,
+    items: Vec<Value>,
+    metadata: SourceMetadata,
+) -> Value {
     json!({
         "id": id,
         "kind": kind,
         "title": title,
         "url": url,
         "items": items,
-        "continuation": continuation
+        "subtitle": metadata.subtitle,
+        "thumbnail-url": metadata.thumbnail_url,
+        "continuation": metadata.continuation
     })
+}
+
+fn browse_response_title(value: &Value) -> Option<String> {
+    [
+        "/header/musicDetailHeaderRenderer/title/runs/0/text",
+        "/header/musicImmersiveHeaderRenderer/title/runs/0/text",
+        "/header/musicEditablePlaylistDetailHeaderRenderer/header/musicDetailHeaderRenderer/title/runs/0/text",
+        "/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/title",
+        "/metadata/musicDetailHeaderRenderer/title/runs/0/text",
+    ]
+    .iter()
+    .find_map(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string)
+    })
+    .or_else(|| find_header_title(value))
+}
+
+fn browse_response_subtitle(value: &Value, title: &str) -> Option<String> {
+    let header = find_header_renderer(value)?;
+    let mut seen = HashSet::new();
+    let parts: Vec<String> = collect_text_runs(header)
+        .into_iter()
+        .filter_map(|run| {
+            let text = run.text.trim();
+            let lower = text.to_ascii_lowercase();
+            (!text.is_empty()
+                && text != title
+                && !is_separator(text)
+                && parse_duration(text).is_none()
+                && !matches!(
+                    lower.as_str(),
+                    "shuffle" | "radio" | "share" | "subscribe" | "subscribed" | "play"
+                )
+                && seen.insert(text.to_string()))
+            .then_some(text.to_string())
+        })
+        .take(4)
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" - "))
+}
+
+fn browse_response_thumbnail_url(value: &Value) -> Option<String> {
+    find_header_renderer(value).and_then(find_best_thumbnail)
+}
+
+fn find_header_renderer(value: &Value) -> Option<&Value> {
+    match value {
+        Value::Object(object) => {
+            for renderer_name in [
+                "musicDetailHeaderRenderer",
+                "musicImmersiveHeaderRenderer",
+                "musicEditablePlaylistDetailHeaderRenderer",
+                "musicVisualHeaderRenderer",
+                "musicHeaderRenderer",
+            ] {
+                if let Some(renderer) = object.get(renderer_name) {
+                    return Some(renderer);
+                }
+            }
+            object.values().find_map(find_header_renderer)
+        }
+        Value::Array(array) => array.iter().find_map(find_header_renderer),
+        _ => None,
+    }
+}
+
+fn find_header_title(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => {
+            for renderer_name in [
+                "musicDetailHeaderRenderer",
+                "musicImmersiveHeaderRenderer",
+                "musicEditablePlaylistDetailHeaderRenderer",
+                "musicHeaderRenderer",
+            ] {
+                if let Some(renderer) = object.get(renderer_name) {
+                    if let Some(title) = section_title(renderer).or_else(|| first_text(renderer)) {
+                        return Some(title);
+                    }
+                }
+            }
+            object.values().find_map(find_header_title)
+        }
+        Value::Array(array) => array.iter().find_map(find_header_title),
+        _ => None,
+    }
 }
 
 struct MusicSection {
@@ -424,12 +1006,15 @@ fn collect_sections(value: &Value, sections: &mut Vec<MusicSection>, limit: usiz
     match value {
         Value::Object(object) => {
             for renderer_name in [
+                "musicCardShelfRenderer",
                 "musicCarouselShelfRenderer",
                 "musicShelfRenderer",
                 "gridRenderer",
             ] {
                 if let Some(renderer) = object.get(renderer_name) {
-                    if let Some(section) = parse_section(renderer, sections.len() + 1, limit) {
+                    if let Some(section) =
+                        parse_renderer_section(renderer_name, renderer, sections.len() + 1, limit)
+                    {
                         sections.push(section);
                     }
                     return;
@@ -448,6 +1033,50 @@ fn collect_sections(value: &Value, sections: &mut Vec<MusicSection>, limit: usiz
     }
 }
 
+fn collect_browse_sections(value: &Value, sections: &mut Vec<MusicSection>, limit: usize) {
+    if let Some(root) = primary_browse_section_root(value) {
+        collect_sections(root, sections, limit);
+    } else {
+        collect_sections(value, sections, limit);
+    }
+}
+
+fn collect_browse_items(
+    value: &Value,
+    items: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+    limit: usize,
+) {
+    if let Some(root) = primary_browse_section_root(value) {
+        collect_items(root, items, seen, limit);
+    } else {
+        collect_items(value, items, seen, limit);
+    }
+}
+
+fn primary_browse_section_root(value: &Value) -> Option<&Value> {
+    [
+        "/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents",
+        "/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer",
+        "/contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents",
+        "/contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer",
+    ]
+    .iter()
+    .find_map(|pointer| value.pointer(pointer))
+}
+
+fn parse_renderer_section(
+    renderer_name: &str,
+    renderer: &Value,
+    index: usize,
+    limit: usize,
+) -> Option<MusicSection> {
+    if renderer_name == "musicCardShelfRenderer" {
+        return parse_card_shelf_section(renderer, index, limit);
+    }
+    parse_section(renderer, index, limit)
+}
+
 fn parse_section(renderer: &Value, index: usize, limit: usize) -> Option<MusicSection> {
     let mut items = Vec::new();
     let mut seen = HashSet::new();
@@ -457,6 +1086,28 @@ fn parse_section(renderer: &Value, index: usize, limit: usize) -> Option<MusicSe
     }
     Some(MusicSection {
         title: section_title(renderer).unwrap_or_else(|| format!("Home section {index}")),
+        items,
+        continuation: find_first_string_for_key(renderer, "continuation"),
+    })
+}
+
+fn parse_card_shelf_section(renderer: &Value, _index: usize, limit: usize) -> Option<MusicSection> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(item) = parse_card_shelf_header(renderer) {
+        seen.insert(item_dedupe_key(&item));
+        items.push(item);
+    }
+    if items.len() < limit {
+        if let Some(contents) = renderer.get("contents") {
+            collect_items(contents, &mut items, &mut seen, limit);
+        }
+    }
+    if items.is_empty() {
+        return None;
+    }
+    Some(MusicSection {
+        title: "Top result".to_string(),
         items,
         continuation: find_first_string_for_key(renderer, "continuation"),
     })
@@ -497,13 +1148,27 @@ fn first_text(value: &Value) -> Option<String> {
     }
 }
 
-fn home_section_id(title: &str, index: usize) -> String {
+fn section_id(parent_id: &str, title: &str, index: usize) -> String {
     let slug = slugify(title);
     if slug.is_empty() {
-        format!("ytm:home:{index}:{}", short_hash(title))
+        format!("{parent_id}:{index}:{}", short_hash(title))
     } else {
-        format!("ytm:home:{index}:{slug}")
+        format!("{parent_id}:{index}:{slug}")
     }
+}
+
+fn url_query_encode(input: &str) -> String {
+    let mut output = String::new();
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                output.push(byte as char)
+            }
+            b' ' => output.push('+'),
+            _ => output.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    output
 }
 
 fn slugify(input: &str) -> String {
@@ -563,6 +1228,105 @@ fn collect_items(value: &Value, items: &mut Vec<Value>, seen: &mut HashSet<Strin
     }
 }
 
+fn parse_card_shelf_header(renderer: &Value) -> Option<Value> {
+    let title = renderer
+        .pointer("/title/runs/0/text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)?;
+    let mut runs = Vec::new();
+    for pointer in [
+        "/title",
+        "/subtitle",
+        "/secondSubtitle",
+        "/subtitleBadges",
+        "/description",
+    ] {
+        if let Some(value) = renderer.pointer(pointer) {
+            collect_text_runs_into(value, &mut runs);
+        }
+    }
+    let browse_endpoint = find_direct_browse_endpoint(renderer);
+    let browse_id = browse_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.browse_id.clone());
+    let browse_params = browse_endpoint
+        .as_ref()
+        .and_then(|endpoint| endpoint.params.clone());
+    let playlist_id = renderer
+        .pointer("/navigationEndpoint/watchEndpoint/playlistId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            renderer
+                .pointer("/title/runs/0/navigationEndpoint/watchEndpoint/playlistId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let id = browse_id
+        .clone()
+        .or_else(|| playlist_id.clone())
+        .unwrap_or_else(|| format!("item:{title}"));
+    let kind = item_kind(browse_id.as_deref(), playlist_id.as_deref(), &runs);
+    let subtitle = runs
+        .iter()
+        .filter_map(|run| {
+            let text = run.text.trim();
+            (!text.is_empty()
+                && text != title
+                && !is_separator(text)
+                && parse_duration(text).is_none())
+            .then_some(text.to_string())
+        })
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" - ");
+    let thumbnail_url = renderer
+        .get("thumbnail")
+        .and_then(find_best_thumbnail)
+        .or_else(|| {
+            renderer
+                .get("thumbnailRenderer")
+                .and_then(find_best_thumbnail)
+        })
+        .or_else(|| find_best_thumbnail(renderer));
+    let url = item_url(&kind, browse_id.as_deref(), playlist_id.as_deref());
+    let mut item = Map::from_iter([
+        ("type".to_string(), Value::String(kind)),
+        ("id".to_string(), Value::String(id)),
+        ("title".to_string(), Value::String(title)),
+        (
+            "subtitle".to_string(),
+            if subtitle.is_empty() {
+                Value::Null
+            } else {
+                Value::String(subtitle)
+            },
+        ),
+        (
+            "url".to_string(),
+            url.map(Value::String).unwrap_or(Value::Null),
+        ),
+        (
+            "browse-id".to_string(),
+            browse_id.map(Value::String).unwrap_or(Value::Null),
+        ),
+        (
+            "browse-params".to_string(),
+            browse_params.map(Value::String).unwrap_or(Value::Null),
+        ),
+        (
+            "playlist-id".to_string(),
+            playlist_id.map(Value::String).unwrap_or(Value::Null),
+        ),
+        (
+            "thumbnail-url".to_string(),
+            thumbnail_url.map(Value::String).unwrap_or(Value::Null),
+        ),
+    ]);
+    Some(Value::Object(std::mem::take(&mut item)))
+}
+
 fn item_dedupe_key(item: &Value) -> String {
     item.get("id")
         .and_then(Value::as_str)
@@ -573,11 +1337,15 @@ fn item_dedupe_key(item: &Value) -> String {
 }
 
 fn parse_item(renderer: &Value) -> Option<Value> {
-    parse_track(renderer).or_else(|| parse_card(renderer))
+    if find_direct_browse_endpoint(renderer).is_some() {
+        parse_card(renderer).or_else(|| parse_track(renderer))
+    } else {
+        parse_track(renderer).or_else(|| parse_card(renderer))
+    }
 }
 
 fn parse_track(renderer: &Value) -> Option<Value> {
-    let video_id = find_first_string_for_key(renderer, "videoId")?;
+    let video_id = find_primary_watch_endpoint(renderer)?.video_id;
     let title = renderer
         .pointer("/title/runs/0/text")
         .and_then(Value::as_str)
@@ -591,6 +1359,7 @@ fn parse_track(renderer: &Value) -> Option<Value> {
                 .map(str::to_string)
         })?;
     let runs = collect_text_runs(renderer);
+    let kind = playable_item_kind(&runs);
     let artist = runs
         .iter()
         .find(|run| {
@@ -619,7 +1388,7 @@ fn parse_track(renderer: &Value) -> Option<Value> {
     let duration = runs.iter().find_map(|run| parse_duration(&run.text));
     let thumbnail_url = find_best_thumbnail(renderer);
     let mut item = Map::from_iter([
-        ("type".to_string(), Value::String("track".to_string())),
+        ("type".to_string(), Value::String(kind)),
         ("id".to_string(), Value::String(video_id.clone())),
         ("title".to_string(), Value::String(title)),
         (
@@ -666,13 +1435,20 @@ fn parse_card(renderer: &Value) -> Option<Value> {
                 .map(|run| run.text)
         })?;
     let runs = collect_text_runs(renderer);
-    let browse_id = find_first_string_for_key(renderer, "browseId");
+    let browse_endpoint = find_primary_browse_endpoint(renderer);
+    let browse_id = browse_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.browse_id.clone())
+        .or_else(|| find_first_string_for_key(renderer, "browseId"));
+    let browse_params = browse_endpoint
+        .as_ref()
+        .and_then(|endpoint| endpoint.params.clone());
     let playlist_id = find_first_string_for_key(renderer, "playlistId");
     let id = browse_id
         .clone()
         .or_else(|| playlist_id.clone())
         .unwrap_or_else(|| format!("item:{title}"));
-    let kind = item_kind(browse_id.as_deref(), playlist_id.as_deref());
+    let kind = item_kind(browse_id.as_deref(), playlist_id.as_deref(), &runs);
     let subtitle = runs
         .iter()
         .filter_map(|run| {
@@ -705,6 +1481,18 @@ fn parse_card(renderer: &Value) -> Option<Value> {
             url.map(Value::String).unwrap_or(Value::Null),
         ),
         (
+            "browse-id".to_string(),
+            browse_id.map(Value::String).unwrap_or(Value::Null),
+        ),
+        (
+            "browse-params".to_string(),
+            browse_params.map(Value::String).unwrap_or(Value::Null),
+        ),
+        (
+            "playlist-id".to_string(),
+            playlist_id.map(Value::String).unwrap_or(Value::Null),
+        ),
+        (
             "thumbnail-url".to_string(),
             thumbnail_url.map(Value::String).unwrap_or(Value::Null),
         ),
@@ -712,12 +1500,28 @@ fn parse_card(renderer: &Value) -> Option<Value> {
     Some(Value::Object(std::mem::take(&mut item)))
 }
 
-fn item_kind(browse_id: Option<&str>, playlist_id: Option<&str>) -> String {
+fn playable_item_kind(runs: &[TextRun]) -> String {
+    if text_runs_contain(runs, "episode") || text_runs_contain(runs, "podcast") {
+        "episode".to_string()
+    } else {
+        "track".to_string()
+    }
+}
+
+fn item_kind(browse_id: Option<&str>, playlist_id: Option<&str>, runs: &[TextRun]) -> String {
+    if text_runs_contain(runs, "podcast") {
+        return "podcast".to_string();
+    }
+    if text_runs_contain(runs, "episode") {
+        return "episode".to_string();
+    }
     if playlist_id.is_some() {
         return "playlist".to_string();
     }
     match browse_id.unwrap_or_default() {
         id if id.starts_with("MPRE") => "album",
+        id if id.starts_with("MPSP") => "podcast",
+        id if id.starts_with("MPED") => "episode",
         id if id.starts_with("UC") => "artist",
         id if id.starts_with("VL") || id.starts_with("PL") || id.starts_with("RD") => "playlist",
         _ => "item",
@@ -739,6 +1543,90 @@ fn item_url(kind: &str, browse_id: Option<&str>, playlist_id: Option<&str>) -> O
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchEndpoint {
+    video_id: String,
+}
+
+fn find_primary_watch_endpoint(renderer: &Value) -> Option<WatchEndpoint> {
+    [
+        "/navigationEndpoint",
+        "/title/runs/0/navigationEndpoint",
+        "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint",
+    ]
+    .iter()
+    .find_map(|path| {
+        renderer
+            .pointer(path)
+            .and_then(watch_endpoint_from_navigation_endpoint)
+    })
+}
+
+fn watch_endpoint_from_navigation_endpoint(value: &Value) -> Option<WatchEndpoint> {
+    let video_id = value
+        .get("watchEndpoint")
+        .and_then(|value| value.get("videoId"))
+        .and_then(Value::as_str)?
+        .to_string();
+    Some(WatchEndpoint { video_id })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowseEndpoint {
+    browse_id: String,
+    params: Option<String>,
+}
+
+fn find_primary_browse_endpoint(renderer: &Value) -> Option<BrowseEndpoint> {
+    find_direct_browse_endpoint(renderer).or_else(|| find_first_browse_endpoint(renderer))
+}
+
+fn find_direct_browse_endpoint(renderer: &Value) -> Option<BrowseEndpoint> {
+    [
+        "/navigationEndpoint",
+        "/title/runs/0/navigationEndpoint",
+        "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint",
+    ]
+    .iter()
+    .find_map(|path| {
+        renderer
+            .pointer(path)
+            .and_then(browse_endpoint_from_navigation_endpoint)
+    })
+}
+
+fn browse_endpoint_from_navigation_endpoint(value: &Value) -> Option<BrowseEndpoint> {
+    value
+        .get("browseEndpoint")
+        .and_then(browse_endpoint_from_browse_endpoint)
+}
+
+fn browse_endpoint_from_browse_endpoint(value: &Value) -> Option<BrowseEndpoint> {
+    let browse_id = value.get("browseId").and_then(Value::as_str)?.to_string();
+    let params = value
+        .get("params")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    Some(BrowseEndpoint { browse_id, params })
+}
+
+fn find_first_browse_endpoint(value: &Value) -> Option<BrowseEndpoint> {
+    match value {
+        Value::Object(object) => {
+            if let Some(endpoint) = object
+                .get("browseEndpoint")
+                .and_then(browse_endpoint_from_browse_endpoint)
+            {
+                return Some(endpoint);
+            }
+            object.values().find_map(find_first_browse_endpoint)
+        }
+        Value::Array(array) => array.iter().find_map(find_first_browse_endpoint),
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 struct TextRun {
     text: String,
@@ -749,6 +1637,11 @@ fn collect_text_runs(value: &Value) -> Vec<TextRun> {
     let mut output = Vec::new();
     collect_text_runs_into(value, &mut output);
     output
+}
+
+fn text_runs_contain(runs: &[TextRun], needle: &str) -> bool {
+    runs.iter()
+        .any(|run| run.text.to_ascii_lowercase().contains(needle))
 }
 
 fn collect_text_runs_into(value: &Value, output: &mut Vec<TextRun>) {
@@ -845,7 +1738,7 @@ mod tests {
 
     #[test]
     fn extracts_bootstrap_configuration() {
-        let html = r#"<script>ytcfg.set({"INNERTUBE_API_KEY":"key","INNERTUBE_CLIENT_VERSION":"1.20260623.01.00","VISITOR_DATA":"visitor"});</script>"#;
+        let html = r#"<script>ytcfg.set({"INNERTUBE_API_KEY":"key","INNERTUBE_CLIENT_VERSION":"1.20260623.01.00","VISITOR_DATA":"visitor","INNERTUBE_CONTEXT":{"client":{"clientName":"WEB_REMIX","clientVersion":"old","hl":"zh-CN","gl":"US"},"user":{"lockedSafetyMode":false}}});</script>"#;
         assert_eq!(
             extract_config_string(html, "INNERTUBE_API_KEY").as_deref(),
             Some("key")
@@ -853,6 +1746,137 @@ mod tests {
         assert_eq!(
             extract_config_string(html, "VISITOR_DATA").as_deref(),
             Some("visitor")
+        );
+        let context = extract_config_value(html, "INNERTUBE_CONTEXT").expect("context");
+        assert_eq!(
+            context.pointer("/client/gl").and_then(Value::as_str),
+            Some("US")
+        );
+        assert_eq!(
+            context
+                .pointer("/user/lockedSafetyMode")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn browse_id_request_body_includes_params() {
+        let auth = AuthConfig {
+            innertube_context: Some(json!({
+                "client": {
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": "auth-client-version",
+                    "hl": "zh-CN",
+                    "gl": "US"
+                },
+                "user": {
+                    "lockedSafetyMode": false,
+                    "onBehalfOfUser": "auth-brand"
+                }
+            })),
+            ..test_auth()
+        };
+        let bootstrap = Bootstrap {
+            api_key: "key".to_string(),
+            client_version: "client-version".to_string(),
+            visitor_data: None,
+            context: Some(json!({
+                "client": {
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": "old-client-version",
+                    "hl": "en",
+                    "gl": "IN"
+                },
+                "user": {
+                    "lockedSafetyMode": true
+                }
+            })),
+        };
+        let body = browse_id_request_body(&auth, &bootstrap, "VLPL1", Some("ggMCCAI%3D"));
+        assert_eq!(body.get("browseId").and_then(Value::as_str), Some("VLPL1"));
+        assert_eq!(
+            body.get("params").and_then(Value::as_str),
+            Some("ggMCCAI%3D")
+        );
+        assert_eq!(
+            body.pointer("/context/client/clientVersion")
+                .and_then(Value::as_str),
+            Some("client-version")
+        );
+        assert_eq!(
+            body.pointer("/context/client/hl").and_then(Value::as_str),
+            Some("en")
+        );
+        assert_eq!(
+            body.pointer("/context/client/gl").and_then(Value::as_str),
+            Some("IN")
+        );
+        assert_eq!(
+            body.pointer("/context/user/lockedSafetyMode")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            body.pointer("/context/user/onBehalfOfUser")
+                .and_then(Value::as_str),
+            Some("auth-brand")
+        );
+    }
+
+    #[test]
+    fn request_body_sets_on_behalf_of_user_from_page_id() {
+        let auth = AuthConfig {
+            headers: BTreeMap::from([
+                ("cookie".to_string(), "__Secure-3PAPISID=secret".to_string()),
+                ("origin".to_string(), YTM_ORIGIN.to_string()),
+                ("x-goog-pageid".to_string(), "brand-page-id".to_string()),
+            ]),
+            ..test_auth()
+        };
+        let bootstrap = Bootstrap {
+            api_key: "key".to_string(),
+            client_version: "client-version".to_string(),
+            visitor_data: None,
+            context: None,
+        };
+        let body = browse_id_request_body(&auth, &bootstrap, "FEmusic_home", None);
+        assert_eq!(
+            body.pointer("/context/user/onBehalfOfUser")
+                .and_then(Value::as_str),
+            Some("brand-page-id")
+        );
+    }
+
+    #[test]
+    fn base_headers_do_not_send_page_id_as_header() {
+        let auth = AuthConfig {
+            headers: BTreeMap::from([
+                ("cookie".to_string(), "__Secure-3PAPISID=secret".to_string()),
+                ("origin".to_string(), YTM_ORIGIN.to_string()),
+                ("x-goog-pageid".to_string(), "brand-page-id".to_string()),
+            ]),
+            ..test_auth()
+        };
+        let headers = base_headers(&auth).unwrap();
+        assert_eq!(
+            headers
+                .get("x-goog-authuser")
+                .and_then(|value| value.to_str().ok()),
+            Some("0")
+        );
+        assert!(headers.get("x-goog-pageid").is_none());
+    }
+
+    #[test]
+    fn appends_consent_cookie_when_missing() {
+        assert_eq!(
+            cookie_header_with_consent("SAPISID=secret", false),
+            "SAPISID=secret; SOCS=CAI"
+        );
+        assert_eq!(
+            cookie_header_with_consent("SAPISID=secret; SOCS=present", true),
+            "SAPISID=secret; SOCS=present"
         );
     }
 
@@ -909,7 +1933,7 @@ mod tests {
                     "title": {"runs": [{
                         "text": "Album Title",
                         "navigationEndpoint": {
-                            "browseEndpoint": {"browseId": "MPRE1"}
+                            "browseEndpoint": {"browseId": "MPRE1", "params": "album-params"}
                         }
                     }]},
                     "subtitle": {"runs": [{"text": "Artist"}]},
@@ -922,7 +1946,13 @@ mod tests {
                     "title": {"runs": [{
                         "text": "Playlist Title",
                         "navigationEndpoint": {
-                            "browseEndpoint": {"browseId": "VLPL1"}
+                            "browseEndpoint": {"browseId": "VLPL1", "params": "playlist-params"}
+                        }
+                    }]},
+                    "subtitle": {"runs": [{
+                        "text": "Artist",
+                        "navigationEndpoint": {
+                            "browseEndpoint": {"browseId": "UCARTIST"}
                         }
                     }]},
                     "thumbnailRenderer": {"musicThumbnailRenderer": {
@@ -940,12 +1970,28 @@ mod tests {
             Some("https://music.youtube.com/browse/MPRE1")
         );
         assert_eq!(
+            album.get("browse-id").and_then(Value::as_str),
+            Some("MPRE1")
+        );
+        assert_eq!(
+            album.get("browse-params").and_then(Value::as_str),
+            Some("album-params")
+        );
+        assert_eq!(
             album.get("thumbnail-url").and_then(Value::as_str),
             Some("album-large")
         );
         assert_eq!(
             playlist.get("type").and_then(Value::as_str),
             Some("playlist")
+        );
+        assert_eq!(
+            playlist.get("browse-id").and_then(Value::as_str),
+            Some("VLPL1")
+        );
+        assert_eq!(
+            playlist.get("browse-params").and_then(Value::as_str),
+            Some("playlist-params")
         );
     }
 
@@ -1020,6 +2066,541 @@ mod tests {
         assert_eq!(
             sources[1].pointer("/items/0/type").and_then(Value::as_str),
             Some("playlist")
+        );
+    }
+
+    #[test]
+    fn normalizes_home_from_primary_tab_only() {
+        let response = json!({
+            "contents": {
+                "singleColumnBrowseResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "selected": true,
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "musicCarouselShelfRenderer": {
+                                            "header": {
+                                                "musicCarouselShelfBasicHeaderRenderer": {
+                                                    "title": {"runs": [{"text": "Listen again"}]}
+                                                }
+                                            },
+                                            "contents": [{
+                                                "musicTwoRowItemRenderer": {
+                                                    "title": {"runs": [{"text": "Personal Song"}]},
+                                                    "navigationEndpoint": {
+                                                        "watchEndpoint": {"videoId": "personal"}
+                                                    }
+                                                }
+                                            }]
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }, {
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "musicCarouselShelfRenderer": {
+                                            "header": {
+                                                "musicCarouselShelfBasicHeaderRenderer": {
+                                                    "title": {"runs": [{"text": "Regional charts"}]}
+                                                }
+                                            },
+                                            "contents": [{
+                                                "musicTwoRowItemRenderer": {
+                                                    "title": {"runs": [{"text": "Generic Playlist"}]},
+                                                    "navigationEndpoint": {
+                                                        "browseEndpoint": {"browseId": "VLGENERIC"}
+                                                    }
+                                                }
+                                            }]
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+        let normalized = normalize_response(&BrowseTarget::Home, 12, &response);
+        let sources = normalized
+            .get("sources")
+            .and_then(Value::as_array)
+            .expect("sources");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0].get("title").and_then(Value::as_str),
+            Some("Listen again")
+        );
+        assert_eq!(
+            sources[0].pointer("/items/0/id").and_then(Value::as_str),
+            Some("personal")
+        );
+    }
+
+    #[test]
+    fn normalizes_library_shelves_as_sources() {
+        let response = json!({
+            "contents": {
+                "sectionListRenderer": {
+                    "contents": [{
+                        "musicCarouselShelfRenderer": {
+                            "header": {
+                                "musicCarouselShelfBasicHeaderRenderer": {
+                                    "title": {"runs": [{"text": "Albums"}]}
+                                }
+                            },
+                            "contents": [{
+                                "musicTwoRowItemRenderer": {
+                                    "title": {"runs": [{"text": "Album A"}]},
+                                    "navigationEndpoint": {
+                                        "browseEndpoint": {"browseId": "MPRE1"}
+                                    }
+                                }
+                            }]
+                        }
+                    }]
+                }
+            }
+        });
+        let normalized = normalize_response(&BrowseTarget::Library, 12, &response);
+        let source = normalized.pointer("/sources/0").unwrap();
+        assert_eq!(
+            source.get("kind").and_then(Value::as_str),
+            Some("youtube-music-library-section")
+        );
+        assert_eq!(source.get("title").and_then(Value::as_str), Some("Albums"));
+        assert_eq!(
+            source.pointer("/items/0/type").and_then(Value::as_str),
+            Some("album")
+        );
+    }
+
+    #[test]
+    fn library_targets_keep_display_order() {
+        assert_eq!(
+            LIBRARY_TARGETS,
+            [
+                BrowseTarget::LibrarySongs,
+                BrowseTarget::LibraryAlbums,
+                BrowseTarget::LibraryArtists,
+                BrowseTarget::LibraryPlaylists,
+                BrowseTarget::Liked,
+            ]
+        );
+    }
+
+    #[test]
+    fn normalizes_explore_shelves_as_sources() {
+        let response = json!({
+            "contents": {
+                "sectionListRenderer": {
+                    "contents": [{
+                        "musicCarouselShelfRenderer": {
+                            "header": {
+                                "musicCarouselShelfBasicHeaderRenderer": {
+                                    "title": {"runs": [{"text": "New releases"}]}
+                                }
+                            },
+                            "contents": [{
+                                "musicTwoRowItemRenderer": {
+                                    "title": {"runs": [{"text": "Album A"}]},
+                                    "navigationEndpoint": {
+                                        "browseEndpoint": {"browseId": "MPRE1"}
+                                    }
+                                }
+                            }]
+                        }
+                    }]
+                }
+            }
+        });
+        let normalized = normalize_response(&BrowseTarget::Explore, 12, &response);
+        let source = normalized.pointer("/sources/0").unwrap();
+        assert_eq!(
+            source.get("kind").and_then(Value::as_str),
+            Some("youtube-music-explore-section")
+        );
+        assert_eq!(
+            source.get("id").and_then(Value::as_str),
+            Some("ytm:explore:1:new-releases")
+        );
+        assert_eq!(
+            source.pointer("/items/0/type").and_then(Value::as_str),
+            Some("album")
+        );
+    }
+
+    #[test]
+    fn normalizes_search_response() {
+        let response = json!({
+            "contents": [{
+                "musicResponsiveListItemRenderer": {
+                    "flexColumns": [{
+                        "musicResponsiveListItemFlexColumnRenderer": {
+                            "text": {"runs": [{"text": "Tokyo"}]}
+                        }
+                    }],
+                    "navigationEndpoint": {
+                        "watchEndpoint": {"videoId": "v1"}
+                    }
+                }
+            }, {
+                "musicTwoRowItemRenderer": {
+                    "title": {"runs": [{
+                        "text": "Album Result",
+                        "navigationEndpoint": {
+                            "browseEndpoint": {"browseId": "MPRE1"}
+                        }
+                    }]},
+                    "subtitle": {"runs": [{"text": "Album"}, {"text": " • "}, {"text": "Artist"}]},
+                    "thumbnailOverlay": {
+                        "musicItemThumbnailOverlayRenderer": {
+                            "content": {
+                                "musicPlayButtonRenderer": {
+                                    "playNavigationEndpoint": {
+                                        "watchEndpoint": {"videoId": "nested-play-button"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }, {
+                "musicResponsiveListItemRenderer": {
+                    "flexColumns": [{
+                        "musicResponsiveListItemFlexColumnRenderer": {
+                            "text": {"runs": [{
+                                "text": "Artist Result",
+                                "navigationEndpoint": {
+                                    "browseEndpoint": {"browseId": "UC1"}
+                                }
+                            }]}
+                        }
+                    }],
+                    "navigationEndpoint": {
+                        "browseEndpoint": {"browseId": "UC1"}
+                    }
+                }
+            }, {
+                "musicTwoRowItemRenderer": {
+                    "title": {"runs": [{
+                        "text": "Podcast Result",
+                        "navigationEndpoint": {
+                            "browseEndpoint": {"browseId": "MPSP1"}
+                        }
+                    }]},
+                    "subtitle": {"runs": [{"text": "Podcast"}]}
+                }
+            }, {
+                "musicResponsiveListItemRenderer": {
+                    "flexColumns": [{
+                        "musicResponsiveListItemFlexColumnRenderer": {
+                            "text": {"runs": [{"text": "Episode Result"}]}
+                        }
+                    }, {
+                        "musicResponsiveListItemFlexColumnRenderer": {
+                            "text": {"runs": [{"text": "Episode"}, {"text": " • "}, {"text": "Podcast"}]}
+                        }
+                    }],
+                    "navigationEndpoint": {
+                        "watchEndpoint": {"videoId": "episode1"}
+                    }
+                }
+            }]
+        });
+        let normalized = normalize_search_response("lofi tokyo", 10, &response);
+        let source = normalized.pointer("/sources/0").unwrap();
+        assert_eq!(
+            source.get("kind").and_then(Value::as_str),
+            Some("youtube-music-search")
+        );
+        assert_eq!(
+            source.get("url").and_then(Value::as_str),
+            Some("https://music.youtube.com/search?q=lofi+tokyo")
+        );
+        assert_eq!(
+            source.pointer("/items/0/id").and_then(Value::as_str),
+            Some("v1")
+        );
+        assert_eq!(
+            source.pointer("/items/0/type").and_then(Value::as_str),
+            Some("track")
+        );
+        assert_eq!(
+            source.pointer("/items/1/type").and_then(Value::as_str),
+            Some("album")
+        );
+        assert_eq!(
+            source.pointer("/items/1/id").and_then(Value::as_str),
+            Some("MPRE1")
+        );
+        assert_eq!(
+            source.pointer("/items/2/type").and_then(Value::as_str),
+            Some("artist")
+        );
+        assert_eq!(
+            source.pointer("/items/3/type").and_then(Value::as_str),
+            Some("podcast")
+        );
+        assert_eq!(
+            source.pointer("/items/4/type").and_then(Value::as_str),
+            Some("episode")
+        );
+    }
+
+    #[test]
+    fn normalizes_search_card_shelf_as_top_result_section() {
+        let response = json!({
+            "contents": {
+                "sectionListRenderer": {
+                    "contents": [{
+                        "musicCardShelfRenderer": {
+                            "title": {"runs": [{
+                                "text": "Chill girl Vibes",
+                                "navigationEndpoint": {
+                                    "browseEndpoint": {"browseId": "UCCHILL", "params": "artist-params"}
+                                }
+                            }]},
+                            "subtitle": {"runs": [
+                                {"text": "Artist"},
+                                {"text": " • "},
+                                {"text": "448K monthly listeners"}
+                            ]},
+                            "thumbnail": {"musicThumbnailRenderer": {
+                                "thumbnail": {"thumbnails": [{"url": "artist-small"}, {"url": "artist-large"}]}
+                            }},
+                            "contents": [{
+                                "musicResponsiveListItemRenderer": {
+                                    "flexColumns": [{
+                                        "musicResponsiveListItemFlexColumnRenderer": {
+                                            "text": {"runs": [{"text": "Quiet Collar Mark"}]}
+                                        }
+                                    }, {
+                                        "musicResponsiveListItemFlexColumnRenderer": {
+                                            "text": {"runs": [
+                                                {"text": "Song"},
+                                                {"text": " • "},
+                                                {"text": "Chill girl Vibes"}
+                                            ]}
+                                        }
+                                    }],
+                                    "navigationEndpoint": {
+                                        "watchEndpoint": {"videoId": "song1"}
+                                    },
+                                    "thumbnail": {"musicThumbnailRenderer": {
+                                        "thumbnail": {"thumbnails": [{"url": "song-thumb"}]}
+                                    }}
+                                }
+                            }]
+                        }
+                    }, {
+                        "musicShelfRenderer": {
+                            "title": {"runs": [{"text": "Songs"}]},
+                            "contents": [{
+                                "musicResponsiveListItemRenderer": {
+                                    "flexColumns": [{
+                                        "musicResponsiveListItemFlexColumnRenderer": {
+                                            "text": {"runs": [{"text": "Corner Store"}]}
+                                        }
+                                    }],
+                                    "navigationEndpoint": {
+                                        "watchEndpoint": {"videoId": "song2"}
+                                    }
+                                }
+                            }]
+                        }
+                    }]
+                }
+            }
+        });
+        let normalized = normalize_search_response("chill girl vibes", 10, &response);
+        let sources = normalized
+            .get("sources")
+            .and_then(Value::as_array)
+            .expect("sources");
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources[0].get("kind").and_then(Value::as_str),
+            Some("youtube-music-search-section")
+        );
+        assert_eq!(
+            sources[0].get("title").and_then(Value::as_str),
+            Some("Top result")
+        );
+        assert_eq!(
+            sources[0].pointer("/items/0/type").and_then(Value::as_str),
+            Some("artist")
+        );
+        assert_eq!(
+            sources[0].pointer("/items/0/title").and_then(Value::as_str),
+            Some("Chill girl Vibes")
+        );
+        assert_eq!(
+            sources[0]
+                .pointer("/items/0/subtitle")
+                .and_then(Value::as_str),
+            Some("Artist - 448K monthly listeners")
+        );
+        assert_eq!(
+            sources[0]
+                .pointer("/items/0/browse-id")
+                .and_then(Value::as_str),
+            Some("UCCHILL")
+        );
+        assert_eq!(
+            sources[0]
+                .pointer("/items/0/browse-params")
+                .and_then(Value::as_str),
+            Some("artist-params")
+        );
+        assert_eq!(
+            sources[0]
+                .pointer("/items/0/thumbnail-url")
+                .and_then(Value::as_str),
+            Some("artist-large")
+        );
+        assert_eq!(
+            sources[0].pointer("/items/1/type").and_then(Value::as_str),
+            Some("track")
+        );
+        assert_eq!(
+            sources[1].get("title").and_then(Value::as_str),
+            Some("Songs")
+        );
+    }
+
+    #[test]
+    fn normalizes_browse_id_response_as_detail_source() {
+        let response = json!({
+            "header": {
+                "musicDetailHeaderRenderer": {
+                    "title": {"runs": [{"text": "Playlist Title"}]}
+                }
+            },
+            "contents": [{
+                "musicResponsiveListItemRenderer": {
+                    "flexColumns": [{
+                        "musicResponsiveListItemFlexColumnRenderer": {
+                            "text": {"runs": [{"text": "Song"}]}
+                        }
+                    }],
+                    "navigationEndpoint": {
+                        "watchEndpoint": {"videoId": "v1"}
+                    }
+                }
+            }]
+        });
+        let normalized = normalize_browse_id_response("VLPL1", 10, &response);
+        let source = normalized.pointer("/sources/0").unwrap();
+        assert_eq!(
+            source.get("kind").and_then(Value::as_str),
+            Some("youtube-music-playlist")
+        );
+        assert_eq!(
+            source.get("title").and_then(Value::as_str),
+            Some("Playlist Title")
+        );
+        assert_eq!(
+            source.pointer("/items/0/id").and_then(Value::as_str),
+            Some("v1")
+        );
+    }
+
+    #[test]
+    fn normalizes_browse_id_response_with_header_and_sections() {
+        let response = json!({
+            "header": {
+                "musicImmersiveHeaderRenderer": {
+                    "title": {"runs": [{"text": "Chill girl Vibes"}]},
+                    "subtitle": {"runs": [{"text": "1.2K subscribers"}]},
+                    "thumbnail": {"musicThumbnailRenderer": {
+                        "thumbnail": {"thumbnails": [{"url": "avatar-small"}, {"url": "avatar-large"}]}
+                    }}
+                }
+            },
+            "contents": {
+                "sectionListRenderer": {
+                    "contents": [{
+                        "musicShelfRenderer": {
+                            "title": {"runs": [{"text": "Songs"}]},
+                            "contents": [{
+                                "musicResponsiveListItemRenderer": {
+                                    "flexColumns": [{
+                                        "musicResponsiveListItemFlexColumnRenderer": {
+                                            "text": {"runs": [{"text": "Popular Song"}]}
+                                        }
+                                    }],
+                                    "navigationEndpoint": {
+                                        "watchEndpoint": {"videoId": "song1"}
+                                    }
+                                }
+                            }]
+                        }
+                    }, {
+                        "musicCarouselShelfRenderer": {
+                            "header": {
+                                "musicCarouselShelfBasicHeaderRenderer": {
+                                    "title": {"runs": [{"text": "Albums"}]}
+                                }
+                            },
+                            "contents": [{
+                                "musicTwoRowItemRenderer": {
+                                    "title": {"runs": [{
+                                        "text": "Album A",
+                                        "navigationEndpoint": {
+                                            "browseEndpoint": {"browseId": "MPRE1"}
+                                        }
+                                    }]}
+                                }
+                            }]
+                        }
+                    }]
+                }
+            }
+        });
+        let normalized = normalize_browse_id_response("UCartist", 10, &response);
+        let sources = normalized
+            .get("sources")
+            .and_then(Value::as_array)
+            .expect("sources");
+        assert_eq!(sources.len(), 3);
+        assert_eq!(
+            sources[0].get("kind").and_then(Value::as_str),
+            Some("youtube-music-artist")
+        );
+        assert_eq!(
+            sources[0].get("title").and_then(Value::as_str),
+            Some("Chill girl Vibes")
+        );
+        assert_eq!(
+            sources[0].get("subtitle").and_then(Value::as_str),
+            Some("1.2K subscribers")
+        );
+        assert_eq!(
+            sources[0].get("thumbnail-url").and_then(Value::as_str),
+            Some("avatar-large")
+        );
+        assert_eq!(
+            sources[1].get("title").and_then(Value::as_str),
+            Some("Songs")
+        );
+        assert_eq!(
+            sources[1].pointer("/items/0/type").and_then(Value::as_str),
+            Some("track")
+        );
+        assert_eq!(
+            sources[2].get("title").and_then(Value::as_str),
+            Some("Albums")
+        );
+        assert_eq!(
+            sources[2].pointer("/items/0/type").and_then(Value::as_str),
+            Some("album")
         );
     }
 
@@ -1128,6 +2709,7 @@ mod tests {
                 ("cookie".to_string(), "__Secure-3PAPISID=secret".to_string()),
                 ("origin".to_string(), YTM_ORIGIN.to_string()),
             ]),
+            innertube_context: None,
         }
     }
 }

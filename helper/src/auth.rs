@@ -21,6 +21,8 @@ pub struct AuthConfig {
     pub schema: u32,
     pub source: AuthSource,
     pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub innertube_context: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,12 +172,16 @@ pub fn import_dia(
     let result = (|| {
         let target = find_or_open_music_target(&client, &base_url)?;
         let cookies = cdp_cookies(&target.websocket_url)?;
-        let config = auth_from_cdp_cookies(
+        let mut config = auth_from_cdp_cookies(
             "dia-cdp",
             Some("dia"),
             &cookies,
             version.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT),
         )?;
+        if let Some(session) = wait_for_cdp_session(&target.websocket_url, Duration::from_secs(12))?
+        {
+            apply_browser_session(&mut config, session);
+        }
         write_private_json(output, &config)?;
         Ok(config)
     })();
@@ -260,6 +266,7 @@ fn auth_from_headers(content: &str) -> Result<AuthConfig, String> {
             browser: None,
         },
         headers,
+        innertube_context: None,
     };
     config.validate()?;
     Ok(config)
@@ -322,11 +329,21 @@ fn auth_from_cookie_map(
             ("user-agent".to_string(), user_agent.to_string()),
             ("x-goog-authuser".to_string(), "0".to_string()),
         ]),
+        innertube_context: None,
     })
 }
 
 fn header_name_is_supported(name: &str) -> bool {
-    matches!(name, "cookie" | "origin" | "user-agent" | "x-goog-authuser")
+    matches!(
+        name,
+        "cookie"
+            | "origin"
+            | "referer"
+            | "user-agent"
+            | "x-goog-authuser"
+            | "x-goog-pageid"
+            | "x-origin"
+    )
 }
 
 fn reject_unsupported_browser_import(browser: &str) -> Result<(), String> {
@@ -372,6 +389,23 @@ struct CdpCookie {
     domain: String,
     #[serde(default)]
     expires: f64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+struct BrowserSession {
+    innertube_context: Option<Value>,
+    session_index: Option<String>,
+    delegated_session_id: Option<String>,
+    data_sync_id: Option<String>,
+}
+
+impl BrowserSession {
+    fn has_identity(&self) -> bool {
+        self.innertube_context.is_some()
+            || self.session_index.is_some()
+            || self.delegated_session_id.is_some()
+            || self.data_sync_id.is_some()
+    }
 }
 
 fn cdp_base_url(port: u16) -> String {
@@ -531,13 +565,183 @@ fn cdp_cookies(websocket_url: &str) -> Result<Vec<CdpCookie>, String> {
         .map_err(|error| format!("invalid DevTools cookie response: {error}"))
 }
 
+fn wait_for_cdp_session(
+    websocket_url: &str,
+    timeout: Duration,
+) -> Result<Option<BrowserSession>, String> {
+    let started = SystemTime::now();
+    let mut last_error = None;
+    loop {
+        match cdp_session(websocket_url) {
+            Ok(session) if session.has_identity() => return Ok(Some(session)),
+            Ok(_) => {}
+            Err(error) => last_error = Some(error),
+        }
+        if started.elapsed().unwrap_or_default() >= timeout {
+            if let Some(error) = last_error {
+                return Err(error);
+            }
+            return Ok(None);
+        }
+        sleep(Duration::from_millis(250));
+    }
+}
+
+fn cdp_session(websocket_url: &str) -> Result<BrowserSession, String> {
+    let expression = r#"
+(() => {
+  const get = (name) => {
+    try {
+      if (globalThis.ytcfg && typeof globalThis.ytcfg.get === "function") {
+        const value = globalThis.ytcfg.get(name);
+        if (value !== undefined) return value;
+      }
+      if (globalThis.ytcfg && globalThis.ytcfg.data_) {
+        const value = globalThis.ytcfg.data_[name];
+        if (value !== undefined) return value;
+      }
+    } catch (_) {}
+    return null;
+  };
+  const context = get("INNERTUBE_CONTEXT");
+  const sessionIndex = get("SESSION_INDEX");
+  const delegatedSessionId = get("DELEGATED_SESSION_ID");
+  const dataSyncId = get("DATASYNC_ID");
+  return {
+    innertubeContext: context || null,
+    sessionIndex: sessionIndex == null ? null : String(sessionIndex),
+    delegatedSessionId: delegatedSessionId == null ? null : String(delegatedSessionId),
+    dataSyncId: dataSyncId == null ? null : String(dataSyncId)
+  };
+})()
+"#;
+    let response = cdp_call_with_params(
+        websocket_url,
+        2,
+        "Runtime.evaluate",
+        json!({
+            "expression": expression,
+            "returnByValue": true,
+            "awaitPromise": true
+        }),
+    )?;
+    if let Some(exception) = response.get("exceptionDetails") {
+        return Err(format!(
+            "DevTools failed to evaluate YouTube Music session context: {exception}"
+        ));
+    }
+    let value = response
+        .pointer("/result/result/value")
+        .ok_or_else(|| "DevTools session context response did not include a value".to_string())?;
+    Ok(BrowserSession {
+        innertube_context: value
+            .get("innertubeContext")
+            .filter(|context| context.is_object())
+            .cloned(),
+        session_index: json_string_field(value, "sessionIndex"),
+        delegated_session_id: json_string_field(value, "delegatedSessionId"),
+        data_sync_id: json_string_field(value, "dataSyncId"),
+    })
+}
+
+fn json_string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn apply_browser_session(config: &mut AuthConfig, mut session: BrowserSession) {
+    if let Some(session_index) = session.session_index.take() {
+        config
+            .headers
+            .insert("x-goog-authuser".to_string(), session_index);
+    }
+
+    let page_id = session
+        .delegated_session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| session.innertube_context.as_ref().and_then(context_page_id))
+        .or_else(|| session.data_sync_id.as_deref().and_then(data_sync_page_id));
+    if let Some(page_id) = page_id {
+        config
+            .headers
+            .insert("x-goog-pageid".to_string(), page_id.clone());
+        if let Some(context) = session.innertube_context.as_mut() {
+            insert_on_behalf_of_user(context, &page_id);
+        }
+    }
+
+    if let Some(context) = session.innertube_context.take() {
+        config.innertube_context = Some(context);
+    }
+}
+
+fn context_page_id(context: &Value) -> Option<String> {
+    context
+        .pointer("/user/onBehalfOfUser")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn data_sync_page_id(data_sync_id: &str) -> Option<String> {
+    let first = data_sync_id
+        .split("||")
+        .next()
+        .unwrap_or(data_sync_id)
+        .trim();
+    (!first.is_empty()
+        && first.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        }))
+    .then(|| first.to_string())
+}
+
+fn insert_on_behalf_of_user(context: &mut Value, page_id: &str) {
+    let Some(context_object) = context.as_object_mut() else {
+        return;
+    };
+    if !context_object
+        .get("user")
+        .map(Value::is_object)
+        .unwrap_or(false)
+    {
+        context_object.insert("user".to_string(), Value::Object(serde_json::Map::new()));
+    }
+    if let Some(user) = context_object
+        .get_mut("user")
+        .and_then(Value::as_object_mut)
+    {
+        user.entry("onBehalfOfUser".to_string())
+            .or_insert_with(|| Value::String(page_id.to_string()));
+    }
+}
+
 fn cdp_call(websocket_url: &str, id: u64, method: &str) -> Result<Value, String> {
+    cdp_call_with_params(websocket_url, id, method, Value::Null)
+}
+
+fn cdp_call_with_params(
+    websocket_url: &str,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     let (mut socket, _) = connect(websocket_url)
         .map_err(|error| format!("cannot connect to DevTools websocket: {error}"))?;
+    let mut payload = json!({ "id": id, "method": method });
+    if !params.is_null() {
+        payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .insert("params".to_string(), params);
+    }
     socket
-        .send(Message::Text(
-            json!({ "id": id, "method": method }).to_string(),
-        ))
+        .send(Message::Text(payload.to_string()))
         .map_err(|error| format!("cannot send DevTools request: {error}"))?;
     loop {
         let message = socket
@@ -668,6 +872,8 @@ mod tests {
             "User-Agent: Browser UA\n",
             "Cookie: SID=sid-value; __Secure-3PAPISID=secret\n",
             "X-Goog-AuthUser: 1\n",
+            "X-Goog-PageId: brand-page-id\n",
+            "X-Origin: https://music.youtube.com\n",
             "Accept-Language: en-US\n"
         );
         let config = auth_from_headers(input).unwrap();
@@ -675,6 +881,8 @@ mod tests {
         assert_eq!(config.cookie("__Secure-3PAPISID"), Some("secret"));
         assert_eq!(config.header("user-agent"), Some("Browser UA"));
         assert_eq!(config.header("x-goog-authuser"), Some("1"));
+        assert_eq!(config.header("x-goog-pageid"), Some("brand-page-id"));
+        assert_eq!(config.header("x-origin"), Some("https://music.youtube.com"));
         assert!(config.header("accept-language").is_none());
     }
 
@@ -713,6 +921,54 @@ mod tests {
         assert_eq!(config.header("user-agent"), Some("Dia UA"));
         assert!(!config.header("cookie").unwrap().contains("ignored"));
         assert!(!config.header("cookie").unwrap().contains("expired"));
+    }
+
+    #[test]
+    fn applies_browser_session_identity_to_auth_config() {
+        let cookies = vec![CdpCookie {
+            name: "__Secure-3PAPISID".to_string(),
+            value: "secret".to_string(),
+            domain: ".youtube.com".to_string(),
+            expires: 0.0,
+        }];
+        let mut config = auth_from_cdp_cookies("dia-cdp", Some("dia"), &cookies, "Dia UA").unwrap();
+        apply_browser_session(
+            &mut config,
+            BrowserSession {
+                innertube_context: Some(json!({
+                    "client": {"clientName": "WEB_REMIX"},
+                    "user": {}
+                })),
+                session_index: Some("2".to_string()),
+                delegated_session_id: Some("brand-page-id".to_string()),
+                data_sync_id: None,
+            },
+        );
+        assert_eq!(config.header("x-goog-authuser"), Some("2"));
+        assert_eq!(config.header("x-goog-pageid"), Some("brand-page-id"));
+        assert_eq!(
+            config
+                .innertube_context
+                .as_ref()
+                .and_then(|context| context.pointer("/user/onBehalfOfUser"))
+                .and_then(Value::as_str),
+            Some("brand-page-id")
+        );
+    }
+
+    #[test]
+    fn loads_legacy_auth_without_context() {
+        let config: AuthConfig = serde_json::from_value(json!({
+            "schema": 1,
+            "source": {"kind": "browser", "browser": "test"},
+            "headers": {
+                "cookie": "__Secure-3PAPISID=secret",
+                "origin": YTM_ORIGIN
+            }
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        assert!(config.innertube_context.is_none());
     }
 
     #[test]

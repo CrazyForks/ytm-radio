@@ -140,9 +140,31 @@ repository. It is adapted from `~/repos/coding-guidelines/general.md` and
 
 - User-visible changes must update user documentation in the same change when
   they affect commands, key bindings, defaults, configuration, setup, or
-  workflows.
+  workflows. Use `README.md` for user operation and `prd.md` for product
+  behavior, scope, and UX decisions.
 - Code is the source of truth. If code and docs diverge, fix docs immediately.
 - Optimize Markdown for rendered reading, not source-width aesthetics. Do not
   rewrap unchanged prose just to satisfy a column width.
 - When documentation is hard to read, improve structure with headings, focused
   bullets, or tables instead of source-only line wrapping.
+
+## Postmortem Conventions
+
+The `postmortem/` directory records design decisions and lessons learned. Read
+relevant records before significant workflow, architecture, or integration
+changes.
+
+Write a postmortem when:
+
+- adding or changing a user-visible workflow;
+- choosing between non-obvious architectural approaches;
+- integrating an optional dependency or external system;
+- reverting or abandoning an approach, especially to document why it was wrong;
+- deliberately deferring a known limitation.
+
+Postmortems are historical records, not current product documentation. Do not
+rewrite old records just to match current behavior; write a new record for the
+later design and optionally add a short superseded note to the old one.
+
+Postmortems must explain why, not restate the code. A record that only
+describes what was done adds no value.

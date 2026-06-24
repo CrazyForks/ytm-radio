@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::env;
 use std::path::PathBuf;
 use std::process;
-use ytmusic::{browse, BrowseTarget};
+use ytmusic::{browse, browse_id as browse_detail, search, BrowseTarget};
 
 const SCHEMA_VERSION: u32 = 1;
 const DEFAULT_DIA_CDP_PORT: u16 = 29317;
@@ -32,6 +32,13 @@ enum Command {
         restart: bool,
     },
     Browse(BrowseTarget),
+    BrowseId {
+        browse_id: String,
+        params: Option<String>,
+    },
+    Search {
+        query: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +141,18 @@ where
             let auth = AuthConfig::load(required_auth_path(&options)?)?;
             browse(target, options.limit, &auth)?
         }
+        Command::BrowseId { browse_id, .. } if options.mock_data => {
+            mock_browse_id(browse_id, options.limit)
+        }
+        Command::BrowseId { browse_id, params } => {
+            let auth = AuthConfig::load(required_auth_path(&options)?)?;
+            browse_detail(browse_id, params.as_deref(), options.limit, &auth)?
+        }
+        Command::Search { query } if options.mock_data => mock_search(query, options.limit),
+        Command::Search { query } => {
+            let auth = AuthConfig::load(required_auth_path(&options)?)?;
+            search(query, options.limit, &auth)?
+        }
     };
     serde_json::to_string(&Envelope {
         ok: true,
@@ -164,6 +183,8 @@ where
     let command = match args.remove(0).as_str() {
         "auth" => parse_auth_command(&mut args)?,
         "browse" => parse_browse_command(&mut args)?,
+        "browse-id" => parse_browse_id_command(&mut args)?,
+        "search" => parse_search_command(&mut args)?,
         "help" | "--help" | "-h" => return Err(usage()),
         other => return Err(format!("unknown command `{other}`")),
     };
@@ -178,6 +199,7 @@ where
     let mut app = None;
     let mut restart = false;
     let mut yt_dlp = "yt-dlp".to_string();
+    let mut browse_params = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -206,6 +228,13 @@ where
             "--app" => app = Some(PathBuf::from(option_value(&args, &mut index)?)),
             "--restart" => restart = true,
             "--yt-dlp" => yt_dlp = option_value(&args, &mut index)?.to_string(),
+            "--params" => {
+                let value = option_value(&args, &mut index)?;
+                if value.trim().is_empty() {
+                    return Err("browse params must not be empty".to_string());
+                }
+                browse_params = Some(value.to_string());
+            }
             other => return Err(format!("unknown option `{other}`")),
         }
         index += 1;
@@ -213,7 +242,7 @@ where
 
     let command = match command {
         Command::AuthImportBrowser { .. } => {
-            if input.is_some() {
+            if input.is_some() || browse_params.is_some() {
                 return Err("header import options require `auth import-headers`".to_string());
             }
             if port.is_some() || app.is_some() || restart {
@@ -226,7 +255,12 @@ where
             }
         }
         Command::AuthImportHeaders { .. } => {
-            if browser.is_some() || port.is_some() || app.is_some() || restart || yt_dlp != "yt-dlp"
+            if browser.is_some()
+                || port.is_some()
+                || app.is_some()
+                || restart
+                || yt_dlp != "yt-dlp"
+                || browse_params.is_some()
             {
                 return Err("browser options require `auth import-browser`".to_string());
             }
@@ -236,7 +270,8 @@ where
             }
         }
         Command::AuthImportDia { .. } => {
-            if browser.is_some() || input.is_some() || yt_dlp != "yt-dlp" {
+            if browser.is_some() || input.is_some() || yt_dlp != "yt-dlp" || browse_params.is_some()
+            {
                 return Err("non-Dia import options require their matching auth action".to_string());
             }
             Command::AuthImportDia {
@@ -244,6 +279,22 @@ where
                 port: port.unwrap_or(DEFAULT_DIA_CDP_PORT),
                 app: app.unwrap_or_else(|| PathBuf::from(DEFAULT_DIA_APP_PATH)),
                 restart,
+            }
+        }
+        Command::BrowseId { browse_id, .. } => {
+            if browser.is_some()
+                || input.is_some()
+                || output.is_some()
+                || port.is_some()
+                || app.is_some()
+                || restart
+                || yt_dlp != "yt-dlp"
+            {
+                return Err("auth import options require an auth import action".to_string());
+            }
+            Command::BrowseId {
+                browse_id,
+                params: browse_params,
             }
         }
         other => {
@@ -254,6 +305,7 @@ where
                 || app.is_some()
                 || restart
                 || yt_dlp != "yt-dlp"
+                || browse_params.is_some()
             {
                 return Err("auth import options require an auth import action".to_string());
             }
@@ -302,10 +354,40 @@ fn parse_browse_command(args: &mut Vec<String>) -> Result<Command, String> {
     args.remove(0);
     Ok(Command::Browse(match target.as_str() {
         "home" => BrowseTarget::Home,
+        "explore" => BrowseTarget::Explore,
         "library" => BrowseTarget::Library,
+        "library-songs" => BrowseTarget::LibrarySongs,
+        "library-albums" => BrowseTarget::LibraryAlbums,
+        "library-artists" => BrowseTarget::LibraryArtists,
+        "library-playlists" => BrowseTarget::LibraryPlaylists,
         "liked" => BrowseTarget::Liked,
         other => return Err(format!("unknown browse target `{other}`")),
     }))
+}
+
+fn parse_browse_id_command(args: &mut Vec<String>) -> Result<Command, String> {
+    let Some(browse_id) = args.first().cloned() else {
+        return Err("expected browse id".to_string());
+    };
+    args.remove(0);
+    if browse_id.trim().is_empty() {
+        return Err("browse id must not be empty".to_string());
+    }
+    Ok(Command::BrowseId {
+        browse_id,
+        params: None,
+    })
+}
+
+fn parse_search_command(args: &mut Vec<String>) -> Result<Command, String> {
+    let Some(query) = args.first().cloned() else {
+        return Err("expected search query".to_string());
+    };
+    args.remove(0);
+    if query.trim().is_empty() {
+        return Err("search query must not be empty".to_string());
+    }
+    Ok(Command::Search { query })
 }
 
 fn option_value<'a>(args: &'a [String], index: &mut usize) -> Result<&'a str, String> {
@@ -322,8 +404,12 @@ fn usage() -> String {
         "  ytm-radio-helper auth import-browser --browser BROWSER --output FILE [--yt-dlp PROGRAM]",
         "  ytm-radio-helper auth import-headers --input FILE --output FILE",
         "  ytm-radio-helper auth import-dia --output FILE [--port N] [--app PATH] [--restart]",
-        "  ytm-radio-helper browse home|library|liked --auth FILE [--limit N]",
-        "  ytm-radio-helper browse home|library|liked --mock [--limit N]",
+        "  ytm-radio-helper browse home|explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N]",
+        "  ytm-radio-helper browse home|explore|library|library-songs|library-albums|library-artists|library-playlists|liked --mock [--limit N]",
+        "  ytm-radio-helper browse-id BROWSE_ID --auth FILE [--params PARAMS] [--limit N]",
+        "  ytm-radio-helper browse-id BROWSE_ID --mock [--params PARAMS] [--limit N]",
+        "  ytm-radio-helper search QUERY --auth FILE [--limit N]",
+        "  ytm-radio-helper search QUERY --mock [--limit N]",
     ]
     .join("\n")
 }
@@ -331,6 +417,12 @@ fn usage() -> String {
 fn mock_browse(target: &BrowseTarget, limit: usize) -> Value {
     if matches!(target, BrowseTarget::Home) {
         return mock_home_browse(limit);
+    }
+    if matches!(target, BrowseTarget::Explore) {
+        return mock_explore_browse(limit);
+    }
+    if matches!(target, BrowseTarget::Library) {
+        return mock_library_browse(limit);
     }
     let (id, kind, title, url, track_id, track_title) = match target {
         BrowseTarget::Home => (
@@ -341,13 +433,39 @@ fn mock_browse(target: &BrowseTarget, limit: usize) -> Value {
             "mock-home-track",
             "Mock Home Track",
         ),
-        BrowseTarget::Library => (
+        BrowseTarget::Explore => unreachable!(),
+        BrowseTarget::Library => unreachable!(),
+        BrowseTarget::LibrarySongs => (
             "ytm:library:songs",
             "youtube-music-library",
             "Library Songs",
             "ytm://library/songs",
             "mock-library-track",
             "Mock Library Track",
+        ),
+        BrowseTarget::LibraryAlbums => (
+            "ytm:library:albums",
+            "youtube-music-library",
+            "Library Albums",
+            "ytm://library/albums",
+            "mock-album-track",
+            "Mock Album Track",
+        ),
+        BrowseTarget::LibraryArtists => (
+            "ytm:library:artists",
+            "youtube-music-library",
+            "Library Artists",
+            "ytm://library/artists",
+            "mock-artist-track",
+            "Mock Artist Track",
+        ),
+        BrowseTarget::LibraryPlaylists => (
+            "ytm:library:playlists",
+            "youtube-music-library",
+            "Library Playlists",
+            "ytm://library/playlists",
+            "mock-playlist-track",
+            "Mock Playlist Track",
         ),
         BrowseTarget::Liked => (
             "ytm:library:liked",
@@ -373,7 +491,11 @@ fn mock_browse(target: &BrowseTarget, limit: usize) -> Value {
             "type": "playlist",
             "id": "mock-playlist",
             "title": "Mock Playlist",
-            "url": "https://music.youtube.com/playlist?list=mock-playlist"
+            "url": "https://music.youtube.com/playlist?list=mock-playlist",
+            "browse-id": "VLmock-playlist",
+            "playlist-id": "mock-playlist",
+            "subtitle": "Playlist",
+            "thumbnail-url": null
         }));
     }
     json!({
@@ -386,6 +508,113 @@ fn mock_browse(target: &BrowseTarget, limit: usize) -> Value {
             "continuation": null
         }]
     })
+}
+
+fn mock_search(query: &str, limit: usize) -> Value {
+    let items = vec![
+        json!({
+            "type": "track",
+            "id": "mock-search-track",
+            "title": format!("{query} result"),
+            "url": "https://music.youtube.com/watch?v=mock-search-track",
+            "artist": "Mock Artist",
+            "album": "Mock Album",
+            "duration": 180,
+            "thumbnail-url": null
+        }),
+        json!({
+            "type": "album",
+            "id": "mock-search-album",
+            "title": format!("{query} album"),
+            "url": "https://music.youtube.com/browse/mock-search-album",
+            "browse-id": "mock-search-album",
+            "playlist-id": null,
+            "subtitle": "Album - Mock Artist",
+            "thumbnail-url": null
+        }),
+        json!({
+            "type": "artist",
+            "id": "UCmock-search-artist",
+            "title": format!("{query} artist"),
+            "url": "https://music.youtube.com/browse/UCmock-search-artist",
+            "browse-id": "UCmock-search-artist",
+            "playlist-id": null,
+            "subtitle": "Artist",
+            "thumbnail-url": null
+        }),
+        json!({
+            "type": "podcast",
+            "id": "MPSPmock-search-podcast",
+            "title": format!("{query} podcast"),
+            "url": "https://music.youtube.com/browse/MPSPmock-search-podcast",
+            "browse-id": "MPSPmock-search-podcast",
+            "playlist-id": null,
+            "subtitle": "Podcast",
+            "thumbnail-url": null
+        }),
+        json!({
+            "type": "playlist",
+            "id": "mock-search-playlist",
+            "title": format!("{query} playlist"),
+            "url": "https://music.youtube.com/playlist?list=mock-search-playlist",
+            "browse-id": "VLmock-search-playlist",
+            "playlist-id": "mock-search-playlist",
+            "subtitle": "Playlist",
+            "thumbnail-url": null
+        }),
+    ];
+    json!({
+        "sources": [{
+            "id": "ytm:search:mock",
+            "kind": "youtube-music-search",
+            "title": format!("Search: {query}"),
+            "url": "ytm://search/mock",
+            "items": items.into_iter().take(limit).collect::<Vec<_>>(),
+            "continuation": null
+        }]
+    })
+}
+
+fn mock_library_browse(limit: usize) -> Value {
+    let songs = mock_browse(&BrowseTarget::LibrarySongs, limit)
+        .pointer("/sources/0")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let albums = json!({
+        "id": "ytm:library:albums",
+        "kind": "youtube-music-library-section",
+        "title": "Albums",
+        "url": "ytm://library/albums",
+        "items": [{
+            "type": "album",
+            "id": "mock-library-album",
+            "title": "Mock Album",
+            "url": "https://music.youtube.com/browse/mock-library-album",
+            "browse-id": "mock-library-album",
+            "playlist-id": null,
+            "subtitle": "Mock Artist",
+            "thumbnail-url": null
+        }],
+        "continuation": null
+    });
+    let playlists = json!({
+        "id": "ytm:library:playlists",
+        "kind": "youtube-music-library-section",
+        "title": "Playlists",
+        "url": "ytm://library/playlists",
+        "items": [{
+            "type": "playlist",
+            "id": "mock-library-playlist",
+            "title": "Mock Playlist",
+            "url": "https://music.youtube.com/playlist?list=mock-library-playlist",
+            "browse-id": "VLmock-library-playlist",
+            "playlist-id": "mock-library-playlist",
+            "subtitle": "Playlist",
+            "thumbnail-url": null
+        }],
+        "continuation": null
+    });
+    json!({ "sources": [songs, albums, playlists] })
 }
 
 fn mock_home_browse(limit: usize) -> Value {
@@ -406,6 +635,8 @@ fn mock_home_browse(limit: usize) -> Value {
             "id": "mock-album",
             "title": "Mock Album",
             "url": "https://music.youtube.com/browse/mock-album",
+            "browse-id": "mock-album",
+            "playlist-id": null,
             "subtitle": "Mock Artist",
             "thumbnail-url": null
         }));
@@ -428,9 +659,111 @@ fn mock_home_browse(limit: usize) -> Value {
                 "id": "mock-mix",
                 "title": "Mock Mix",
                 "url": "https://music.youtube.com/playlist?list=mock-mix",
+                "browse-id": "VLmock-mix",
+                "playlist-id": "mock-mix",
                 "subtitle": "Playlist",
                 "thumbnail-url": null
             }],
+            "continuation": null
+        }]
+    })
+}
+
+fn mock_explore_browse(limit: usize) -> Value {
+    let item_limit = limit.clamp(1, 2);
+    let mut new_releases = vec![json!({
+        "type": "album",
+        "id": "mock-explore-album",
+        "title": "Mock New Release",
+        "url": "https://music.youtube.com/browse/mock-explore-album",
+        "browse-id": "mock-explore-album",
+        "playlist-id": null,
+        "subtitle": "Mock Artist",
+        "thumbnail-url": null
+    })];
+    if item_limit > 1 {
+        new_releases.push(json!({
+            "type": "playlist",
+            "id": "mock-explore-playlist",
+            "title": "Mock Trending Playlist",
+            "url": "https://music.youtube.com/playlist?list=mock-explore-playlist",
+            "browse-id": "VLmock-explore-playlist",
+            "playlist-id": "mock-explore-playlist",
+            "subtitle": "Playlist",
+            "thumbnail-url": null
+        }));
+    }
+    json!({
+        "sources": [{
+            "id": "ytm:explore:mock:new-releases",
+            "kind": "youtube-music-explore-section",
+            "title": "New releases",
+            "url": "ytm://explore/mock",
+            "items": new_releases,
+            "continuation": null
+        }, {
+            "id": "ytm:explore:mock:charts",
+            "kind": "youtube-music-explore-section",
+            "title": "Charts",
+            "url": "ytm://explore/mock",
+            "items": [{
+                "type": "playlist",
+                "id": "mock-chart",
+                "title": "Mock Chart",
+                "url": "https://music.youtube.com/playlist?list=mock-chart",
+                "browse-id": "VLmock-chart",
+                "playlist-id": "mock-chart",
+                "subtitle": "Playlist",
+                "thumbnail-url": null
+            }],
+            "continuation": null
+        }]
+    })
+}
+
+fn mock_browse_id(browse_id: &str, limit: usize) -> Value {
+    let item_limit = limit.clamp(1, 2);
+    let kind = if browse_id.starts_with("MPRE") {
+        "youtube-music-album"
+    } else if browse_id.starts_with("UC") {
+        "youtube-music-artist"
+    } else if browse_id.starts_with("VL")
+        || browse_id.starts_with("PL")
+        || browse_id.starts_with("RD")
+    {
+        "youtube-music-playlist"
+    } else {
+        "youtube-music-detail"
+    };
+    let mut items = vec![json!({
+        "type": "track",
+        "id": "mock-detail-track",
+        "title": "Mock Detail Track",
+        "url": "https://music.youtube.com/watch?v=mock-detail-track",
+        "artist": "Mock Artist",
+        "album": "Mock Detail",
+        "duration": 181,
+        "thumbnail-url": null
+    })];
+    if item_limit > 1 {
+        items.push(json!({
+            "type": "track",
+            "id": "mock-detail-track-2",
+            "title": "Mock Detail Track 2",
+            "url": "https://music.youtube.com/watch?v=mock-detail-track-2",
+            "artist": "Mock Artist",
+            "album": "Mock Detail",
+            "duration": 182,
+            "thumbnail-url": null
+        }));
+    }
+    json!({
+        "sources": [{
+            "id": format!("ytm:browse:{browse_id}"),
+            "kind": kind,
+            "title": format!("Mock {browse_id}"),
+            "url": format!("https://music.youtube.com/browse/{browse_id}"),
+            "items": items,
             "continuation": null
         }]
     })
@@ -447,6 +780,67 @@ mod tests {
             options,
             Options {
                 command: Command::Browse(BrowseTarget::Home),
+                auth_file: None,
+                limit: 2,
+                mock_data: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_library_subtarget_command() {
+        let options = parse_args(["browse", "library-albums", "--mock"]).unwrap();
+        assert_eq!(
+            options.command,
+            Command::Browse(BrowseTarget::LibraryAlbums)
+        );
+    }
+
+    #[test]
+    fn parses_explore_command() {
+        let options = parse_args(["browse", "explore", "--mock"]).unwrap();
+        assert_eq!(options.command, Command::Browse(BrowseTarget::Explore));
+    }
+
+    #[test]
+    fn parses_browse_id_command() {
+        let options = parse_args(["browse-id", "VLPL1", "--mock", "--limit", "5"]).unwrap();
+        assert_eq!(
+            options,
+            Options {
+                command: Command::BrowseId {
+                    browse_id: "VLPL1".to_string(),
+                    params: None,
+                },
+                auth_file: None,
+                limit: 5,
+                mock_data: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_browse_id_params() {
+        let options =
+            parse_args(["browse-id", "VLPL1", "--params", "ggMCCAI%3D", "--mock"]).unwrap();
+        assert_eq!(
+            options.command,
+            Command::BrowseId {
+                browse_id: "VLPL1".to_string(),
+                params: Some("ggMCCAI%3D".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_search_command() {
+        let options = parse_args(["search", "tokyo", "--mock", "--limit", "2"]).unwrap();
+        assert_eq!(
+            options,
+            Options {
+                command: Command::Search {
+                    query: "tokyo".to_string()
+                },
                 auth_file: None,
                 limit: 2,
                 mock_data: true,
@@ -552,10 +946,45 @@ mod tests {
 
     #[test]
     fn mock_browse_outputs_track_items() {
-        let output = run(["browse", "library", "--mock", "--limit", "1"]).unwrap();
+        let output = run(["browse", "library-songs", "--mock", "--limit", "1"]).unwrap();
         assert!(output.contains(r#""schema":1"#));
         assert!(output.contains(r#""id":"ytm:library:songs""#));
         assert!(output.contains(r#""type":"track""#));
         assert!(!output.contains(r#""type":"playlist""#));
+    }
+
+    #[test]
+    fn mock_library_outputs_sections() {
+        let output = run(["browse", "library", "--mock", "--limit", "2"]).unwrap();
+        assert!(output.contains(r#""id":"ytm:library:songs""#));
+        assert!(output.contains(r#""id":"ytm:library:albums""#));
+        assert!(output.contains(r#""id":"ytm:library:playlists""#));
+    }
+
+    #[test]
+    fn mock_explore_outputs_sections() {
+        let output = run(["browse", "explore", "--mock", "--limit", "2"]).unwrap();
+        assert!(output.contains(r#""id":"ytm:explore:mock:new-releases""#));
+        assert!(output.contains(r#""kind":"youtube-music-explore-section""#));
+        assert!(output.contains("Mock New Release"));
+    }
+
+    #[test]
+    fn mock_search_outputs_results() {
+        let output = run(["search", "tokyo", "--mock", "--limit", "5"]).unwrap();
+        assert!(output.contains(r#""kind":"youtube-music-search""#));
+        assert!(output.contains("tokyo result"));
+        assert!(output.contains("tokyo album"));
+        assert!(output.contains("tokyo artist"));
+        assert!(output.contains("tokyo podcast"));
+        assert!(output.contains("tokyo playlist"));
+    }
+
+    #[test]
+    fn mock_browse_id_outputs_detail_source() {
+        let output = run(["browse-id", "VLPL1", "--mock", "--limit", "2"]).unwrap();
+        assert!(output.contains(r#""id":"ytm:browse:VLPL1""#));
+        assert!(output.contains(r#""kind":"youtube-music-playlist""#));
+        assert!(output.contains("Mock Detail Track"));
     }
 }
