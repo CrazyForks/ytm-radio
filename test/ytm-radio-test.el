@@ -228,6 +228,63 @@
       (should (= (map-elt ytm-radio--player :position) 0))
       (should (equal scheduled (list track-b))))))
 
+(ert-deftest ytm-radio-play-track-loads-next-track-in-current-mpv ()
+  "Load a different track into the current mpv process when IPC is ready."
+  (let* ((track-a (ytm-radio--make-track
+                   :id "a"
+                   :title "A"
+                   :url "https://music.youtube.com/watch?v=a"))
+         (track-b (ytm-radio--make-track
+                   :id "b"
+                   :title "B"
+                   :duration 200
+                   :url "https://music.youtube.com/watch?v=b"))
+         (track-c (ytm-radio--make-track
+                   :id "c"
+                   :title "C"
+                   :url "https://music.youtube.com/watch?v=c"))
+         (source (ytm-radio--make-source
+                  :id "s"
+                  :kind 'youtube-music-library
+                  :title "S"
+                  :tracks (list track-a track-b track-c)))
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons "s" source))
+           :last-track-id "a"))
+         (ytm-radio--player
+          (ytm-radio--make-player
+           :status 'playing
+           :current-track track-a
+           :process 'mpv-process
+           :ipc-process 'mpv-ipc
+           :position 42))
+         commands
+         scheduled)
+    (cl-letf (((symbol-function 'process-live-p)
+               (lambda (process) (memq process '(mpv-process mpv-ipc))))
+              ((symbol-function 'ytm-radio--ensure-program) #'ignore)
+              ((symbol-function 'ytm-radio--stop-process)
+               (lambda () (error "should not stop mpv")))
+              ((symbol-function 'start-process)
+               (lambda (&rest _args) (error "should not start mpv")))
+              ((symbol-function 'ytm-radio--mpv-send)
+               (lambda (command) (push command commands)))
+              ((symbol-function 'ytm-radio--save) #'ignore)
+              ((symbol-function 'ytm-radio--render) #'ignore)
+              ((symbol-function 'ytm-radio--show-now-playing) #'ignore)
+              ((symbol-function 'ytm-radio--schedule-stream-prefetch)
+               (lambda (tracks) (setq scheduled tracks))))
+      (ytm-radio--play-track track-b)
+      (should (member '("loadfile"
+                        "https://music.youtube.com/watch?v=b"
+                        "replace")
+                      commands))
+      (should (equal (map-elt ytm-radio--player :current-track) track-b))
+      (should (eq (map-elt ytm-radio--player :status) 'loading))
+      (should (= (map-elt ytm-radio--player :duration) 200))
+      (should (equal scheduled (list track-c))))))
+
 (ert-deftest ytm-radio-render-explains-empty-catalog ()
   "Render an empty catalog with next-step guidance."
   (let ((ytm-radio--state (ytm-radio--make-state))

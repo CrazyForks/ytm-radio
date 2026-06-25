@@ -1536,14 +1536,20 @@ When APPEND is non-nil, load `ytm-radio--home-continuation'."
   (when-let* ((next (ytm-radio--next-track track)))
     (ytm-radio--schedule-stream-prefetch (list next))))
 
+(defun ytm-radio--mpv-ready-p ()
+  "Return non-nil when the current mpv process can accept IPC commands."
+  (let ((process (map-elt ytm-radio--player :process))
+        (ipc-process (map-elt ytm-radio--player :ipc-process)))
+    (and process
+         ipc-process
+         (process-live-p process)
+         (process-live-p ipc-process))))
+
 (defun ytm-radio--restart-current-track-in-place (track)
   "Restart TRACK in the current mpv instance when it is already loaded."
   (when-let* ((current (map-elt ytm-radio--player :current-track))
               ((ytm-radio--same-track-p current track))
-              (process (map-elt ytm-radio--player :process))
-              (ipc-process (map-elt ytm-radio--player :ipc-process))
-              ((process-live-p process))
-              ((process-live-p ipc-process)))
+              ((ytm-radio--mpv-ready-p)))
     (setf (map-elt ytm-radio--player :current-track) track
           (map-elt ytm-radio--player :status) 'playing
           (map-elt ytm-radio--player :position) 0
@@ -1557,12 +1563,29 @@ When APPEND is non-nil, load `ytm-radio--home-continuation'."
     (ytm-radio--show-now-playing nil)
     t))
 
+(defun ytm-radio--load-track-in-current-mpv (track)
+  "Load TRACK into the current mpv process when IPC is available."
+  (when (ytm-radio--mpv-ready-p)
+    (setf (map-elt ytm-radio--player :current-track) track
+          (map-elt ytm-radio--player :status) 'loading
+          (map-elt ytm-radio--player :position) nil
+          (map-elt ytm-radio--player :duration) (map-elt track :duration)
+          (map-elt ytm-radio--state :last-track-id) (map-elt track :id))
+    (setq ytm-radio--last-rendered-progress-key nil)
+    (ytm-radio--reset-title-scroll)
+    (ytm-radio--save)
+    (ytm-radio--mpv-send (list "loadfile" (ytm-radio--playback-url track) "replace"))
+    (ytm-radio--render)
+    (ytm-radio--show-now-playing nil)
+    t))
+
 (defun ytm-radio--play-track (track)
   "Play TRACK with mpv."
   (ytm-radio--ensure-program ytm-radio-mpv-program "mpv")
   (unless (map-elt track :url)
     (user-error "Track has no playable URL"))
-  (unless (ytm-radio--restart-current-track-in-place track)
+  (unless (or (ytm-radio--restart-current-track-in-place track)
+              (ytm-radio--load-track-in-current-mpv track))
     (ytm-radio--stop-process)
     (let* ((socket (make-temp-name
                     (file-name-concat temporary-file-directory "ytm-radio-mpv-")))
