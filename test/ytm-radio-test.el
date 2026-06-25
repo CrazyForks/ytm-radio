@@ -871,6 +871,28 @@
         (should (equal (seq-filter #'identity (nreverse line-heights))
                        '((10 . 10) (10 . 10) (10 . 10))))))))
 
+(ert-deftest ytm-radio-detail-header-actions-align-with-last-cover-slice ()
+  "Place detail header actions on the last cover row."
+  (let* ((track (ytm-radio--make-track
+                 :id "v1"
+                 :title "Song"
+                 :url "https://music.youtube.com/watch?v=v1"))
+         (source (ytm-radio--make-source
+                  :id "ytm:browse:MPRE1:header"
+                  :kind 'youtube-music-album
+                  :title "Smoke Rings"
+                  :subtitle "Album - Kolisnik & LoFi Beats")))
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'ytm-radio--source-header-cover-image)
+                 (lambda (_source) (list 'cover-image 90 10 6)))
+                ((symbol-function 'ytm-radio--detail-view-tracks)
+                 (lambda () (list track))))
+        (ytm-radio--insert-source-header source t))
+      (goto-char (point-min))
+      (should (= (line-number-at-pos (point)) 1))
+      (should (search-forward "Play" nil t))
+      (should (= (line-number-at-pos (match-beginning 0)) 6)))))
+
 (ert-deftest ytm-radio-album-playlist-detail-headers-use-square-layout ()
   "Use square detail covers for album and playlist headers only."
   (let ((album (ytm-radio--make-source

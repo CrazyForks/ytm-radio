@@ -3841,7 +3841,7 @@ When OMIT-LEADING-SPACE is non-nil, do not insert the leading blank line."
           (insert "\n"))
         (dotimes (row row-count)
           (ytm-radio--insert-detail-header-cover-cell cover row)
-          (if (= row 4)
+          (if (= row (1- row-count))
               (ytm-radio--insert-detail-header-actions)
             (when-let* ((line (ytm-radio--detail-header-line
                                row title subtitle summary)))
