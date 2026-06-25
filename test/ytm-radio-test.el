@@ -71,14 +71,18 @@
   "Build mpv arguments with raw ytdl options."
   (let ((ytm-radio-mpv-extra-args '("--really-quiet"))
         (ytm-radio-mpv-network-cache-args '("--cache=yes"
+                                            "--cache-pause=no"
                                             "--demuxer-readahead-secs=60"
                                             "--demuxer-max-bytes=256MiB"))
+        (ytm-radio-mpv-ytdl-format "bestaudio/best")
         (ytm-radio-ytdl-raw-options '("cookies-from-browser=chrome"
                                       "proxy=http://127.0.0.1:8888")))
     (should (equal (ytm-radio--mpv-arguments "sock" "url")
                    '("--cache=yes"
+                     "--cache-pause=no"
                      "--demuxer-readahead-secs=60"
                      "--demuxer-max-bytes=256MiB"
+                     "--ytdl-format=bestaudio/best"
                      "--really-quiet"
                      "--ytdl-raw-options=cookies-from-browser=chrome,proxy=http://127.0.0.1:8888"
                      "--no-video"
@@ -86,15 +90,94 @@
                      "url")))))
 
 (ert-deftest ytm-radio-mpv-extra-args-can-override-cache-defaults ()
-  "Place user mpv args after default network cache args."
+  "Place user mpv args after default mpv playback args."
   (let ((ytm-radio-mpv-network-cache-args '("--cache=yes"
                                             "--demuxer-readahead-secs=60"))
-        (ytm-radio-mpv-extra-args '("--demuxer-readahead-secs=5"))
+        (ytm-radio-mpv-ytdl-format "bestaudio/best")
+        (ytm-radio-mpv-extra-args '("--demuxer-readahead-secs=5"
+                                    "--ytdl-format=worstaudio/best"))
         (ytm-radio-ytdl-raw-options nil))
-    (should (equal (seq-take (ytm-radio--mpv-arguments "sock" "url") 3)
+    (should (equal (seq-take (ytm-radio--mpv-arguments "sock" "url") 5)
                    '("--cache=yes"
                      "--demuxer-readahead-secs=60"
-                     "--demuxer-readahead-secs=5")))))
+                     "--ytdl-format=bestaudio/best"
+                     "--demuxer-readahead-secs=5"
+                     "--ytdl-format=worstaudio/best")))))
+
+(ert-deftest ytm-radio-mpv-ytdl-format-can-use-mpv-default ()
+  "Omit the ytdl format argument when configured nil."
+  (let ((ytm-radio-mpv-network-cache-args nil)
+        (ytm-radio-mpv-ytdl-format nil)
+        (ytm-radio-mpv-extra-args nil)
+        (ytm-radio-ytdl-raw-options nil))
+    (should-not
+     (member "--ytdl-format=bestaudio/best"
+             (ytm-radio--mpv-arguments "sock" "url")))))
+
+(ert-deftest ytm-radio-playback-url-uses-valid-stream-cache ()
+  "Use cached direct stream URLs until they are close to expiry."
+  (let* ((ytm-radio--stream-url-cache (make-hash-table :test #'equal))
+         (track (ytm-radio--make-track
+                 :id "v1"
+                 :title "Song"
+                 :url "https://music.youtube.com/watch?v=v1"))
+         (direct-url "https://rr.example/videoplayback?expire=9999999999"))
+    (ytm-radio--cache-stream-url track direct-url)
+    (should (equal (ytm-radio--playback-url track) direct-url))
+    (puthash "v1"
+             (list (cons 'url "https://rr.example/expired")
+                   (cons 'expires 1))
+             ytm-radio--stream-url-cache)
+    (should (equal (ytm-radio--playback-url track)
+                   "https://music.youtube.com/watch?v=v1"))))
+
+(ert-deftest ytm-radio-play-track-prefetches-next-track ()
+  "Schedule the next track for background stream prefetch after playback starts."
+  (let* ((track-a (ytm-radio--make-track
+                   :id "a"
+                   :title "A"
+                   :url "https://music.youtube.com/watch?v=a"))
+         (track-b (ytm-radio--make-track
+                   :id "b"
+                   :title "B"
+                   :url "https://music.youtube.com/watch?v=b"))
+         (source (ytm-radio--make-source
+                  :id "s"
+                  :kind 'youtube-music-library
+                  :title "S"
+                  :tracks (list track-a track-b)))
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons "s" source))))
+         (ytm-radio--player (ytm-radio--make-player))
+         (ytm-radio-mpv-network-cache-args nil)
+         (ytm-radio-mpv-extra-args nil)
+         (ytm-radio-ytdl-raw-options nil)
+         process
+         scheduled)
+    (unwind-protect
+        (cl-letf (((symbol-function 'ytm-radio--ensure-program) #'ignore)
+                  ((symbol-function 'ytm-radio--stop-process) #'ignore)
+                  ((symbol-function 'ytm-radio--mpv-connect) #'ignore)
+                  ((symbol-function 'ytm-radio--render) #'ignore)
+                  ((symbol-function 'ytm-radio--show-now-playing) #'ignore)
+                  ((symbol-function 'ytm-radio--save) #'ignore)
+                  ((symbol-function 'ytm-radio--schedule-stream-prefetch)
+                   (lambda (tracks) (setq scheduled tracks)))
+                  ((symbol-function 'start-process)
+                   (lambda (name buffer _program &rest _args)
+                     (setq process
+                           (make-process
+                            :name name
+                            :buffer buffer
+                            :command '("sleep" "2")
+                            :noquery t)))))
+          (ytm-radio--play-track track-a)
+          (should (equal scheduled (list track-b))))
+      (when (processp process)
+        (set-process-sentinel process nil)
+        (when (process-live-p process)
+          (delete-process process))))))
 
 (ert-deftest ytm-radio-render-explains-empty-catalog ()
   "Render an empty catalog with next-step guidance."
@@ -106,9 +189,12 @@
         (erase-buffer)))
     (ytm-radio--render)
     (with-current-buffer "*ytm-radio*"
-      (should (string-match-p "ytm-radio[[:space:]]+Home"
-                              (substring-no-properties
-                               (ytm-radio--browser-header-line))))
+      (let ((header (substring-no-properties
+                     (ytm-radio--browser-header-line))))
+        (should (string-match-p "\\` YT[[:space:]]+Home" header))
+        (should (string-match-p "Home[[:space:]]+Explore[[:space:]]+Library"
+                                header))
+        (should-not (string-match-p "ytm-radio" header)))
       (should-not (string-match-p "\\`Home[[:space:]]+Explore"
                                   (buffer-string)))
       (should-not (string-match-p "\\_<All\\_>" (buffer-string)))
@@ -119,7 +205,7 @@
                "Add a URL, or import your YouTube Music library/home"
                (buffer-string)))
       (should (string-match-p
-               "Use login once to import a browser session"
+               "YouTube Music login opens automatically when needed"
                (buffer-string))))))
 
 (ert-deftest ytm-radio-open-uses-cached-home-without-refresh ()
@@ -167,6 +253,33 @@
                  (setq started (if append 'append 'initial)))))
       (ytm-radio)
       (should (eq started 'initial)))))
+
+(ert-deftest ytm-radio-opens-login-when-auth-is-missing-and-home-uncached ()
+  "Start the login flow on first browser open when Home needs account auth."
+  (let* ((directory (make-temp-file "ytm-radio-auth-" t))
+         (auth-file (expand-file-name "auth.json" directory))
+         (ytm-radio--state (ytm-radio--make-state))
+         (ytm-radio--player (ytm-radio--make-player))
+         (ytm-radio--loaded t)
+         (ytm-radio--browser-view 'home)
+         (ytm-radio--initial-home-refreshed nil)
+         (ytm-radio--login-process nil)
+         (ytm-radio-helper-use-mock-data nil)
+         (ytm-radio-helper-auth-file auth-file)
+         captured-output
+         captured-continuation)
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'ytm-radio--show-buffer)
+                     (lambda (_buffer) nil))
+                    ((symbol-function 'ytm-radio--start-login)
+                     (lambda (output &optional _restart-running after-success)
+                       (setq captured-output output
+                             captured-continuation after-success))))
+            (ytm-radio)
+            (should (equal captured-output auth-file))
+            (should (functionp captured-continuation))))
+      (delete-directory directory t))))
 
 (ert-deftest ytm-radio-migrates-legacy-runtime-files ()
   "Copy default runtime files out of `user-emacs-directory'."
@@ -627,6 +740,7 @@
               #'ytm-radio-library))
   (should (eq (lookup-key ytm-radio--mode-map (kbd "/"))
               #'ytm-radio-search))
+  (should-not (lookup-key ytm-radio--mode-map (kbd "A")))
   (should (eq (lookup-key ytm-radio--mode-map (kbd "b"))
               #'ytm-radio-back))
   (should-not (eq (lookup-key ytm-radio--mode-map (kbd "h"))
@@ -1390,78 +1504,167 @@
                      '("ytm:browse:UC1:header"
                        "ytm:browse:UC1:1:songs"))))))
 
-(ert-deftest ytm-radio-helper-browser-import-arguments ()
-  "Build Rust helper arguments for browser cookie import."
-  (let ((ytm-radio-yt-dlp-program "/opt/homebrew/bin/yt-dlp"))
+(ert-deftest ytm-radio-helper-login-arguments ()
+  "Build Rust helper arguments for the browser login window."
+  (let ((ytm-radio-helper-login-browser "dia")
+        (ytm-radio-helper-login-profile-directory "/tmp/ytm-login-profile")
+        (ytm-radio-helper-login-cdp-port 29999)
+        (ytm-radio-helper-login-timeout 60))
     (should
      (equal
-      (ytm-radio--helper-import-browser-arguments
-       "chrome:Default"
-       "/tmp/ytm-auth.json")
+      (ytm-radio--helper-login-arguments "/tmp/ytm-auth.json")
       '("auth"
-        "import-browser"
+        "login-window"
+        "--output"
+        "/tmp/ytm-auth.json"
+        "--port"
+        "29999"
+        "--timeout-secs"
+        "60"
+        "--profile-dir"
+        "/tmp/ytm-login-profile"
         "--browser"
-        "chrome:Default"
+        "dia")))))
+
+(ert-deftest ytm-radio-helper-login-arguments-auto-browser ()
+  "Omit --browser when the helper should use the default browser."
+  (let ((ytm-radio-helper-login-browser nil)
+        (ytm-radio-helper-login-profile-directory nil)
+        (ytm-radio-helper-login-cdp-port 29999)
+        (ytm-radio-helper-login-timeout 60))
+    (should
+     (equal
+      (ytm-radio--helper-login-arguments "/tmp/ytm-auth.json")
+      '("auth"
+        "login-window"
         "--output"
         "/tmp/ytm-auth.json"
-        "--yt-dlp"
-        "/opt/homebrew/bin/yt-dlp")))))
+        "--port"
+        "29999"
+        "--timeout-secs"
+        "60")))))
 
-(ert-deftest ytm-radio-auth-import-candidates-include-dia ()
-  "Offer Dia through the unified login source prompt."
-  (let ((ytm-radio-helper-browser-candidates '("chrome" "firefox")))
-    (should (equal (ytm-radio--auth-import-candidates)
-                   '("chrome" "firefox" "dia")))
-    (should (ytm-radio--dia-auth-source-p "dia"))
-    (should (ytm-radio--dia-auth-source-p " Dia "))
-    (should-not (ytm-radio--dia-auth-source-p "chrome"))))
+(ert-deftest ytm-radio-helper-login-arguments-restart-running ()
+  "Pass --restart-running only for confirmed browser restart retries."
+  (let ((ytm-radio-helper-login-browser nil)
+        (ytm-radio-helper-login-profile-directory nil)
+        (ytm-radio-helper-login-cdp-port 29999)
+        (ytm-radio-helper-login-timeout 60))
+    (should
+     (member "--restart-running"
+             (ytm-radio--helper-login-arguments "/tmp/ytm-auth.json" t)))))
 
-(ert-deftest ytm-radio-helper-headers-import-arguments ()
-  "Build Rust helper arguments for request header import."
+(ert-deftest ytm-radio-login-detects-restartable-diagnostics ()
+  "Detect helper diagnostics that can be handled by browser restart."
   (should
-   (equal
-    (ytm-radio--helper-import-headers-arguments
-     "/tmp/request-headers.txt"
-     "/tmp/ytm-auth.json")
-    '("auth"
-      "import-headers"
-      "--input"
-      "/tmp/request-headers.txt"
-      "--output"
-      "/tmp/ytm-auth.json"))))
+   (ytm-radio--login-restart-needed-p
+    "Dia is already running without DevTools on 127.0.0.1:29317"))
+  (should-not
+   (ytm-radio--login-restart-needed-p
+    "login window is not authenticated yet")))
 
-(ert-deftest ytm-radio-helper-dia-import-arguments ()
-  "Build Rust helper arguments for automatic Dia import."
-  (let ((ytm-radio-helper-dia-cdp-port 29999)
-        (ytm-radio-helper-dia-app "/Applications/Dia.app/Contents/MacOS/Dia"))
-    (should
-     (equal
-      (ytm-radio--helper-import-dia-arguments "/tmp/ytm-auth.json")
-      '("auth"
-        "import-dia"
-        "--output"
-        "/tmp/ytm-auth.json"
-        "--port"
-        "29999"
-        "--app"
-        "/Applications/Dia.app/Contents/MacOS/Dia")))))
+(ert-deftest ytm-radio-account-login-uses-default-auth-file-without-prompt ()
+  "Start account login with the configured auth file without prompting."
+  (let ((ytm-radio--login-process nil)
+        (ytm-radio-helper-auth-file "/tmp/ytm-auth.json")
+        captured-output
+        captured-continuation
+        captured-restart)
+    (cl-letf (((symbol-function 'read-file-name)
+               (lambda (&rest _arguments)
+                 (error "account login prompted for a file")))
+              ((symbol-function 'ytm-radio--start-login)
+               (lambda (output &optional restart-running after-success)
+                 (setq captured-output output
+                       captured-restart restart-running
+                       captured-continuation after-success))))
+      (ytm-radio--start-account-login #'ignore)
+      (should (equal captured-output "/tmp/ytm-auth.json"))
+      (should-not captured-restart)
+      (should (functionp captured-continuation)))))
 
-(ert-deftest ytm-radio-helper-dia-import-restart-arguments ()
-  "Build Rust helper arguments for Dia import with restart."
-  (let ((ytm-radio-helper-dia-cdp-port 29999)
-        (ytm-radio-helper-dia-app "/Applications/Dia.app/Contents/MacOS/Dia"))
-    (should
-     (equal
-      (ytm-radio--helper-import-dia-arguments "/tmp/ytm-auth.json" t)
-      '("auth"
-        "import-dia"
-        "--output"
-        "/tmp/ytm-auth.json"
-        "--port"
-        "29999"
-        "--app"
-        "/Applications/Dia.app/Contents/MacOS/Dia"
-        "--restart")))))
+(ert-deftest ytm-radio-account-login-running-updates-continuation ()
+  "Refresh during login should keep one helper process and update continuation."
+  (let ((ytm-radio--login-process 'fake-process)
+        (ytm-radio--login-continuation nil)
+        (ytm-radio--login-status nil)
+        (called-start-login nil))
+    (cl-letf (((symbol-function 'process-live-p)
+               (lambda (process)
+                 (eq process 'fake-process)))
+              ((symbol-function 'ytm-radio--start-login)
+               (lambda (&rest _arguments)
+                 (setq called-start-login t)))
+              ((symbol-function 'message)
+               (lambda (&rest _arguments) nil)))
+      (ytm-radio--start-account-login #'ignore "YouTube Music login required")
+      (should-not called-start-login)
+      (should (functionp ytm-radio--login-continuation))
+      (should (equal ytm-radio--login-status "Login waiting in browser...")))))
+
+(ert-deftest ytm-radio-login-runs-continuation-after-success ()
+  "Run the pending account action after login imports auth."
+  (let ((ytm-radio--state (ytm-radio--make-state))
+        (ytm-radio--loaded t)
+        (ytm-radio--login-process nil)
+        (ytm-radio--login-continuation nil)
+        (ytm-radio--login-status nil)
+        (ytm-radio-helper-auth-file "/tmp/ytm-auth.json")
+        ran-continuation
+        started-home)
+    (cl-letf (((symbol-function 'ytm-radio--call-helper-async)
+               (lambda (_arguments success _error-callback)
+                 (funcall success '((auth . t)))
+                 nil))
+              ((symbol-function 'ytm-radio--save)
+               (lambda () nil))
+              ((symbol-function 'ytm-radio--start-home-load)
+               (lambda (&optional _append)
+                 (setq started-home t))))
+      (ytm-radio--start-login
+       "/tmp/ytm-auth.json"
+       nil
+       (lambda ()
+         (setq ran-continuation t)))
+      (should ran-continuation)
+      (should-not started-home)
+      (should-not ytm-radio--login-status)
+      (should-not ytm-radio--login-continuation))))
+
+(ert-deftest ytm-radio-account-auth-failure-starts-login ()
+  "Treat 401 helper diagnostics as a prompt to refresh account auth."
+  (let* ((auth-file (make-temp-file "ytm-radio-auth-"))
+         (ytm-radio-helper-use-mock-data nil)
+         (ytm-radio-helper-auth-file auth-file)
+         (ytm-radio--login-process nil)
+         captured-continuation)
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'ytm-radio--start-login)
+                     (lambda (_output &optional _restart-running after-success)
+                       (setq captured-continuation after-success))))
+            (ytm-radio--with-account-auth
+             (lambda ()
+               (user-error
+                "Account helper failed: YouTube Music returned HTTP 401 Unauthorized")))
+            (should-not (file-exists-p auth-file))
+            (should (functionp captured-continuation))))
+      (when (file-exists-p auth-file)
+        (delete-file auth-file)))))
+
+(ert-deftest ytm-radio-clear-helper-bootstrap-cache ()
+  "Delete the helper bootstrap cache beside the configured auth file."
+  (let* ((directory (make-temp-file "ytm-radio-auth-" t))
+         (ytm-radio-helper-auth-file
+          (expand-file-name "auth.json" directory))
+         (cache-file (expand-file-name "bootstrap-cache.json" directory)))
+    (unwind-protect
+        (progn
+          (with-temp-file cache-file
+            (insert "{}"))
+          (ytm-radio--clear-helper-bootstrap-cache)
+          (should-not (file-exists-p cache-file)))
+      (delete-directory directory t))))
 
 (ert-deftest ytm-radio-helper-envelope-validates-schema ()
   "Return helper data only for successful schema version one envelopes."
@@ -1532,6 +1735,36 @@
     (should-not (assoc "ytm:home:1:listen-again" (ytm-radio--sources)))
     (should (assoc "ytm:library:songs" (ytm-radio--sources)))
     (should (assoc "manual" (ytm-radio--sources)))))
+
+(ert-deftest ytm-radio-drop-account-helper-sources-removes-detail-sources ()
+  "Remove all account helper sources while keeping manual URL sources."
+  (let* ((home (ytm-radio--make-source
+                :id "ytm:home:1:listen-again"
+                :kind 'youtube-music-home-section
+                :title "Listen again"))
+         (search (ytm-radio--make-source
+                  :id "ytm:search:30"
+                  :kind 'youtube-music-search
+                  :title "Search"))
+         (detail (ytm-radio--make-source
+                  :id "ytm:browse:UC1:header"
+                  :kind 'youtube-music-artist
+                  :title "Artist"))
+         (manual (ytm-radio--make-source
+                  :id "PL1"
+                  :kind 'youtube-music-playlist
+                  :title "Manual"))
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons (map-elt home :id) home)
+                          (cons (map-elt search :id) search)
+                          (cons (map-elt detail :id) detail)
+                          (cons (map-elt manual :id) manual)))))
+    (ytm-radio--drop-account-helper-sources)
+    (should-not (assoc "ytm:home:1:listen-again" (ytm-radio--sources)))
+    (should-not (assoc "ytm:search:30" (ytm-radio--sources)))
+    (should-not (assoc "ytm:browse:UC1:header" (ytm-radio--sources)))
+    (should (assoc "PL1" (ytm-radio--sources)))))
 
 (provide 'ytm-radio-test)
 

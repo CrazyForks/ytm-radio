@@ -1,37 +1,31 @@
 mod auth;
 mod ytmusic;
 
-use auth::import_headers;
-use auth::{import_browser, import_dia, AuthConfig, DEFAULT_DIA_APP_PATH};
+use auth::{login_window, AuthConfig};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::env;
 use std::path::PathBuf;
 use std::process;
+use std::time::Duration;
 use ytmusic::{
     bootstrap_cache_path, browse, browse_id as browse_detail, continuation, search, BrowseTarget,
 };
 
 const SCHEMA_VERSION: u32 = 1;
-const DEFAULT_DIA_CDP_PORT: u16 = 29317;
+const DEFAULT_LOGIN_CDP_PORT: u16 = 29317;
+const DEFAULT_LOGIN_TIMEOUT_SECS: u64 = 180;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     AuthCheck,
-    AuthImportBrowser {
-        browser: String,
+    AuthLoginWindow {
         output: PathBuf,
-        yt_dlp: String,
-    },
-    AuthImportHeaders {
-        input: PathBuf,
-        output: PathBuf,
-    },
-    AuthImportDia {
-        output: PathBuf,
+        browser: Option<String>,
+        profile_dir: Option<PathBuf>,
         port: u16,
-        app: PathBuf,
-        restart: bool,
+        timeout_secs: u64,
+        restart_running: bool,
     },
     Browse(BrowseTarget),
     BrowseId {
@@ -103,42 +97,28 @@ where
                 }
             })
         }
-        Command::AuthImportBrowser {
+        Command::AuthLoginWindow {
+            output,
             browser,
-            output,
-            yt_dlp,
-        } => {
-            let config = import_browser(browser, output, yt_dlp)?;
-            json!({
-                "auth": {
-                    "configured": true,
-                    "source": config.source,
-                    "path": output
-                }
-            })
-        }
-        Command::AuthImportHeaders { input, output } => {
-            let config = import_headers(input, output)?;
-            json!({
-                "auth": {
-                    "configured": true,
-                    "source": config.source,
-                    "path": output
-                }
-            })
-        }
-        Command::AuthImportDia {
-            output,
+            profile_dir,
             port,
-            app,
-            restart,
+            timeout_secs,
+            restart_running,
         } => {
-            let config = import_dia(output, *port, app, *restart)?;
+            let config = login_window(
+                output,
+                browser.as_deref(),
+                profile_dir.as_deref(),
+                *port,
+                Duration::from_secs(*timeout_secs),
+                *restart_running,
+            )?;
             json!({
                 "auth": {
                     "configured": true,
                     "source": config.source,
-                    "path": output
+                    "path": output,
+                    "profile": profile_dir
                 }
             })
         }
@@ -229,14 +209,13 @@ where
     let mut limit = 100;
     let mut mock_data = false;
     let mut browser = None;
-    let mut input = None;
     let mut output = None;
     let mut port = None;
-    let mut app = None;
-    let mut restart = false;
-    let mut yt_dlp = "yt-dlp".to_string();
+    let mut profile_dir = None;
     let mut browse_params = None;
     let mut initial_only = false;
+    let mut timeout_secs = None;
+    let mut restart_running = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -252,7 +231,6 @@ where
             }
             "--mock" => mock_data = true,
             "--browser" => browser = Some(option_value(&args, &mut index)?.to_string()),
-            "--input" => input = Some(PathBuf::from(option_value(&args, &mut index)?)),
             "--output" => output = Some(PathBuf::from(option_value(&args, &mut index)?)),
             "--port" => {
                 let value = option_value(&args, &mut index)?;
@@ -262,9 +240,15 @@ where
                         .map_err(|_| format!("invalid port `{value}`"))?,
                 );
             }
-            "--app" => app = Some(PathBuf::from(option_value(&args, &mut index)?)),
-            "--restart" => restart = true,
-            "--yt-dlp" => yt_dlp = option_value(&args, &mut index)?.to_string(),
+            "--profile-dir" => profile_dir = Some(PathBuf::from(option_value(&args, &mut index)?)),
+            "--timeout-secs" => {
+                let value = option_value(&args, &mut index)?;
+                timeout_secs = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid timeout `{value}`"))?,
+                );
+            }
             "--params" => {
                 let value = option_value(&args, &mut index)?;
                 if value.trim().is_empty() {
@@ -273,68 +257,37 @@ where
                 browse_params = Some(value.to_string());
             }
             "--initial-only" => initial_only = true,
+            "--restart-running" => restart_running = true,
             other => return Err(format!("unknown option `{other}`")),
         }
         index += 1;
     }
 
     let command = match command {
-        Command::AuthImportBrowser { .. } => {
-            if input.is_some() || browse_params.is_some() || initial_only {
-                return Err("header import options require `auth import-headers`".to_string());
+        Command::AuthLoginWindow { .. } => {
+            if browse_params.is_some() || initial_only || mock_data || auth_file.is_some() {
+                return Err("browse options require a browse action".to_string());
             }
-            if port.is_some() || app.is_some() || restart {
-                return Err("Dia import options require `auth import-dia`".to_string());
-            }
-            Command::AuthImportBrowser {
-                browser: browser.ok_or_else(|| "missing --browser BROWSER".to_string())?,
-                output: output.ok_or_else(|| "missing --output FILE".to_string())?,
-                yt_dlp,
-            }
-        }
-        Command::AuthImportHeaders { .. } => {
-            if browser.is_some()
-                || port.is_some()
-                || app.is_some()
-                || restart
-                || yt_dlp != "yt-dlp"
-                || browse_params.is_some()
-                || initial_only
-            {
-                return Err("browser options require `auth import-browser`".to_string());
-            }
-            Command::AuthImportHeaders {
-                input: input.ok_or_else(|| "missing --input FILE".to_string())?,
-                output: output.ok_or_else(|| "missing --output FILE".to_string())?,
-            }
-        }
-        Command::AuthImportDia { .. } => {
-            if browser.is_some()
-                || input.is_some()
-                || yt_dlp != "yt-dlp"
-                || browse_params.is_some()
-                || initial_only
-            {
-                return Err("non-Dia import options require their matching auth action".to_string());
-            }
-            Command::AuthImportDia {
-                output: output.ok_or_else(|| "missing --output FILE".to_string())?,
-                port: port.unwrap_or(DEFAULT_DIA_CDP_PORT),
-                app: app.unwrap_or_else(|| PathBuf::from(DEFAULT_DIA_APP_PATH)),
-                restart,
+            let output = output.ok_or_else(|| "missing --output FILE".to_string())?;
+            Command::AuthLoginWindow {
+                output,
+                browser,
+                profile_dir,
+                port: port.unwrap_or(DEFAULT_LOGIN_CDP_PORT),
+                timeout_secs: timeout_secs.unwrap_or(DEFAULT_LOGIN_TIMEOUT_SECS),
+                restart_running,
             }
         }
         Command::BrowseId { browse_id, .. } => {
             if browser.is_some()
-                || input.is_some()
                 || output.is_some()
                 || port.is_some()
-                || app.is_some()
-                || restart
-                || yt_dlp != "yt-dlp"
+                || profile_dir.is_some()
+                || timeout_secs.is_some()
                 || initial_only
+                || restart_running
             {
-                return Err("auth import options require an auth import action".to_string());
+                return Err("auth options require an auth action".to_string());
             }
             Command::BrowseId {
                 browse_id,
@@ -343,15 +296,14 @@ where
         }
         Command::Browse(target) => {
             if browser.is_some()
-                || input.is_some()
                 || output.is_some()
                 || port.is_some()
-                || app.is_some()
-                || restart
-                || yt_dlp != "yt-dlp"
+                || profile_dir.is_some()
+                || timeout_secs.is_some()
                 || browse_params.is_some()
+                || restart_running
             {
-                return Err("auth import options require an auth import action".to_string());
+                return Err("auth options require an auth action".to_string());
             }
             if initial_only && !matches!(target, BrowseTarget::Home) {
                 return Err("--initial-only is only supported for browse home".to_string());
@@ -360,16 +312,15 @@ where
         }
         other => {
             if browser.is_some()
-                || input.is_some()
                 || output.is_some()
                 || port.is_some()
-                || app.is_some()
-                || restart
-                || yt_dlp != "yt-dlp"
+                || profile_dir.is_some()
+                || timeout_secs.is_some()
                 || browse_params.is_some()
                 || initial_only
+                || restart_running
             {
-                return Err("auth import options require an auth import action".to_string());
+                return Err("auth options require an auth action".to_string());
             }
             other
         }
@@ -391,20 +342,13 @@ fn parse_auth_command(args: &mut Vec<String>) -> Result<Command, String> {
     args.remove(0);
     match action.as_str() {
         "check" => Ok(Command::AuthCheck),
-        "import-browser" => Ok(Command::AuthImportBrowser {
-            browser: String::new(),
+        "login-window" => Ok(Command::AuthLoginWindow {
             output: PathBuf::new(),
-            yt_dlp: String::new(),
-        }),
-        "import-headers" => Ok(Command::AuthImportHeaders {
-            input: PathBuf::new(),
-            output: PathBuf::new(),
-        }),
-        "import-dia" => Ok(Command::AuthImportDia {
-            output: PathBuf::new(),
-            port: DEFAULT_DIA_CDP_PORT,
-            app: PathBuf::from(DEFAULT_DIA_APP_PATH),
-            restart: false,
+            browser: None,
+            profile_dir: None,
+            port: DEFAULT_LOGIN_CDP_PORT,
+            timeout_secs: DEFAULT_LOGIN_TIMEOUT_SECS,
+            restart_running: false,
         }),
         other => Err(format!("unknown auth action `{other}`")),
     }
@@ -475,9 +419,7 @@ fn usage() -> String {
     [
         "usage:",
         "  ytm-radio-helper auth check --auth FILE",
-        "  ytm-radio-helper auth import-browser --browser BROWSER --output FILE [--yt-dlp PROGRAM]",
-        "  ytm-radio-helper auth import-headers --input FILE --output FILE",
-        "  ytm-radio-helper auth import-dia --output FILE [--port N] [--app PATH] [--restart]",
+        "  ytm-radio-helper auth login-window --output FILE [--browser BROWSER] [--profile-dir DIR] [--port N] [--timeout-secs N] [--restart-running]",
         "  ytm-radio-helper browse home --auth FILE [--limit N] [--initial-only]",
         "  ytm-radio-helper browse home --mock [--limit N] [--initial-only]",
         "  ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N]",
@@ -1007,84 +949,51 @@ mod tests {
     }
 
     #[test]
-    fn parses_browser_import_command() {
+    fn parses_login_window_command_with_defaults() {
+        let options =
+            parse_args(["auth", "login-window", "--output", "/tmp/ytm/auth.json"]).unwrap();
+        assert_eq!(
+            options.command,
+            Command::AuthLoginWindow {
+                output: PathBuf::from("/tmp/ytm/auth.json"),
+                browser: None,
+                profile_dir: None,
+                port: DEFAULT_LOGIN_CDP_PORT,
+                timeout_secs: DEFAULT_LOGIN_TIMEOUT_SECS,
+                restart_running: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_login_window_command_with_browser_profile_and_timeout() {
         let options = parse_args([
             "auth",
-            "import-browser",
+            "login-window",
+            "--output",
+            "/tmp/auth.json",
             "--browser",
-            "chrome:Default",
-            "--output",
-            "/tmp/auth.json",
-        ])
-        .unwrap();
-        assert_eq!(
-            options.command,
-            Command::AuthImportBrowser {
-                browser: "chrome:Default".to_string(),
-                output: PathBuf::from("/tmp/auth.json"),
-                yt_dlp: "yt-dlp".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_header_import_command() {
-        let options = parse_args([
-            "auth",
-            "import-headers",
-            "--input",
-            "/tmp/headers.txt",
-            "--output",
-            "/tmp/auth.json",
-        ])
-        .unwrap();
-        assert_eq!(
-            options.command,
-            Command::AuthImportHeaders {
-                input: PathBuf::from("/tmp/headers.txt"),
-                output: PathBuf::from("/tmp/auth.json"),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_dia_import_command() {
-        let options = parse_args([
-            "auth",
-            "import-dia",
-            "--output",
-            "/tmp/auth.json",
+            "brave",
+            "--profile-dir",
+            "/tmp/profile",
             "--port",
-            "29999",
-            "--app",
-            "/Applications/Dia.app/Contents/MacOS/Dia",
+            "29998",
+            "--timeout-secs",
+            "60",
+            "--restart-running",
         ])
         .unwrap();
         assert_eq!(
             options.command,
-            Command::AuthImportDia {
+            Command::AuthLoginWindow {
                 output: PathBuf::from("/tmp/auth.json"),
-                port: 29999,
-                app: PathBuf::from("/Applications/Dia.app/Contents/MacOS/Dia"),
-                restart: false,
+                browser: Some("brave".to_string()),
+                profile_dir: Some(PathBuf::from("/tmp/profile")),
+                port: 29998,
+                timeout_secs: 60,
+                restart_running: true,
             }
         );
-    }
-
-    #[test]
-    fn parses_dia_import_restart_flag() {
-        let options = parse_args([
-            "auth",
-            "import-dia",
-            "--output",
-            "/tmp/auth.json",
-            "--restart",
-        ])
-        .unwrap();
-        match options.command {
-            Command::AuthImportDia { restart, .. } => assert!(restart),
-            other => panic!("unexpected command: {other:?}"),
-        }
     }
 
     #[test]

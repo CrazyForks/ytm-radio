@@ -14,8 +14,8 @@ and useful.
 ## Users
 
 - Emacs users who want keyboard-first YouTube Music playback.
-- Users who already have a logged-in browser session and want to reuse that
-  account context without storing raw cookies in Emacs state.
+- Users who want a guided YouTube Music login flow without copying headers or
+  exposing raw cookies to Emacs state.
 - Users who prefer a compact now-playing child frame for artwork and transport
   controls while continuing to work in other buffers.
 
@@ -32,12 +32,15 @@ and useful.
   mouse interaction.
 - Keep the now-playing child frame focused on cover art, title, artist,
   progress, and compact playback-mode controls.
-- Keep account access explicit, short-lived, and outside Elisp.
+- Keep account access short-lived and outside Elisp, while making the browser
+  login handoff automatic when account-backed views require it.
 
 ## Non-goals
 
 - Do not embed the full YouTube Music web app.
 - Do not implement browser cookie database decryption in Rust.
+- Do not support copied request-header auth or browser-cookie database import
+  as fallback login paths.
 - Do not add an Emacs dynamic module or Python helper.
 - Do not make the Rust helper a resident service by default.
 - Do not persist cookies, auth headers, process objects, sockets, timers, or
@@ -47,6 +50,11 @@ and useful.
 
 - Empty startup must show the browser shell and useful import actions, not a URL
   prompt.
+- Opening an uncached account-backed view without auth should start the browser
+  login flow automatically and resume the requested action after login.
+- HTTP 401/403 and obsolete auth-source diagnostics should clear
+  account-derived cache, start the same login flow, and retry the requested
+  action after login.
 - Root views should use the stable top-level vocabulary: Home, Explore, and
   Library. Search is a command-driven view entered with `/`, not a persistent
   top-level tab.
@@ -69,8 +77,8 @@ and useful.
 
 - Elisp owns local catalog state, UI rendering, user commands, and mpv IPC.
 - `yt-dlp` owns URL metadata discovery and mpv's ytdl media extraction path.
-- The Rust helper owns YouTube Music account requests, browser import, and
-  helper JSON envelopes.
+- The Rust helper owns YouTube Music account requests, the browser login
+  window, and helper JSON envelopes.
 - Helper stdout must remain machine-readable JSON; diagnostics belong on
   stderr.
 - Helper schema versions are explicit, and unsupported schema versions must be

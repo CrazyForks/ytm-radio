@@ -51,6 +51,21 @@
   "Face for ytm-radio source section headings."
   :group 'ytm-radio)
 
+(defface ytm-radio-header-active
+  '((t (:inherit bold :underline nil)))
+  "Face for the active ytm-radio browser header item."
+  :group 'ytm-radio)
+
+(defface ytm-radio-header-inactive
+  '((t (:inherit shadow :underline nil)))
+  "Face for inactive ytm-radio browser header items."
+  :group 'ytm-radio)
+
+(defface ytm-radio-header-logo
+  '((t (:foreground "#ff0000" :weight bold :underline nil)))
+  "Face for the YouTube logo in the ytm-radio browser header."
+  :group 'ytm-radio)
+
 (defface ytm-radio-child-frame-border
   '((((class color) (background light)) (:background "#8a8a8a"))
     (((class color) (background dark)) (:background "#6f6f6f"))
@@ -87,12 +102,28 @@
 
 (defcustom ytm-radio-mpv-network-cache-args
   '("--cache=yes"
+    "--cache-pause=no"
     "--demuxer-readahead-secs=60"
     "--demuxer-max-bytes=256MiB")
   "Default mpv cache arguments used for long network tracks.
 These arguments are placed before `ytm-radio-mpv-extra-args', so user-supplied
 extra arguments can override them."
   :type '(repeat string)
+  :group 'ytm-radio)
+
+(defcustom ytm-radio-mpv-ytdl-format "bestaudio/best"
+  "Default mpv ytdl format used when playing YouTube URLs.
+The default avoids resolving and selecting video streams for audio-only
+playback.  Set nil to let mpv choose its own ytdl format."
+  :type '(choice (const :tag "mpv default" nil)
+                 string)
+  :group 'ytm-radio)
+
+(defcustom ytm-radio-stream-prefetch-limit 1
+  "Maximum number of upcoming tracks to pre-resolve for faster playback.
+Prefetching runs in the background and keeps direct audio stream URLs in memory
+only.  Set to 0 to disable stream prefetching."
+  :type 'natnum
   :group 'ytm-radio)
 
 (defcustom ytm-radio-ytdl-raw-options nil
@@ -121,32 +152,35 @@ The file contents are never persisted in ytm-radio state."
   :type 'file
   :group 'ytm-radio)
 
-(defcustom ytm-radio-helper-browser "chrome"
-  "Browser specification passed to the helper for cookie import.
-The syntax is the same as yt-dlp's BROWSER argument, for example
-\"chrome\", \"chrome:Default\", or \"firefox\"."
-  :type 'string
+(defcustom ytm-radio-helper-login-browser nil
+  "Browser executable or known browser name used for account login.
+When nil, the helper uses the system default browser when it supports the
+Chromium DevTools login flow."
+  :type '(choice (const :tag "Auto" nil)
+                 string)
   :group 'ytm-radio)
 
-(defcustom ytm-radio-helper-browser-candidates
-  '("chrome" "chrome:Default" "firefox" "safari" "brave" "edge"
-    "chromium" "opera" "vivaldi" "whale")
-  "Browser specifications offered by `ytm-radio-auth-import'."
-  :type '(repeat string)
+(defcustom ytm-radio-helper-login-profile-directory nil
+  "Optional isolated browser profile directory used for account login.
+When nil, the helper opens the login browser with its normal profile."
+  :type '(choice (const :tag "Use normal browser profile" nil)
+                 directory)
   :group 'ytm-radio)
 
-(defcustom ytm-radio-helper-dia-app
-  "/Applications/Dia.app/Contents/MacOS/Dia"
-  "Dia executable used by the helper for automatic login import."
-  :type 'file
-  :group 'ytm-radio)
-
-(defcustom ytm-radio-helper-dia-cdp-port 29317
-  "Local DevTools port used for one-shot Dia login import."
+(defcustom ytm-radio-helper-login-cdp-port 29317
+  "Local DevTools port used for account login."
   :type '(restricted-sexp
           :match-alternatives
           ((lambda (value)
              (and (integerp value) (<= 1 value 65535)))))
+  :group 'ytm-radio)
+
+(defcustom ytm-radio-helper-login-timeout 180
+  "Seconds the account login flow waits for browser sign-in to finish."
+  :type '(restricted-sexp
+          :match-alternatives
+          ((lambda (value)
+             (and (integerp value) (< 0 value)))))
   :group 'ytm-radio)
 
 (defcustom ytm-radio-helper-use-mock-data nil
@@ -386,6 +420,15 @@ The legacy `list' mode is treated as `all'."
 (defvar ytm-radio--cover-downloads (make-hash-table :test #'equal)
   "Cover image URLs currently being fetched into the local cache.")
 
+(defvar ytm-radio--stream-url-cache (make-hash-table :test #'equal)
+  "Direct audio stream URLs cached by track id or URL.")
+
+(defvar ytm-radio--stream-prefetch-queue nil
+  "Tracks waiting for background direct stream URL resolution.")
+
+(defvar ytm-radio--stream-prefetch-process nil
+  "Current asynchronous stream prefetch process.")
+
 (defvar ytm-radio--browser-view 'home
   "Current ytm-radio browser view.")
 
@@ -400,6 +443,15 @@ The legacy `list' mode is treated as `all'."
 
 (defvar ytm-radio--browser-load-process nil
   "Current asynchronous non-Home helper process.")
+
+(defvar ytm-radio--login-process nil
+  "Current asynchronous YouTube Music login helper process.")
+
+(defvar ytm-radio--login-continuation nil
+  "Action to run after the current YouTube Music login succeeds.")
+
+(defvar ytm-radio--login-status nil
+  "Current YouTube Music login status for the browser header line.")
 
 (defvar ytm-radio--initial-home-refreshed nil
   "Non-nil once Home has been refreshed on first browser open.")
@@ -828,10 +880,72 @@ build a watch URL when yt-dlp returns only a video id."
 
 ;;; Account helper
 
-(defun ytm-radio--ensure-readable-file (file label)
-  "Signal a user error unless FILE named LABEL is readable."
-  (unless (and file (file-readable-p file))
-    (user-error "%s is not configured or readable" label)))
+(defun ytm-radio--account-auth-available-p ()
+  "Return non-nil when account-backed helper requests can run now."
+  (or ytm-radio-helper-use-mock-data
+      (and ytm-radio-helper-auth-file
+           (file-readable-p ytm-radio-helper-auth-file))))
+
+(defun ytm-radio--account-auth-diagnostic-p (diagnostic)
+  "Return non-nil when DIAGNOSTIC means account auth should be refreshed."
+  (string-match-p
+   (rx (or "HTTP 401 Unauthorized"
+           "HTTP 403 Forbidden"
+           "Request is missing required authentication credential"
+           "unsupported auth source"
+           "auth file is missing"
+           "auth cookie is missing"
+           "cannot read auth file"
+           "invalid auth file"))
+   diagnostic))
+
+(defun ytm-radio--invalidate-account-auth ()
+  "Clear cached account helper state after an auth failure."
+  (ytm-radio--clear-helper-bootstrap-cache)
+  (when (and (stringp ytm-radio-helper-auth-file)
+             (file-exists-p ytm-radio-helper-auth-file))
+    (ignore-errors
+      (delete-file ytm-radio-helper-auth-file))))
+
+(defun ytm-radio--start-account-login (action &optional message)
+  "Start login and run ACTION after it succeeds.
+MESSAGE is shown before opening the login browser."
+  (if (process-live-p ytm-radio--login-process)
+      (progn
+        (setq ytm-radio--login-continuation action)
+        (ytm-radio--set-login-status "Login waiting in browser...")
+        (message
+         "YouTube Music login is already running; finish signing in in the browser"))
+    (when message
+      (message "%s" message))
+    (ytm-radio--start-login (expand-file-name ytm-radio-helper-auth-file)
+                            nil
+                            action)))
+
+(defun ytm-radio--with-account-auth (action &optional message)
+  "Run ACTION when account auth is available, otherwise start login.
+MESSAGE is shown when login is required."
+  (if (ytm-radio--account-auth-available-p)
+      (condition-case error
+          (funcall action)
+        (user-error
+         (let ((diagnostic (error-message-string error)))
+           (if (ytm-radio--account-auth-diagnostic-p diagnostic)
+               (progn
+                 (ytm-radio--invalidate-account-auth)
+                 (ytm-radio--start-account-login action "YouTube Music login required"))
+             (signal (car error) (cdr error))))))
+    (ytm-radio--start-account-login
+     action
+     (or message "YouTube Music login required"))))
+
+(defun ytm-radio--handle-account-helper-error (diagnostic retry-action)
+  "Handle account helper DIAGNOSTIC, retrying through RETRY-ACTION if needed."
+  (if (ytm-radio--account-auth-diagnostic-p diagnostic)
+      (progn
+        (ytm-radio--invalidate-account-auth)
+        (ytm-radio--start-account-login retry-action "YouTube Music login required"))
+    (message "%s" diagnostic)))
 
 (defun ytm-radio--helper-limit (target)
   "Return the configured helper limit for TARGET."
@@ -885,48 +999,41 @@ When INITIAL-ONLY is non-nil, request only the first Home page."
           (list "--limit"
                 (number-to-string ytm-radio-helper-library-limit))))
 
-(defun ytm-radio--helper-import-browser-arguments (browser output)
-  "Return helper arguments for importing BROWSER cookies into OUTPUT."
-  (list "auth"
-        "import-browser"
-        "--browser"
-        browser
-        "--output"
-        (expand-file-name output)
-        "--yt-dlp"
-        ytm-radio-yt-dlp-program))
+(defun ytm-radio--helper-login-arguments (output &optional restart-running)
+  "Return helper arguments for logging in and writing auth to OUTPUT.
+When RESTART-RUNNING is non-nil, ask the helper to restart a running browser
+that does not expose DevTools."
+  (append
+   (list "auth"
+         "login-window"
+         "--output"
+         (expand-file-name output)
+         "--port"
+         (number-to-string ytm-radio-helper-login-cdp-port)
+         "--timeout-secs"
+         (number-to-string ytm-radio-helper-login-timeout))
+   (when restart-running
+     (list "--restart-running"))
+   (when (and (stringp ytm-radio-helper-login-profile-directory)
+              (not (string-empty-p ytm-radio-helper-login-profile-directory)))
+     (list "--profile-dir"
+           (expand-file-name ytm-radio-helper-login-profile-directory)))
+   (when (and (stringp ytm-radio-helper-login-browser)
+              (not (string-empty-p ytm-radio-helper-login-browser)))
+     (list "--browser" ytm-radio-helper-login-browser))))
 
-(defun ytm-radio--helper-import-headers-arguments (input output)
-  "Return helper arguments for importing request headers from INPUT into OUTPUT."
-  (list "auth"
-        "import-headers"
-        "--input"
-        (expand-file-name input)
-        "--output"
-        (expand-file-name output)))
+(defun ytm-radio--helper-bootstrap-cache-file ()
+  "Return the helper bootstrap cache path, or nil."
+  (when ytm-radio-helper-auth-file
+    (expand-file-name
+     "bootstrap-cache.json"
+     (file-name-directory (expand-file-name ytm-radio-helper-auth-file)))))
 
-(defun ytm-radio--helper-import-dia-arguments (output &optional restart)
-  "Return helper arguments for importing Dia login into OUTPUT.
-When RESTART is non-nil, allow the helper to restart Dia once."
-  (append (list "auth"
-                "import-dia"
-                "--output"
-                (expand-file-name output)
-                "--port"
-                (number-to-string ytm-radio-helper-dia-cdp-port)
-                "--app"
-                (expand-file-name ytm-radio-helper-dia-app))
-          (when restart
-            (list "--restart"))))
-
-(defun ytm-radio--auth-import-candidates ()
-  "Return login source candidates for `ytm-radio-auth-import'."
-  (delete-dups (append ytm-radio-helper-browser-candidates
-                       (list "dia"))))
-
-(defun ytm-radio--dia-auth-source-p (source)
-  "Return non-nil when SOURCE names Dia."
-  (string-equal (downcase (string-trim source)) "dia"))
+(defun ytm-radio--clear-helper-bootstrap-cache ()
+  "Delete the helper bootstrap cache file when it exists."
+  (when-let* ((file (ytm-radio--helper-bootstrap-cache-file))
+              ((file-exists-p file)))
+    (delete-file file)))
 
 (defun ytm-radio--call-helper (arguments)
   "Run the external helper with ARGUMENTS and return parsed JSON."
@@ -1057,6 +1164,8 @@ SOURCE-ID and SOURCE-KIND identify the imported helper source."
       ("search"
        (or (string-prefix-p "ytm:search" id)
            (string-equal kind "youtube-music-search")))
+      ("browse"
+       (string-prefix-p "ytm:browse" id))
       (_ nil))))
 
 (defun ytm-radio--drop-helper-target-sources (target)
@@ -1066,6 +1175,11 @@ SOURCE-ID and SOURCE-KIND identify the imported helper source."
          (lambda (cell)
            (ytm-radio--helper-target-source-p (cdr cell) target))
          (ytm-radio--sources))))
+
+(defun ytm-radio--drop-account-helper-sources ()
+  "Remove account-backed helper sources from state."
+  (dolist (target '("home" "explore" "library" "liked" "search" "browse"))
+    (ytm-radio--drop-helper-target-sources target)))
 
 (defun ytm-radio--import-sources (sources)
   "Import SOURCES into state and return the number imported."
@@ -1131,34 +1245,36 @@ When APPEND is non-nil, load `ytm-radio--home-continuation'."
   (ytm-radio--ensure-loaded)
   (when (process-live-p ytm-radio--home-process)
     (user-error "Home is already loading"))
-  (unless ytm-radio-helper-use-mock-data
-    (ytm-radio--ensure-readable-file
-     ytm-radio-helper-auth-file
-     "YouTube Music helper auth file"))
-  (let ((arguments (if append
-                       (if ytm-radio--home-continuation
-                           (ytm-radio--helper-continuation-arguments
-                            ytm-radio--home-continuation)
-                         (user-error "No more Home sections"))
-                     (ytm-radio--helper-browse-arguments "home" t))))
-    (setq ytm-radio--home-loading (if append 'more 'initial))
-    (unless append
-      (setq ytm-radio--home-continuation nil))
-    (ytm-radio--render-browser (not append))
-    (setq
-     ytm-radio--home-process
-     (ytm-radio--call-helper-async
-      arguments
-      (lambda (data)
-        (setq ytm-radio--home-process nil
-              ytm-radio--home-loading nil
-              ytm-radio--initial-home-refreshed t)
-        (ytm-radio--apply-home-helper-data data append))
-      (lambda (diagnostic)
-        (setq ytm-radio--home-process nil
-              ytm-radio--home-loading nil)
-        (ytm-radio--render-browser)
-        (message "%s" diagnostic))))))
+  (ytm-radio--with-account-auth
+   (lambda ()
+     (let ((arguments (if append
+                          (if ytm-radio--home-continuation
+                              (ytm-radio--helper-continuation-arguments
+                               ytm-radio--home-continuation)
+                            (user-error "No more Home sections"))
+                        (ytm-radio--helper-browse-arguments "home" t))))
+       (setq ytm-radio--home-loading (if append 'more 'initial))
+       (unless append
+         (setq ytm-radio--home-continuation nil))
+       (ytm-radio--render-browser (not append))
+       (setq
+        ytm-radio--home-process
+        (ytm-radio--call-helper-async
+         arguments
+         (lambda (data)
+           (setq ytm-radio--home-process nil
+                 ytm-radio--home-loading nil
+                 ytm-radio--initial-home-refreshed t)
+           (ytm-radio--apply-home-helper-data data append))
+         (lambda (diagnostic)
+           (setq ytm-radio--home-process nil
+                 ytm-radio--home-loading nil)
+           (ytm-radio--render-browser)
+           (ytm-radio--handle-account-helper-error
+            diagnostic
+            (lambda ()
+              (ytm-radio--start-home-load append))))))))
+   "YouTube Music login required"))
 
 (defun ytm-radio--start-helper-target-load (target label view)
   "Start asynchronous helper import for TARGET with LABEL in VIEW."
@@ -1166,60 +1282,61 @@ When APPEND is non-nil, load `ytm-radio--home-continuation'."
   (when (process-live-p ytm-radio--browser-load-process)
     (user-error "YouTube Music %s is already loading"
                 ytm-radio--browser-loading-view))
-  (unless ytm-radio-helper-use-mock-data
-    (ytm-radio--ensure-readable-file
-     ytm-radio-helper-auth-file
-     "YouTube Music helper auth file"))
-  (setq ytm-radio--browser-loading-message
-        (format "Loading %s..." (ytm-radio--browser-title))
-        ytm-radio--browser-loading-view view)
-  (ytm-radio--render-browser t)
-  (setq
-   ytm-radio--browser-load-process
-   (ytm-radio--call-helper-async
-    (ytm-radio--helper-browse-arguments target)
-    (lambda (data)
-      (let ((sources (ytm-radio--helper-sources data)))
+  (ytm-radio--with-account-auth
+   (lambda ()
+     (setq ytm-radio--browser-loading-message
+           (format "Loading %s..." (ytm-radio--browser-title))
+           ytm-radio--browser-loading-view view)
+     (ytm-radio--render-browser t)
+     (setq
+      ytm-radio--browser-load-process
+      (ytm-radio--call-helper-async
+       (ytm-radio--helper-browse-arguments target)
+       (lambda (data)
+         (let ((sources (ytm-radio--helper-sources data)))
+           (setq ytm-radio--browser-load-process nil
+                 ytm-radio--browser-loading-message nil
+                 ytm-radio--browser-loading-view nil)
+           (ytm-radio--drop-helper-target-sources target)
+           (dolist (source sources)
+             (ytm-radio--put-source source))
+           (ytm-radio--save)
+           (ytm-radio--render)
+           (message "Imported %s: %d sources, %d tracks"
+                    label
+                    (length sources)
+                    (ytm-radio--helper-track-count sources))))
+       (lambda (diagnostic)
         (setq ytm-radio--browser-load-process nil
               ytm-radio--browser-loading-message nil
               ytm-radio--browser-loading-view nil)
-        (ytm-radio--drop-helper-target-sources target)
-        (dolist (source sources)
-          (ytm-radio--put-source source))
-        (ytm-radio--save)
-        (ytm-radio--render)
-        (message "Imported %s: %d sources, %d tracks"
-                 label
-                 (length sources)
-                 (ytm-radio--helper-track-count sources))))
-    (lambda (diagnostic)
-      (setq ytm-radio--browser-load-process nil
-            ytm-radio--browser-loading-message nil
-            ytm-radio--browser-loading-view nil)
-      (ytm-radio--render-browser)
-      (message "%s" diagnostic)))))
+        (ytm-radio--render-browser)
+        (ytm-radio--handle-account-helper-error
+         diagnostic
+         (lambda ()
+           (ytm-radio--start-helper-target-load target label view)))))))
+   "YouTube Music login required"))
 
 (defun ytm-radio--import-helper-target (target label)
   "Import helper TARGET and report LABEL."
   (ytm-radio--ensure-loaded)
-  (unless ytm-radio-helper-use-mock-data
-    (ytm-radio--ensure-readable-file
-     ytm-radio-helper-auth-file
-     "YouTube Music helper auth file"))
-  (let* ((sources (ytm-radio--fetch-helper-target-sources target))
-         (track-count (seq-reduce
-                       (lambda (count source)
-                         (+ count (length (map-elt source :tracks))))
-                       sources
-                       0)))
-    (unless sources
-      (user-error "No %s returned" label))
-    (ytm-radio--drop-helper-target-sources target)
-    (ytm-radio--import-sources sources)
-    (message "Imported %s: %d sources, %d tracks"
-             label
-             (length sources)
-             track-count)))
+  (ytm-radio--with-account-auth
+   (lambda ()
+     (let* ((sources (ytm-radio--fetch-helper-target-sources target))
+            (track-count (seq-reduce
+                          (lambda (count source)
+                            (+ count (length (map-elt source :tracks))))
+                          sources
+                          0)))
+       (unless sources
+         (user-error "No %s returned" label))
+       (ytm-radio--drop-helper-target-sources target)
+       (ytm-radio--import-sources sources)
+       (message "Imported %s: %d sources, %d tracks"
+                label
+                (length sources)
+                track-count)))
+   "YouTube Music login required"))
 
 ;;; Playback
 
@@ -1229,9 +1346,157 @@ When APPEND is non-nil, load `ytm-radio--home-continuation'."
     (concat "--ytdl-raw-options="
             (mapconcat #'identity ytm-radio-ytdl-raw-options ","))))
 
+(defun ytm-radio--mpv-ytdl-format-argument ()
+  "Return the mpv ytdl format argument, or nil."
+  (when (and (stringp ytm-radio-mpv-ytdl-format)
+             (not (string-empty-p ytm-radio-mpv-ytdl-format)))
+    (concat "--ytdl-format=" ytm-radio-mpv-ytdl-format)))
+
+(defun ytm-radio--stream-cache-key (track)
+  "Return the stream cache key for TRACK."
+  (or (map-elt track :id)
+      (map-elt track :url)))
+
+(defun ytm-radio--stream-url-expiry (url)
+  "Return direct stream URL expiry time, or a conservative fallback."
+  (if (and (stringp url)
+           (string-match "[?&]expire=\\([0-9]+\\)" url))
+      (string-to-number (match-string 1 url))
+    (+ (floor (float-time)) 1800)))
+
+(defun ytm-radio--stream-cache-entry-valid-p (entry)
+  "Return non-nil when cached stream ENTRY can still be used."
+  (and (map-elt entry 'url)
+       (> (or (map-elt entry 'expires) 0)
+          (+ (floor (float-time)) 300))))
+
+(defun ytm-radio--cached-stream-url (track)
+  "Return a cached direct stream URL for TRACK, or nil."
+  (when-let* ((key (ytm-radio--stream-cache-key track))
+              (entry (gethash key ytm-radio--stream-url-cache)))
+    (if (ytm-radio--stream-cache-entry-valid-p entry)
+        (map-elt entry 'url)
+      (remhash key ytm-radio--stream-url-cache)
+      nil)))
+
+(defun ytm-radio--cache-stream-url (track url)
+  "Cache direct stream URL for TRACK."
+  (when-let* ((key (ytm-radio--stream-cache-key track))
+              ((stringp url))
+              ((not (string-empty-p url))))
+    (puthash key
+             (list (cons 'url url)
+                   (cons 'expires (ytm-radio--stream-url-expiry url)))
+             ytm-radio--stream-url-cache)))
+
+(defun ytm-radio--playback-url (track)
+  "Return the best playback URL available for TRACK."
+  (or (ytm-radio--cached-stream-url track)
+      (map-elt track :url)))
+
+(defun ytm-radio--stream-resolve-arguments (url)
+  "Return yt-dlp arguments for resolving direct stream URL from URL."
+  (append ytm-radio-yt-dlp-extra-args
+          (list "--no-playlist")
+          (when (and (stringp ytm-radio-mpv-ytdl-format)
+                     (not (string-empty-p ytm-radio-mpv-ytdl-format)))
+            (list "-f" ytm-radio-mpv-ytdl-format))
+          (list "-g" url)))
+
+(defun ytm-radio--first-output-line (buffer)
+  "Return the first non-empty line from BUFFER."
+  (with-current-buffer buffer
+    (goto-char (point-min))
+    (catch 'line
+      (while (not (eobp))
+        (let ((line (string-trim
+                     (buffer-substring-no-properties
+                      (line-beginning-position)
+                      (line-end-position)))))
+          (unless (string-empty-p line)
+            (throw 'line line)))
+        (forward-line 1))
+      nil)))
+
+(defun ytm-radio--stream-prefetch-queued-p (key)
+  "Return non-nil when stream cache KEY is already queued."
+  (seq-some (lambda (track)
+              (equal (ytm-radio--stream-cache-key track) key))
+            ytm-radio--stream-prefetch-queue))
+
+(defun ytm-radio--stream-prefetch-current-key ()
+  "Return the track key currently being prefetched."
+  (when (process-live-p ytm-radio--stream-prefetch-process)
+    (process-get ytm-radio--stream-prefetch-process 'ytm-radio-track-key)))
+
+(defun ytm-radio--queue-stream-prefetch (track)
+  "Queue TRACK for background stream URL prefetch."
+  (when-let* ((url (map-elt track :url))
+              (key (ytm-radio--stream-cache-key track))
+              ((not (ytm-radio--cached-stream-url track)))
+              ((not (equal key (ytm-radio--stream-prefetch-current-key))))
+              ((not (ytm-radio--stream-prefetch-queued-p key))))
+    (setq ytm-radio--stream-prefetch-queue
+          (append ytm-radio--stream-prefetch-queue (list track)))))
+
+(defun ytm-radio--start-next-stream-prefetch ()
+  "Start the next queued stream prefetch, if any."
+  (unless (or (process-live-p ytm-radio--stream-prefetch-process)
+              (null ytm-radio--stream-prefetch-queue))
+    (let* ((track (pop ytm-radio--stream-prefetch-queue))
+           (url (map-elt track :url))
+           (key (ytm-radio--stream-cache-key track)))
+      (if (or (not url) (ytm-radio--cached-stream-url track))
+          (ytm-radio--start-next-stream-prefetch)
+        (condition-case nil
+            (ytm-radio--ensure-program ytm-radio-yt-dlp-program "yt-dlp")
+          (user-error
+           (setq ytm-radio--stream-prefetch-queue nil
+                 track nil)))
+        (when track
+          (let* ((stdout (generate-new-buffer " *ytm-radio-stream-stdout*"))
+                 (stderr (generate-new-buffer " *ytm-radio-stream-stderr*"))
+                 (process
+                  (make-process
+                   :name "ytm-radio-stream-prefetch"
+                   :buffer stdout
+                   :stderr stderr
+                   :command (cons ytm-radio-yt-dlp-program
+                                  (ytm-radio--stream-resolve-arguments url))
+                   :noquery t
+                   :sentinel
+                   (lambda (process _event)
+                     (when (memq (process-status process) '(exit signal))
+                       (unwind-protect
+                           (when (zerop (process-exit-status process))
+                             (when-let* ((direct-url
+                                          (ytm-radio--first-output-line stdout)))
+                               (ytm-radio--cache-stream-url
+                                (process-get process 'ytm-radio-track)
+                                direct-url)))
+                         (setq ytm-radio--stream-prefetch-process nil)
+                         (when (buffer-live-p stdout)
+                           (kill-buffer stdout))
+                         (when (buffer-live-p stderr)
+                           (kill-buffer stderr))
+                         (ytm-radio--start-next-stream-prefetch)))))))
+            (process-put process 'ytm-radio-track track)
+            (process-put process 'ytm-radio-track-key key)
+            (setq ytm-radio--stream-prefetch-process process)))))))
+
+(defun ytm-radio--schedule-stream-prefetch (tracks)
+  "Schedule background stream prefetch for TRACKS."
+  (when (and (not noninteractive)
+             (integerp ytm-radio-stream-prefetch-limit)
+             (> ytm-radio-stream-prefetch-limit 0))
+    (dolist (track (seq-take tracks ytm-radio-stream-prefetch-limit))
+      (ytm-radio--queue-stream-prefetch track))
+    (ytm-radio--start-next-stream-prefetch)))
+
 (defun ytm-radio--mpv-arguments (socket url)
   "Return mpv arguments for SOCKET and media URL."
   (append ytm-radio-mpv-network-cache-args
+          (delq nil (list (ytm-radio--mpv-ytdl-format-argument)))
           ytm-radio-mpv-extra-args
           (delq nil (list (ytm-radio--mpv-raw-options-argument)
                           "--no-video"
@@ -1269,7 +1534,7 @@ When APPEND is non-nil, load `ytm-radio--home-continuation'."
   (ytm-radio--stop-process)
   (let* ((socket (make-temp-name
                   (file-name-concat temporary-file-directory "ytm-radio-mpv-")))
-         (args (ytm-radio--mpv-arguments socket (map-elt track :url)))
+         (args (ytm-radio--mpv-arguments socket (ytm-radio--playback-url track)))
          (process (apply #'start-process
                          "ytm-radio-mpv" nil ytm-radio-mpv-program args)))
     (set-process-sentinel process #'ytm-radio--mpv-sentinel)
@@ -1285,7 +1550,9 @@ When APPEND is non-nil, load `ytm-radio--home-continuation'."
     (ytm-radio--save)
     (ytm-radio--mpv-connect socket process 0)
     (ytm-radio--render)
-    (ytm-radio--show-now-playing nil)))
+    (ytm-radio--show-now-playing nil)
+    (when-let* ((next (ytm-radio--next-track track)))
+      (ytm-radio--schedule-stream-prefetch (list next)))))
 
 (defun ytm-radio--mpv-connect (socket process attempt)
   "Connect to mpv SOCKET for PROCESS, retrying from ATTEMPT."
@@ -1512,7 +1779,6 @@ When AUTOMATIC is non-nil, honor single-track repeat."
 (defvar ytm-radio--mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "a") #'ytm-radio-add-url)
-    (define-key map (kbd "A") #'ytm-radio-auth-import)
     (define-key map (kbd "c") #'ytm-radio-now-playing)
     (define-key map (kbd "E") #'ytm-radio-explore)
     (define-key map (kbd "L") #'ytm-radio-library)
@@ -1943,6 +2209,9 @@ The bar is measured between LEFT-LABEL and RIGHT-LABEL."
 (defun ytm-radio--browser-loading-status ()
   "Return a short loading status for the current browser view."
   (cond
+   ((and (process-live-p ytm-radio--login-process)
+         ytm-radio--login-status)
+    ytm-radio--login-status)
    ((and ytm-radio--browser-loading-message
          (or (null ytm-radio--browser-loading-view)
              (equal ytm-radio--browser-loading-view
@@ -1952,13 +2221,59 @@ The bar is measured between LEFT-LABEL and RIGHT-LABEL."
          ytm-radio--home-loading)
     (ytm-radio--home-loading-message))))
 
+(defun ytm-radio--set-login-status (status)
+  "Set browser login STATUS and refresh the header line."
+  (setq ytm-radio--login-status status)
+  (when-let* ((buffer (get-buffer ytm-radio--library-buffer-name)))
+    (with-current-buffer buffer
+      (force-mode-line-update))))
+
+(defun ytm-radio--browser-root-active-p (view)
+  "Return non-nil when root VIEW is the active browser root."
+  (eq (ytm-radio--view-kind) view))
+
+(defun ytm-radio--browser-header-item (label view)
+  "Return a header-line LABEL for root VIEW."
+  (let ((active (ytm-radio--browser-root-active-p view)))
+    (propertize label
+                'face (if active
+                          'ytm-radio-header-active
+                        'ytm-radio-header-inactive))))
+
+(defun ytm-radio--browser-header-context ()
+  "Return non-root browser header context."
+  (unless (memq (ytm-radio--view-kind) '(home explore library))
+    (ytm-radio--browser-title)))
+
+(defun ytm-radio--faicon (name fallback)
+  "Return nerd-icons Font Awesome NAME, or FALLBACK."
+  (if (and (require 'nerd-icons nil t)
+           (fboundp 'nerd-icons-faicon))
+      (condition-case nil
+          (funcall #'nerd-icons-faicon name :height 1.0)
+        (error fallback))
+    fallback))
+
+(defun ytm-radio--browser-header-logo ()
+  "Return the YouTube logo for the browser header line."
+  (propertize (ytm-radio--faicon "nf-fa-youtube" "YT")
+              'face 'ytm-radio-header-logo))
+
 (defun ytm-radio--browser-header-line ()
   "Return the ytm-radio browser header line."
-  (let ((title (ytm-radio--browser-title))
+  (let ((context (ytm-radio--browser-header-context))
         (status (ytm-radio--browser-loading-status)))
     (concat
-     " ytm-radio  "
-     (propertize title 'face 'bold)
+     " "
+     (ytm-radio--browser-header-logo)
+     "    "
+     (string-join
+      (list (ytm-radio--browser-header-item "Home" 'home)
+            (ytm-radio--browser-header-item "Explore" 'explore)
+            (ytm-radio--browser-header-item "Library" 'library))
+      "   ")
+     (when context
+       (concat "    " (propertize context 'face 'ytm-radio-header-active)))
      (when status
        (concat "  " (propertize status 'face 'shadow))))))
 
@@ -2093,23 +2408,22 @@ The bar is measured between LEFT-LABEL and RIGHT-LABEL."
 (defun ytm-radio--open-browse-id-as-source (browse-id &optional params)
   "Fetch YouTube Music BROWSE-ID as a source and show it.
 PARAMS is the optional YouTube Music browse endpoint params string."
-  (unless ytm-radio-helper-use-mock-data
-    (ytm-radio--ensure-readable-file
-     ytm-radio-helper-auth-file
-     "YouTube Music helper auth file"))
-  (let ((sources (ytm-radio--fetch-helper-browse-id-sources browse-id params)))
-    (unless sources
-      (user-error "No YouTube Music detail returned for %s" browse-id))
-    (ytm-radio--import-sources sources)
-    (if (cdr sources)
-        (ytm-radio--set-browser-view
-         (list (cons :kind 'detail)
-               (cons :source-ids (mapcar (lambda (source)
-                                            (map-elt source :id))
-                                          sources))
-               (cons :title (ytm-radio--source-display-title (car sources))))
-         t)
-      (ytm-radio--enter-source (car sources)))))
+  (ytm-radio--with-account-auth
+   (lambda ()
+     (let ((sources (ytm-radio--fetch-helper-browse-id-sources browse-id params)))
+       (unless sources
+         (user-error "No YouTube Music detail returned for %s" browse-id))
+       (ytm-radio--import-sources sources)
+       (if (cdr sources)
+           (ytm-radio--set-browser-view
+            (list (cons :kind 'detail)
+                  (cons :source-ids (mapcar (lambda (source)
+                                               (map-elt source :id))
+                                             sources))
+                  (cons :title (ytm-radio--source-display-title (car sources))))
+            t)
+         (ytm-radio--enter-source (car sources)))))
+   "YouTube Music login required"))
 
 (defun ytm-radio--open-item (source item)
   "Open ITEM from SOURCE using the browser's default action."
@@ -2226,19 +2540,12 @@ move to the preferred content start."
       (ytm-radio--start-helper-target-load
        (car import-spec) (cdr import-spec) view))))
 
-(defun ytm-radio--initial-home-import-available-p ()
-  "Return non-nil when ytm-radio can load Home without prompting."
-  (or ytm-radio-helper-use-mock-data
-      (and ytm-radio-helper-auth-file
-           (file-readable-p ytm-radio-helper-auth-file))))
-
 (defun ytm-radio--maybe-refresh-initial-home ()
-  "Refresh Home once on first browser open when account access is available."
+  "Refresh Home once on first browser open, logging in when needed."
   (when (and (eq (ytm-radio--view-kind) 'home)
              (not ytm-radio--initial-home-refreshed)
              (not ytm-radio--home-loading)
-             (not (ytm-radio--target-cached-p "home"))
-             (ytm-radio--initial-home-import-available-p))
+             (not (ytm-radio--target-cached-p "home")))
     (ytm-radio--start-home-load)))
 
 (defun ytm-radio--home-can-lazy-load-p ()
@@ -2969,7 +3276,7 @@ When RESET-POINT is non-nil, move point to the first browser content item."
         (ytm-radio--insert-browser-heading-padding)
         (when (ytm-radio--empty-catalog-p)
           (insert "Add a URL, or import your YouTube Music library/home.\n")
-          (insert "Use login once to import a browser session.\n"))
+          (insert "YouTube Music login opens automatically when needed.\n"))
         (cond
          ((and ytm-radio--browser-loading-message
                (or (null ytm-radio--browser-loading-view)
@@ -2994,8 +3301,8 @@ When RESET-POINT is non-nil, move point to the first browser content item."
             (cl-loop for source in sources
                      for first = t then nil
                      do (ytm-radio--insert-source-section
-                         source
-                         (and first omit-first-leading-space))))))
+                        source
+                        (and first omit-first-leading-space))))))
         (ytm-radio--restore-browser-point old-point reset-point)
         (ytm-radio--maybe-lazy-load-home)))))
 
@@ -3700,100 +4007,67 @@ When FOCUS is non-nil, focus the now-playing child frame."
   "Search YouTube Music for QUERY through the Rust helper."
   (interactive (list (read-string "YouTube Music search: ")))
   (ytm-radio--ensure-loaded)
-  (unless ytm-radio-helper-use-mock-data
-    (ytm-radio--ensure-readable-file
-     ytm-radio-helper-auth-file
-     "YouTube Music helper auth file"))
-  (let ((sources (ytm-radio--fetch-helper-sources
-                  (ytm-radio--helper-search-arguments query))))
-    (unless sources
-      (user-error "No search results returned"))
-    (ytm-radio--drop-helper-target-sources "search")
-    (ytm-radio--import-sources sources)
-    (ytm-radio--set-browser-view
-     (list (cons :kind 'search)
-           (cons :query query)
-           (cons :title (format "Search: %s" query)))
-     t)
-    (message "Imported search results for %s" query)))
+  (ytm-radio--with-account-auth
+   (lambda ()
+     (let ((sources (ytm-radio--fetch-helper-sources
+                     (ytm-radio--helper-search-arguments query))))
+       (unless sources
+         (user-error "No search results returned"))
+       (ytm-radio--drop-helper-target-sources "search")
+       (ytm-radio--import-sources sources)
+       (ytm-radio--set-browser-view
+        (list (cons :kind 'search)
+              (cons :query query)
+              (cons :title (format "Search: %s" query)))
+        t)
+       (message "Imported search results for %s" query)))
+   "YouTube Music login required"))
 
-;;;###autoload
-(defun ytm-radio-auth-import (source output)
-  "Import YouTube Music authentication from SOURCE into OUTPUT.
-SOURCE is a login source such as \"chrome\", \"firefox\", \"safari\",
-or \"dia\"."
-  (interactive
-   (list
-    (completing-read "Login source: "
-                     (ytm-radio--auth-import-candidates)
-                     nil nil nil nil ytm-radio-helper-browser)
-    (read-file-name "Auth file: "
-                    (file-name-directory ytm-radio-helper-auth-file)
-                    ytm-radio-helper-auth-file)))
-  (if (ytm-radio--dia-auth-source-p source)
-      (ytm-radio-auth-import-dia output)
-    (ytm-radio-auth-import-browser source output)))
+(when (fboundp 'ytm-radio-login)
+  (fmakunbound 'ytm-radio-login))
 
-;;;###autoload
-(defun ytm-radio-auth-import-dia (output)
-  "Import YouTube Music authentication from Dia into OUTPUT."
-  (interactive
-   (list
-    (read-file-name "Auth file: "
-                    (file-name-directory ytm-radio-helper-auth-file)
-                    ytm-radio-helper-auth-file)))
-  (condition-case error
-      (ytm-radio--helper-envelope-data
-       (ytm-radio--call-helper
-        (ytm-radio--helper-import-dia-arguments output)))
-    (user-error
-     (let ((message (error-message-string error)))
-       (if (and (string-match-p "quit Dia and run import again" message)
-                (yes-or-no-p
-                 "Dia must be restarted once for login import.  Restart Dia now? "))
-             (ytm-radio--helper-envelope-data
-              (ytm-radio--call-helper
-               (ytm-radio--helper-import-dia-arguments output t)))
-         (signal (car error) (cdr error))))))
-  (setq ytm-radio-helper-auth-file (expand-file-name output))
-  (setq ytm-radio--initial-home-refreshed nil)
-  (message "YouTube Music Dia session imported"))
+(defun ytm-radio--login-restart-needed-p (diagnostic)
+  "Return non-nil when DIAGNOSTIC means the login browser needs restart."
+  (string-match-p "already running without DevTools" diagnostic))
 
-;;;###autoload
-(defun ytm-radio-auth-import-browser (browser output)
-  "Import YouTube Music authentication from BROWSER into OUTPUT."
-  (interactive
-   (list
-    (completing-read "Browser specification: "
-                     ytm-radio-helper-browser-candidates
-                     nil nil nil nil ytm-radio-helper-browser)
-    (read-file-name "Auth file: "
-                    (file-name-directory ytm-radio-helper-auth-file)
-                    ytm-radio-helper-auth-file)))
-  (ytm-radio--helper-envelope-data
-   (ytm-radio--call-helper
-    (ytm-radio--helper-import-browser-arguments browser output)))
-  (setq ytm-radio-helper-auth-file (expand-file-name output))
-  (setq ytm-radio--initial-home-refreshed nil)
-  (message "YouTube Music browser session imported"))
-
-;;;###autoload
-(defun ytm-radio-auth-import-headers (input output)
-  "Import YouTube Music authentication from browser request headers.
-INPUT is a text file containing copied request headers.  OUTPUT is the
-helper auth JSON file."
-  (interactive
-   (list
-    (read-file-name "Headers file: " nil nil t)
-    (read-file-name "Auth file: "
-                    (file-name-directory ytm-radio-helper-auth-file)
-                    ytm-radio-helper-auth-file)))
-  (ytm-radio--helper-envelope-data
-   (ytm-radio--call-helper
-    (ytm-radio--helper-import-headers-arguments input output)))
-  (setq ytm-radio-helper-auth-file (expand-file-name output))
-  (setq ytm-radio--initial-home-refreshed nil)
-  (message "YouTube Music browser headers imported"))
+(defun ytm-radio--start-login (output &optional restart-running after-success)
+  "Start asynchronous login into OUTPUT.
+When RESTART-RUNNING is non-nil, allow the helper to restart the browser.
+When AFTER-SUCCESS is non-nil, call it after importing auth."
+  (when after-success
+    (setq ytm-radio--login-continuation after-success))
+  (message "Opening YouTube Music login window...")
+  (ytm-radio--set-login-status "Login waiting in browser...")
+  (setq
+   ytm-radio--login-process
+   (ytm-radio--call-helper-async
+    (ytm-radio--helper-login-arguments output restart-running)
+    (lambda (_data)
+     (setq ytm-radio--login-process nil
+            ytm-radio-helper-auth-file (expand-file-name output)
+            ytm-radio--initial-home-refreshed nil
+            ytm-radio--home-continuation nil)
+      (ytm-radio--set-login-status nil)
+      (ytm-radio--clear-helper-bootstrap-cache)
+      (ytm-radio--drop-account-helper-sources)
+      (ytm-radio--save)
+      (if-let* ((continuation ytm-radio--login-continuation))
+          (progn
+            (setq ytm-radio--login-continuation nil)
+            (funcall continuation))
+        (ytm-radio--set-browser-view 'home t)
+        (ytm-radio--start-home-load))
+      (message "YouTube Music login imported"))
+    (lambda (diagnostic)
+      (setq ytm-radio--login-process nil)
+      (ytm-radio--set-login-status nil)
+      (if (and (not restart-running)
+               (ytm-radio--login-restart-needed-p diagnostic)
+               (yes-or-no-p
+                "Restart the login browser once to enable import? "))
+          (ytm-radio--start-login output t after-success)
+        (setq ytm-radio--login-continuation nil)
+        (message "%s" diagnostic))))))
 
 ;;;###autoload
 (defun ytm-radio-doctor ()

@@ -81,10 +81,8 @@ pub fn continuation(
         .map_err(|error| format!("cannot create HTTP client: {error}"))?;
     let bootstrap = bootstrap_with_cache(&client, auth, bootstrap_cache)?;
     let response = request_continuation(&client, auth, &bootstrap, token)?;
-    Ok(normalize_sectioned_response(
-        &BrowseTarget::Home,
-        limit,
-        &response,
+    Ok(normalize_home_continuation_response(
+        token, limit, &response,
     ))
 }
 
@@ -776,7 +774,7 @@ fn normalize_home_responses(limit: usize, responses: &[Value]) -> Value {
 }
 
 fn normalize_sectioned_response(target: &BrowseTarget, limit: usize, response: &Value) -> Value {
-    normalize_sectioned_responses(target, limit, std::slice::from_ref(response))
+    normalize_sectioned_responses_with_parent(target, limit, std::slice::from_ref(response), None)
 }
 
 fn normalize_sectioned_responses(
@@ -784,8 +782,28 @@ fn normalize_sectioned_responses(
     limit: usize,
     responses: &[Value],
 ) -> Value {
+    normalize_sectioned_responses_with_parent(target, limit, responses, None)
+}
+
+fn normalize_home_continuation_response(token: &str, limit: usize, response: &Value) -> Value {
+    let parent_id = format!("ytm:home:more:{}", short_hash(token));
+    normalize_sectioned_responses_with_parent(
+        &BrowseTarget::Home,
+        limit,
+        std::slice::from_ref(response),
+        Some(&parent_id),
+    )
+}
+
+fn normalize_sectioned_responses_with_parent(
+    target: &BrowseTarget,
+    limit: usize,
+    responses: &[Value],
+    parent_id_override: Option<&str>,
+) -> Value {
     let (parent_id, section_kind, fallback_kind, fallback_title, url) =
         sectioned_source_metadata(target);
+    let parent_id = parent_id_override.unwrap_or(parent_id);
     let mut sections = Vec::new();
     for response in responses {
         collect_browse_sections(response, &mut sections, limit);
@@ -2958,11 +2976,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalizes_home_continuation_with_distinct_source_ids() {
+        let first = json!({
+            "contents": {
+                "sectionListRenderer": {
+                    "contents": [{
+                        "musicCarouselShelfRenderer": {
+                            "header": {
+                                "musicCarouselShelfBasicHeaderRenderer": {
+                                    "title": {"runs": [{"text": "Listen again"}]}
+                                }
+                            },
+                            "contents": [{
+                                "musicTwoRowItemRenderer": {
+                                    "title": {"runs": [{"text": "Song A"}]},
+                                    "navigationEndpoint": {
+                                        "watchEndpoint": {"videoId": "a1"}
+                                    }
+                                }
+                            }]
+                        }
+                    }]
+                }
+            }
+        });
+        let continuation = json!({
+            "onResponseReceivedActions": [{
+                "appendContinuationItemsAction": {
+                    "continuationItems": [{
+                        "musicCarouselShelfRenderer": {
+                            "header": {
+                                "musicCarouselShelfBasicHeaderRenderer": {
+                                    "title": {"runs": [{"text": "Listen again"}]}
+                                }
+                            },
+                            "contents": [{
+                                "musicTwoRowItemRenderer": {
+                                    "title": {"runs": [{"text": "Song B"}]},
+                                    "navigationEndpoint": {
+                                        "watchEndpoint": {"videoId": "b1"}
+                                    }
+                                }
+                            }]
+                        }
+                    }]
+                }
+            }]
+        });
+        let first_sources = normalize_home_responses(12, &[first]);
+        let more_sources = normalize_home_continuation_response("next-page", 12, &continuation);
+        let first_id = first_sources
+            .pointer("/sources/0/id")
+            .and_then(Value::as_str)
+            .expect("first id");
+        let more_id = more_sources
+            .pointer("/sources/0/id")
+            .and_then(Value::as_str)
+            .expect("more id");
+        assert_ne!(first_id, more_id);
+        assert!(more_id.starts_with("ytm:home:more:"));
+    }
+
     fn test_auth() -> AuthConfig {
         AuthConfig {
             schema: 1,
             source: AuthSource {
-                kind: "browser".to_string(),
+                kind: "login-window".to_string(),
                 browser: Some("test".to_string()),
             },
             headers: BTreeMap::from([

@@ -11,7 +11,7 @@ use tungstenite::{connect, Message};
 
 const YTM_ORIGIN: &str = "https://music.youtube.com";
 const YTM_ORIGIN_ENCODED: &str = "https%3A%2F%2Fmusic.youtube.com";
-pub const DEFAULT_DIA_APP_PATH: &str = "/Applications/Dia.app/Contents/MacOS/Dia";
+const DEFAULT_DIA_LOGIN_BROWSER_PATH: &str = "/Applications/Dia.app/Contents/MacOS/Dia";
 const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -45,6 +45,11 @@ impl AuthConfig {
         if self.schema != 1 {
             return Err(format!("unsupported auth schema {}", self.schema));
         }
+        if self.source.kind != "login-window" {
+            return Err(
+                "unsupported auth source; run auth login-window or M-x ytm-radio-login".to_string(),
+            );
+        }
         let cookie = self
             .header("cookie")
             .ok_or_else(|| "auth file is missing the cookie header".to_string())?;
@@ -73,210 +78,247 @@ impl AuthConfig {
     }
 }
 
-pub fn import_browser(browser: &str, output: &Path, yt_dlp: &str) -> Result<AuthConfig, String> {
-    reject_unsupported_browser_import(browser)?;
-
-    let cookie_file = temporary_cookie_path();
-    let command_output = Command::new(yt_dlp)
-        .args([
-            "--ignore-config",
-            "--cookies-from-browser",
-            browser,
-            "--cookies",
-        ])
-        .arg(&cookie_file)
-        .args([
-            "--skip-download",
-            "--simulate",
-            "--no-warnings",
-            "https://music.youtube.com/",
-        ])
-        .output()
-        .map_err(|error| format!("cannot run `{yt_dlp}`: {error}"))?;
-
-    if !command_output.status.success() {
-        let _ = fs::remove_file(&cookie_file);
-        return Err(format!(
-            "yt-dlp cookie export failed: {}",
-            command_error_detail(&command_output.stderr)
-        ));
-    }
-    if !cookie_file.exists() {
-        return Err(format!(
-            "yt-dlp did not export a cookie file: {}",
-            command_error_detail(&command_output.stderr)
-        ));
-    }
-
-    let parsed = fs::read_to_string(&cookie_file)
-        .map_err(|error| format!("cannot read exported browser cookies: {error}"))
-        .and_then(|content| auth_from_netscape(browser, &content));
-    let _ = fs::remove_file(&cookie_file);
-    let config = parsed.map_err(|error| {
-        let detail = String::from_utf8_lossy(&command_output.stderr);
-        let detail = detail
-            .lines()
-            .last()
-            .unwrap_or("yt-dlp cookie export failed");
-        format!("{error}: {detail}")
-    })?;
-    write_private_json(output, &config)?;
-    Ok(config)
-}
-
-pub fn import_headers(input: &Path, output: &Path) -> Result<AuthConfig, String> {
-    let content = fs::read_to_string(input)
-        .map_err(|error| format!("cannot read headers file `{}`: {error}", input.display()))?;
-    let config = auth_from_headers(&content)?;
-    write_private_json(output, &config)?;
-    Ok(config)
-}
-
-pub fn import_dia(
+pub fn login_window(
     output: &Path,
+    browser: Option<&str>,
+    profile_dir: Option<&Path>,
     port: u16,
-    app: &Path,
-    restart: bool,
+    timeout: Duration,
+    restart_running: bool,
 ) -> Result<AuthConfig, String> {
+    let browser = resolve_login_browser(browser)?;
     let client = Client::builder()
         .timeout(Duration::from_millis(900))
         .build()
         .map_err(|error| format!("cannot create HTTP client: {error}"))?;
     let base_url = cdp_base_url(port);
     let mut launched_child = None;
-    let mut launched_debug = false;
-    let mut restore_normal_dia = false;
+    let mut close_browser_when_done = false;
     let version = match cdp_version(&client, &base_url) {
         Ok(version) => version,
         Err(_) => {
-            if restart {
-                quit_dia_for_restart()?;
-                restore_normal_dia = true;
+            if login_browser_is_running(&browser) {
+                if restart_running {
+                    restart_running_login_browser(&browser)?;
+                } else if let Some(error) =
+                    running_login_browser_conflict(&browser, port, profile_dir.is_some())
+                {
+                    return Err(error);
+                }
             }
-            launched_child = Some(spawn_dia_with_cdp(app, port)?);
-            launched_debug = true;
-            let Some(version) = wait_for_cdp_version(&client, &base_url, Duration::from_secs(6))
+            launched_child = Some(spawn_login_browser(&browser, profile_dir, port)?);
+            close_browser_when_done = profile_dir.is_some();
+            let Some(version) = wait_for_cdp_version(&client, &base_url, Duration::from_secs(8))
             else {
-                terminate_spawned_dia(&mut launched_child);
-                if restore_normal_dia {
-                    reopen_dia_normally(app);
+                if close_browser_when_done {
+                    terminate_spawned_browser(&mut launched_child);
                 }
                 return Err(format!(
-                    "cannot reach Dia remote debugging on 127.0.0.1:{port}; \
-                     if Dia is already running, quit Dia and run import again"
+                    "cannot reach login browser DevTools on 127.0.0.1:{port}; \
+                     if the browser is already running, close it and run login again, \
+                     or set ytm-radio-helper-login-profile-directory for an isolated login profile"
                 ));
             };
             version
         }
     };
     let result = (|| {
-        let target = find_or_open_music_target(&client, &base_url)?;
-        let cookies = cdp_cookies(&target.websocket_url)?;
-        let mut config = auth_from_cdp_cookies(
-            "dia-cdp",
-            Some("dia"),
-            &cookies,
-            version.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT),
-        )?;
-        if let Some(session) = wait_for_cdp_session(&target.websocket_url, Duration::from_secs(12))?
-        {
-            apply_browser_session(&mut config, session);
-        }
+        let target = open_music_login_target(&client, &base_url)?;
+        let config = wait_for_login_config(&target, &version, browser.name.as_str(), timeout)?;
         write_private_json(output, &config)?;
         Ok(config)
     })();
-    if launched_debug {
+    if close_browser_when_done {
         close_cdp_browser(version.browser_websocket_url.as_deref());
-        terminate_spawned_dia(&mut launched_child);
-    }
-    if restore_normal_dia {
-        reopen_dia_normally(app);
+        terminate_spawned_browser(&mut launched_child);
     }
     result
 }
 
-fn auth_from_netscape(browser: &str, content: &str) -> Result<AuthConfig, String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock error: {error}"))?
-        .as_secs();
-    let mut cookies = BTreeMap::new();
-    for line in content.lines() {
-        if line.is_empty() || (line.starts_with('#') && !line.starts_with("#HttpOnly_")) {
-            continue;
+fn restart_running_login_browser(browser: &LoginBrowser) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let bundle_id = macos_app_bundle_for_executable(&browser.executable)
+            .and_then(|app_path| macos_bundle_identifier(&app_path))
+            .ok_or_else(|| {
+                format!(
+                    "cannot determine app identity for `{}`; close it and run login again",
+                    browser.executable.display()
+                )
+            })?;
+        let quit_requested = macos_quit_app_id(&bundle_id)?;
+        if !quit_requested {
+            macos_terminate_browser_processes(browser)?;
         }
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 7 {
-            continue;
+        match wait_for_login_browser_exit(browser, Duration::from_secs(8)) {
+            Ok(()) => Ok(()),
+            Err(error) if quit_requested => {
+                macos_terminate_browser_processes(browser)?;
+                wait_for_login_browser_exit(browser, Duration::from_secs(4)).map_err(|_| error)
+            }
+            Err(error) => Err(error),
         }
-        let domain = fields[0].trim_start_matches("#HttpOnly_");
-        if !(domain == "youtube.com" || domain.ends_with(".youtube.com")) {
-            continue;
-        }
-        let expires = fields[4].parse::<u64>().unwrap_or(0);
-        if expires != 0 && expires <= now {
-            continue;
-        }
-        cookies.insert(fields[5].to_string(), fields[6].to_string());
     }
-
-    auth_from_cookie_map(
-        "browser",
-        Some(browser),
-        cookies,
-        DEFAULT_USER_AGENT,
-        "exported cookies do not contain an authenticated YouTube session",
-    )
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = browser;
+        Err("automatic browser restart is only implemented on macOS; close the browser and run login again"
+            .to_string())
+    }
 }
 
-fn auth_from_headers(content: &str) -> Result<AuthConfig, String> {
-    let mut headers = BTreeMap::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(':') {
-            continue;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim();
-        if name.is_empty() || value.is_empty() {
-            continue;
-        }
-        if header_name_is_supported(&name) {
-            headers.insert(name, value.to_string());
+#[cfg(target_os = "macos")]
+fn macos_quit_app_id(bundle_id: &str) -> Result<bool, String> {
+    let script = format!(
+        "tell application id \"{}\" to quit",
+        bundle_id.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let output = Command::new("osascript")
+        .args(["-e", &script])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot ask browser to quit: {error}"))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let detail = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("no diagnostic from osascript")
+        .trim()
+        .to_string();
+    if detail.contains("User canceled") || detail.contains("(-128)") {
+        return Ok(false);
+    }
+    Err(format!("cannot ask browser to quit: {detail}"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_terminate_browser_processes(browser: &LoginBrowser) -> Result<(), String> {
+    let executable = browser.executable.to_string_lossy();
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot inspect browser processes: {error}"))?;
+    if !output.status.success() {
+        return Err("cannot inspect browser processes".to_string());
+    }
+    let pids = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| macos_process_line_for_executable(line, &executable))
+        .filter(|pid| pid != &std::process::id().to_string())
+        .collect::<Vec<_>>();
+    if pids.is_empty() {
+        return Err(format!(
+            "browser `{}` did not quit and no matching process could be found",
+            browser.executable.display()
+        ));
+    }
+    for pid in pids {
+        let status = Command::new("kill")
+            .args(["-TERM", &pid])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("cannot terminate browser process {pid}: {error}"))?;
+        if !status.success() {
+            return Err(format!("cannot terminate browser process {pid}"));
         }
     }
+    Ok(())
+}
 
-    headers
-        .entry("origin".to_string())
-        .or_insert_with(|| YTM_ORIGIN.to_string());
-    headers
-        .entry("user-agent".to_string())
-        .or_insert_with(|| DEFAULT_USER_AGENT.to_string());
-    headers
-        .entry("x-goog-authuser".to_string())
-        .or_insert_with(|| "0".to_string());
+#[cfg(target_os = "macos")]
+fn macos_process_line_for_executable(line: &str, executable: &str) -> Option<String> {
+    let line = line.trim_start();
+    let (pid, command) = line.split_once(char::is_whitespace)?;
+    if pid.chars().all(|character| character.is_ascii_digit()) && command.contains(executable) {
+        Some(pid.to_string())
+    } else {
+        None
+    }
+}
 
-    let config = AuthConfig {
-        schema: 1,
-        source: AuthSource {
-            kind: "headers".to_string(),
-            browser: None,
-        },
-        headers,
-        innertube_context: None,
+#[cfg(target_os = "macos")]
+fn wait_for_login_browser_exit(browser: &LoginBrowser, timeout: Duration) -> Result<(), String> {
+    let started = SystemTime::now();
+    while login_browser_is_running(browser) {
+        if started.elapsed().unwrap_or_default() >= timeout {
+            return Err(format!(
+                "browser `{}` did not quit; close it and run login again",
+                browser.executable.display()
+            ));
+        }
+        sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+fn running_login_browser_conflict(
+    browser: &LoginBrowser,
+    port: u16,
+    isolated_profile: bool,
+) -> Option<String> {
+    if !login_browser_is_running(browser) {
+        return None;
+    }
+    if isolated_profile && browser.name != "dia" {
+        return None;
+    }
+    if browser.name == "dia" {
+        return Some(format!(
+            "Dia is already running without DevTools on 127.0.0.1:{port}; \
+             close Dia and run login again. Dia only permits one instance, \
+             so ytm-radio will not start a second Dia process."
+        ));
+    }
+    Some(format!(
+        "login browser `{}` is already running without DevTools on 127.0.0.1:{port}; \
+         close it and run login again, or set ytm-radio-helper-login-profile-directory \
+         for an isolated login profile.",
+        browser.executable.display()
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn login_browser_is_running(browser: &LoginBrowser) -> bool {
+    macos_app_bundle_for_executable(&browser.executable)
+        .and_then(|app_path| macos_bundle_identifier(&app_path))
+        .is_some_and(|bundle_id| macos_app_id_is_running(&bundle_id))
+}
+
+#[cfg(target_os = "linux")]
+fn login_browser_is_running(browser: &LoginBrowser) -> bool {
+    let Some(process_name) = browser
+        .executable
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
     };
-    config.validate()?;
-    Ok(config)
+    Command::new("pgrep")
+        .args(["-x", process_name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
-fn auth_from_cdp_cookies(
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn login_browser_is_running(_browser: &LoginBrowser) -> bool {
+    false
+}
+
+fn auth_from_cdp_cookies_with_error(
     source_kind: &str,
     browser: Option<&str>,
     cookies: &[CdpCookie],
     user_agent: &str,
+    missing_error: &str,
 ) -> Result<AuthConfig, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -292,13 +334,7 @@ fn auth_from_cdp_cookies(
         }
         cookie_map.insert(cookie.name.clone(), cookie.value.clone());
     }
-    auth_from_cookie_map(
-        source_kind,
-        browser,
-        cookie_map,
-        user_agent,
-        "Dia did not expose an authenticated YouTube Music session; log in to music.youtube.com first",
-    )
+    auth_from_cookie_map(source_kind, browser, cookie_map, user_agent, missing_error)
 }
 
 fn auth_from_cookie_map(
@@ -333,38 +369,6 @@ fn auth_from_cookie_map(
     })
 }
 
-fn header_name_is_supported(name: &str) -> bool {
-    matches!(
-        name,
-        "cookie"
-            | "origin"
-            | "referer"
-            | "user-agent"
-            | "x-goog-authuser"
-            | "x-goog-pageid"
-            | "x-origin"
-    )
-}
-
-fn reject_unsupported_browser_import(browser: &str) -> Result<(), String> {
-    let browser_name = browser
-        .split([':', '+'])
-        .next()
-        .unwrap_or(browser)
-        .trim()
-        .to_ascii_lowercase();
-    if browser_name == "dia" {
-        return Err(
-            "Dia cookie import is not supported by yt-dlp. Dia uses Chromium cookies, \
-             but its cookie encryption is not exposed through a yt-dlp supported browser \
-             profile. Use `auth import-dia --output FILE`, or import from Chrome, Firefox, \
-             Safari, Edge, Brave, Chromium, Opera, Vivaldi, or Whale."
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
 #[derive(Debug, Deserialize)]
 struct CdpVersion {
     #[serde(rename = "webSocketDebuggerUrl")]
@@ -375,9 +379,8 @@ struct CdpVersion {
 
 #[derive(Debug, Deserialize)]
 struct CdpTarget {
-    #[serde(rename = "type")]
-    target_type: String,
-    url: String,
+    #[serde(default)]
+    id: String,
     #[serde(rename = "webSocketDebuggerUrl")]
     websocket_url: String,
 }
@@ -408,6 +411,12 @@ impl BrowserSession {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoginBrowser {
+    name: String,
+    executable: PathBuf,
+}
+
 fn cdp_base_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
@@ -436,104 +445,498 @@ fn wait_for_cdp_version(client: &Client, base_url: &str, timeout: Duration) -> O
     }
 }
 
-fn spawn_dia_with_cdp(app: &Path, port: u16) -> Result<Child, String> {
-    if !app.exists() {
+fn resolve_login_browser(requested: Option<&str>) -> Result<LoginBrowser, String> {
+    if let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+        if requested.eq_ignore_ascii_case("default") {
+            return resolve_default_login_browser();
+        }
+        if requested.contains('/') || requested.contains('\\') {
+            let executable = PathBuf::from(requested);
+            if executable.exists() {
+                return Ok(LoginBrowser {
+                    name: executable
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("custom")
+                        .to_string(),
+                    executable,
+                });
+            }
+            return Err(format!(
+                "cannot find login browser executable `{requested}`"
+            ));
+        }
+        let requested_lower = requested.to_ascii_lowercase();
+        if let Some(browser) = login_browser_candidates().into_iter().find(|candidate| {
+            candidate.name == requested_lower && login_browser_is_available(candidate)
+        }) {
+            return Ok(browser);
+        }
         return Err(format!(
-            "cannot find Dia executable `{}`; set the Dia app path explicitly",
-            app.display()
+            "cannot find login browser `{requested}`; try chrome, brave, edge, chromium, dia, or an executable path"
         ));
     }
-    Command::new(app)
+
+    resolve_default_login_browser()
+}
+
+fn resolve_default_login_browser() -> Result<LoginBrowser, String> {
+    let browser = default_login_browser()?;
+    if login_browser_is_available(&browser) {
+        return Ok(browser);
+    }
+    Err(format!(
+        "default login browser `{}` is not available; set ytm-radio-helper-login-browser to chrome, brave, edge, chromium, dia, or an executable path",
+        browser.executable.display()
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn default_login_browser() -> Result<LoginBrowser, String> {
+    let app_path = command_stdout(
+        "osascript",
+        &[
+            "-e",
+            "use framework \"AppKit\"",
+            "-e",
+            "set theURL to current application's NSURL's URLWithString:\"https://music.youtube.com\"",
+            "-e",
+            "set appURL to current application's NSWorkspace's sharedWorkspace()'s URLForApplicationToOpenURL:theURL",
+            "-e",
+            "if appURL is missing value then error \"no default browser\"",
+            "-e",
+            "return appURL's path() as string",
+        ],
+    )
+    .ok_or_else(|| {
+        "cannot determine the macOS default browser; set ytm-radio-helper-login-browser"
+            .to_string()
+    })?;
+    let app_path = PathBuf::from(app_path);
+    let executable = macos_app_executable(&app_path).unwrap_or(app_path);
+    supported_default_login_browser(executable)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_executable(app_path: &Path) -> Option<PathBuf> {
+    if app_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("app")
+    {
+        return None;
+    }
+    let executable = command_stdout(
+        "plutil",
+        &[
+            "-extract",
+            "CFBundleExecutable",
+            "raw",
+            "-o",
+            "-",
+            app_path.join("Contents/Info.plist").to_str()?,
+        ],
+    )?;
+    Some(app_path.join("Contents/MacOS").join(executable))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_bundle_for_executable(executable: &Path) -> Option<PathBuf> {
+    executable
+        .ancestors()
+        .find(|ancestor| {
+            ancestor
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("app")
+        })
+        .map(Path::to_path_buf)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_bundle_identifier(app_path: &Path) -> Option<String> {
+    command_stdout(
+        "plutil",
+        &[
+            "-extract",
+            "CFBundleIdentifier",
+            "raw",
+            "-o",
+            "-",
+            app_path.join("Contents/Info.plist").to_str()?,
+        ],
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_id_is_running(bundle_id: &str) -> bool {
+    let script = format!(
+        "application id \"{}\" is running",
+        bundle_id.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    command_stdout("osascript", &["-e", &script])
+        .as_deref()
+        .is_some_and(|output| output == "true")
+}
+
+#[cfg(target_os = "linux")]
+fn default_login_browser() -> Result<LoginBrowser, String> {
+    let desktop_id = command_stdout("xdg-settings", &["get", "default-web-browser"])
+        .or_else(|| command_stdout("xdg-mime", &["query", "default", "x-scheme-handler/https"]))
+        .ok_or_else(|| {
+            "cannot determine the Linux default browser; set ytm-radio-helper-login-browser"
+                .to_string()
+        })?;
+    let desktop_path = find_desktop_entry(&desktop_id)
+        .ok_or_else(|| format!("cannot find default browser desktop entry `{desktop_id}`"))?;
+    let content = fs::read_to_string(&desktop_path).map_err(|error| {
+        format!(
+            "cannot read default browser desktop entry `{}`: {error}",
+            desktop_path.display()
+        )
+    })?;
+    let exec = desktop_entry_exec(&content).ok_or_else(|| {
+        format!(
+            "default browser desktop entry `{}` has no Exec line",
+            desktop_path.display()
+        )
+    })?;
+    let executable = desktop_exec_command(exec).ok_or_else(|| {
+        format!(
+            "cannot parse Exec line from default browser desktop entry `{}`",
+            desktop_path.display()
+        )
+    })?;
+    supported_default_login_browser(PathBuf::from(executable))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn default_login_browser() -> Result<LoginBrowser, String> {
+    Err(
+        "cannot determine the default browser on this platform; set ytm-radio-helper-login-browser"
+            .to_string(),
+    )
+}
+
+fn command_stdout(program: &str, arguments: &[&str]) -> Option<String> {
+    let output = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn supported_default_login_browser(executable: PathBuf) -> Result<LoginBrowser, String> {
+    let Some(name) = supported_login_browser_name(&executable) else {
+        return Err(format!(
+            "default browser `{}` is not supported for login; set ytm-radio-helper-login-browser to chrome, brave, edge, chromium, dia, or a Chromium-compatible executable path",
+            executable.display()
+        ));
+    };
+    Ok(login_browser_path(name, executable))
+}
+
+fn supported_login_browser_name(executable: &Path) -> Option<&'static str> {
+    let path = executable.to_string_lossy().to_ascii_lowercase();
+    let file = executable
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if path.contains("google chrome")
+        || matches!(
+            file.as_str(),
+            "google-chrome" | "google-chrome-stable" | "chrome"
+        )
+    {
+        Some("chrome")
+    } else if path.contains("brave browser") || file == "brave-browser" || file == "brave" {
+        Some("brave")
+    } else if path.contains("microsoft edge") || file == "microsoft-edge" {
+        Some("edge")
+    } else if path.contains("chromium") || matches!(file.as_str(), "chromium" | "chromium-browser")
+    {
+        Some("chromium")
+    } else if path.contains("/dia.app/") || file == "dia" {
+        Some("dia")
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn find_desktop_entry(desktop_id: &str) -> Option<PathBuf> {
+    let direct = PathBuf::from(desktop_id);
+    if direct.exists() {
+        return Some(direct);
+    }
+    desktop_application_dirs()
+        .into_iter()
+        .map(|directory| directory.join(desktop_id))
+        .find(|path| path.exists())
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_application_dirs() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(xdg_data_home) = std::env::var_os("XDG_DATA_HOME") {
+        directories.push(PathBuf::from(xdg_data_home).join("applications"));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        directories.push(PathBuf::from(home).join(".local/share/applications"));
+    }
+    let xdg_data_dirs = std::env::var_os("XDG_DATA_DIRS")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+    directories.extend(
+        xdg_data_dirs
+            .split(':')
+            .filter(|directory| !directory.is_empty())
+            .map(|directory| PathBuf::from(directory).join("applications")),
+    );
+    directories
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_entry_exec(content: &str) -> Option<&str> {
+    let mut in_desktop_entry = false;
+    for line in content.lines().map(str::trim) {
+        if line.starts_with('[') && line.ends_with(']') {
+            in_desktop_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if in_desktop_entry {
+            if let Some(exec) = line.strip_prefix("Exec=") {
+                return Some(exec.trim());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_exec_command(exec: &str) -> Option<String> {
+    let tokens = split_desktop_exec(exec);
+    let mut index = 0;
+    if tokens.get(index).is_some_and(|token| token == "env") {
+        index += 1;
+        while let Some(token) = tokens.get(index) {
+            if token.starts_with('-') {
+                index += 1;
+                continue;
+            }
+            if token.contains('=') {
+                index += 1;
+                continue;
+            }
+            break;
+        }
+    }
+    tokens
+        .get(index)
+        .filter(|token| !token.contains('%'))
+        .cloned()
+}
+
+#[cfg(target_os = "linux")]
+fn split_desktop_exec(exec: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for character in exec.chars() {
+        if escaped {
+            token.push(character);
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '"' => quoted = !quoted,
+            character if character.is_whitespace() && !quoted => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            _ => token.push(character),
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn login_browser_candidates() -> Vec<LoginBrowser> {
+    let mut candidates = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        candidates.extend([
+            login_browser(
+                "chrome",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            ),
+            login_browser(
+                "brave",
+                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            ),
+            login_browser(
+                "edge",
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            ),
+            login_browser(
+                "chromium",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            ),
+            login_browser("dia", DEFAULT_DIA_LOGIN_BROWSER_PATH),
+        ]);
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            candidates.extend([
+                login_browser_path(
+                    "chrome",
+                    home.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                ),
+                login_browser_path(
+                    "brave",
+                    home.join("Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+                ),
+                login_browser_path(
+                    "edge",
+                    home.join("Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                ),
+                login_browser_path(
+                    "chromium",
+                    home.join("Applications/Chromium.app/Contents/MacOS/Chromium"),
+                ),
+            ]);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        candidates.extend([
+            login_browser("chrome", "google-chrome"),
+            login_browser("chrome", "google-chrome-stable"),
+            login_browser("brave", "brave-browser"),
+            login_browser("edge", "microsoft-edge"),
+            login_browser("chromium", "chromium"),
+            login_browser("chromium", "chromium-browser"),
+        ]);
+    }
+    candidates
+}
+
+fn login_browser(name: &str, executable: &str) -> LoginBrowser {
+    login_browser_path(name, PathBuf::from(executable))
+}
+
+fn login_browser_path(name: &str, executable: PathBuf) -> LoginBrowser {
+    LoginBrowser {
+        name: name.to_string(),
+        executable,
+    }
+}
+
+fn login_browser_is_available(browser: &LoginBrowser) -> bool {
+    if browser.executable.components().count() > 1 || browser.executable.is_absolute() {
+        return browser.executable.exists();
+    }
+    Command::new(&browser.executable)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn spawn_login_browser(
+    browser: &LoginBrowser,
+    profile_dir: Option<&Path>,
+    port: u16,
+) -> Result<Child, String> {
+    let mut command = Command::new(&browser.executable);
+    command
         .arg(format!("--remote-debugging-port={port}"))
-        .arg("--remote-debugging-address=127.0.0.1")
-        .arg(YTM_ORIGIN)
+        .arg("--remote-debugging-address=127.0.0.1");
+    if let Some(profile_dir) = profile_dir {
+        fs::create_dir_all(profile_dir).map_err(|error| {
+            format!(
+                "cannot create login browser profile `{}`: {error}",
+                profile_dir.display()
+            )
+        })?;
+        command.arg(format!("--user-data-dir={}", profile_dir.display()));
+    }
+    command
+        .arg("--no-first-run")
+        .arg("--new-window")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| format!("cannot start Dia with remote debugging: {error}"))
+        .map_err(|error| {
+            format!(
+                "cannot start login browser `{}`: {error}",
+                browser.executable.display()
+            )
+        })
 }
 
-#[cfg(target_os = "macos")]
-fn quit_dia_for_restart() -> Result<(), String> {
-    let output = Command::new("osascript")
-        .args([
-            "-e",
-            "tell application id \"company.thebrowser.dia\" to quit",
-        ])
-        .output()
-        .map_err(|error| format!("cannot ask Dia to quit: {error}"))?;
-    if !output.status.success() {
-        let detail = command_error_detail(&output.stderr);
-        if wait_for_dia_exit(Duration::from_secs(3)) {
-            return Ok(());
-        }
-        if detail.contains("User canceled") || detail.contains("(-128)") {
-            return Err(
-                "Dia quit was canceled; approve the Dia restart prompt or close Dia manually"
-                    .to_string(),
-            );
-        }
-        return Err(format!("cannot ask Dia to quit: {detail}"));
-    }
-    if wait_for_dia_exit(Duration::from_secs(8)) {
-        return Ok(());
-    }
-    Err("Dia did not quit; close Dia and run import again".to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn wait_for_dia_exit(timeout: Duration) -> bool {
+fn wait_for_login_config(
+    target: &CdpTarget,
+    version: &CdpVersion,
+    browser_name: &str,
+    timeout: Duration,
+) -> Result<AuthConfig, String> {
     let started = SystemTime::now();
-    while dia_is_running() {
-        if started.elapsed().unwrap_or_default() > timeout {
-            return false;
+    let mut last_error = None;
+    loop {
+        if started.elapsed().unwrap_or_default() >= timeout {
+            return Err(last_error.unwrap_or_else(|| {
+                "login window did not expose an authenticated YouTube Music session before timeout"
+                    .to_string()
+            }));
         }
-        sleep(Duration::from_millis(200));
-    }
-    true
-}
-
-#[cfg(not(target_os = "macos"))]
-fn quit_dia_for_restart() -> Result<(), String> {
-    Err("automatic Dia restart is only implemented on macOS".to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn dia_is_running() -> bool {
-    Command::new("osascript")
-        .args(["-e", "application id \"company.thebrowser.dia\" is running"])
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .is_some_and(|output| output.trim() == "true")
-}
-
-#[cfg(target_os = "macos")]
-fn reopen_dia_normally(app: &Path) {
-    let opened = Command::new("open")
-        .args(["-b", "company.thebrowser.dia"])
-        .spawn()
-        .is_ok();
-    if !opened {
-        let _ = Command::new(app).spawn();
+        match login_config_once(target, version, browser_name) {
+            Ok(config) => return Ok(config),
+            Err(error) => last_error = Some(error),
+        }
+        sleep(Duration::from_secs(1));
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn reopen_dia_normally(_app: &Path) {}
-
-fn find_or_open_music_target(client: &Client, base_url: &str) -> Result<CdpTarget, String> {
-    if let Some(target) = list_cdp_targets(client, base_url)?
-        .into_iter()
-        .find(|target| target.target_type == "page" && target.url.starts_with(YTM_ORIGIN))
-    {
-        return Ok(target);
+fn login_config_once(
+    target: &CdpTarget,
+    version: &CdpVersion,
+    browser_name: &str,
+) -> Result<AuthConfig, String> {
+    let cookies = cdp_cookies(&target.websocket_url)?;
+    let mut config = auth_from_cdp_cookies_with_error(
+        "login-window",
+        Some(browser_name),
+        &cookies,
+        version.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT),
+        "login window is not authenticated yet; finish signing in to music.youtube.com",
+    )?;
+    if let Ok(session) = cdp_session(&target.websocket_url) {
+        if session.has_identity() {
+            apply_browser_session(&mut config, session);
+        }
     }
+    Ok(config)
+}
+
+fn open_music_login_target(client: &Client, base_url: &str) -> Result<CdpTarget, String> {
     let target: CdpTarget = client
         .put(format!("{base_url}/json/new?{YTM_ORIGIN_ENCODED}"))
         .send()
-        .map_err(|error| format!("cannot open YouTube Music in Dia: {error}"))?
+        .map_err(|error| format!("cannot open YouTube Music in DevTools browser: {error}"))?
         .error_for_status()
         .map_err(|error| format!("DevTools rejected new tab request: {error}"))?
         .json()
@@ -541,18 +944,18 @@ fn find_or_open_music_target(client: &Client, base_url: &str) -> Result<CdpTarge
     if target.websocket_url.is_empty() {
         return Err("DevTools target did not include a websocket URL".to_string());
     }
+    activate_cdp_target(client, base_url, &target);
     Ok(target)
 }
 
-fn list_cdp_targets(client: &Client, base_url: &str) -> Result<Vec<CdpTarget>, String> {
-    client
-        .get(format!("{base_url}/json/list"))
+fn activate_cdp_target(client: &Client, base_url: &str, target: &CdpTarget) {
+    if target.id.is_empty() {
+        return;
+    }
+    let _ = client
+        .get(format!("{base_url}/json/activate/{}", target.id))
         .send()
-        .map_err(|error| format!("cannot list Dia DevTools targets: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("DevTools rejected target list request: {error}"))?
-        .json()
-        .map_err(|error| format!("invalid DevTools target list: {error}"))
+        .and_then(|response| response.error_for_status());
 }
 
 fn cdp_cookies(websocket_url: &str) -> Result<Vec<CdpCookie>, String> {
@@ -563,28 +966,6 @@ fn cdp_cookies(websocket_url: &str) -> Result<Vec<CdpCookie>, String> {
         .ok_or_else(|| "DevTools cookie response did not include cookies".to_string())?;
     serde_json::from_value(cookies)
         .map_err(|error| format!("invalid DevTools cookie response: {error}"))
-}
-
-fn wait_for_cdp_session(
-    websocket_url: &str,
-    timeout: Duration,
-) -> Result<Option<BrowserSession>, String> {
-    let started = SystemTime::now();
-    let mut last_error = None;
-    loop {
-        match cdp_session(websocket_url) {
-            Ok(session) if session.has_identity() => return Ok(Some(session)),
-            Ok(_) => {}
-            Err(error) => last_error = Some(error),
-        }
-        if started.elapsed().unwrap_or_default() >= timeout {
-            if let Some(error) = last_error {
-                return Err(error);
-            }
-            return Ok(None);
-        }
-        sleep(Duration::from_millis(250));
-    }
 }
 
 fn cdp_session(websocket_url: &str) -> Result<BrowserSession, String> {
@@ -768,7 +1149,7 @@ fn close_cdp_browser(websocket_url: Option<&str>) {
     }
 }
 
-fn terminate_spawned_dia(child: &mut Option<Child>) {
+fn terminate_spawned_browser(child: &mut Option<Child>) {
     if let Some(child) = child.as_mut() {
         if matches!(child.try_wait(), Ok(None)) {
             let _ = child.kill();
@@ -779,28 +1160,6 @@ fn terminate_spawned_dia(child: &mut Option<Child>) {
 fn is_youtube_domain(domain: &str) -> bool {
     let domain = domain.trim_start_matches('.');
     domain == "youtube.com" || domain.ends_with(".youtube.com")
-}
-
-fn command_error_detail(stderr: &[u8]) -> String {
-    let detail = String::from_utf8_lossy(stderr);
-    detail
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("no diagnostic from yt-dlp")
-        .trim()
-        .to_string()
-}
-
-fn temporary_cookie_path() -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    std::env::temp_dir().join(format!(
-        "ytm-radio-cookies-{}-{stamp}.txt",
-        std::process::id()
-    ))
 }
 
 fn write_private_json(path: &Path, config: &AuthConfig) -> Result<(), String> {
@@ -847,53 +1206,7 @@ mod tests {
     static TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn parses_authenticated_netscape_cookie_file() {
-        let input = concat!(
-            "# Netscape HTTP Cookie File\n",
-            ".youtube.com\tTRUE\t/\tTRUE\t4102444800\t__Secure-3PAPISID\tsecret\n",
-            ".youtube.com\tTRUE\t/\tTRUE\t4102444800\tSID\tsid-value\n",
-            ".example.com\tTRUE\t/\tTRUE\t4102444800\tignored\tvalue\n"
-        );
-        let config = auth_from_netscape("chrome:Default", input).unwrap();
-        assert_eq!(config.cookie("__Secure-3PAPISID"), Some("secret"));
-        assert!(!config.header("cookie").unwrap().contains("ignored"));
-    }
-
-    #[test]
-    fn rejects_cookie_file_without_youtube_login() {
-        let error = auth_from_netscape("chrome", "# Netscape HTTP Cookie File\n").unwrap_err();
-        assert!(error.contains("authenticated YouTube session"));
-    }
-
-    #[test]
-    fn parses_browser_request_headers() {
-        let input = concat!(
-            ":method: POST\n",
-            "User-Agent: Browser UA\n",
-            "Cookie: SID=sid-value; __Secure-3PAPISID=secret\n",
-            "X-Goog-AuthUser: 1\n",
-            "X-Goog-PageId: brand-page-id\n",
-            "X-Origin: https://music.youtube.com\n",
-            "Accept-Language: en-US\n"
-        );
-        let config = auth_from_headers(input).unwrap();
-        assert_eq!(config.source.kind, "headers");
-        assert_eq!(config.cookie("__Secure-3PAPISID"), Some("secret"));
-        assert_eq!(config.header("user-agent"), Some("Browser UA"));
-        assert_eq!(config.header("x-goog-authuser"), Some("1"));
-        assert_eq!(config.header("x-goog-pageid"), Some("brand-page-id"));
-        assert_eq!(config.header("x-origin"), Some("https://music.youtube.com"));
-        assert!(config.header("accept-language").is_none());
-    }
-
-    #[test]
-    fn rejects_headers_without_authenticated_cookie() {
-        let error = auth_from_headers("User-Agent: Browser UA\n").unwrap_err();
-        assert!(error.contains("missing the cookie header"));
-    }
-
-    #[test]
-    fn builds_auth_from_cdp_cookies() {
+    fn builds_login_auth_from_cdp_cookies() {
         let cookies = vec![
             CdpCookie {
                 name: "__Secure-3PAPISID".to_string(),
@@ -914,13 +1227,70 @@ mod tests {
                 expires: 0.0,
             },
         ];
-        let config = auth_from_cdp_cookies("dia-cdp", Some("dia"), &cookies, "Dia UA").unwrap();
-        assert_eq!(config.source.kind, "dia-cdp");
-        assert_eq!(config.source.browser, Some("dia".to_string()));
+        let config = auth_from_cdp_cookies_with_error(
+            "login-window",
+            Some("chrome"),
+            &cookies,
+            "Browser UA",
+            "missing login",
+        )
+        .unwrap();
+        assert_eq!(config.source.kind, "login-window");
+        assert_eq!(config.source.browser, Some("chrome".to_string()));
         assert_eq!(config.cookie("__Secure-3PAPISID"), Some("secret"));
-        assert_eq!(config.header("user-agent"), Some("Dia UA"));
+        assert_eq!(config.header("user-agent"), Some("Browser UA"));
         assert!(!config.header("cookie").unwrap().contains("ignored"));
         assert!(!config.header("cookie").unwrap().contains("expired"));
+    }
+
+    #[test]
+    fn rejects_cdp_cookies_without_login() {
+        let cookies = vec![CdpCookie {
+            name: "SID".to_string(),
+            value: "sid".to_string(),
+            domain: ".youtube.com".to_string(),
+            expires: 0.0,
+        }];
+        let error = auth_from_cdp_cookies_with_error(
+            "login-window",
+            Some("chrome"),
+            &cookies,
+            "Browser UA",
+            "missing login",
+        )
+        .unwrap_err();
+        assert_eq!(error, "missing login");
+    }
+
+    #[test]
+    fn parses_cdp_target_id_for_activation() {
+        let target: CdpTarget = serde_json::from_value(json!({
+            "id": "target-1",
+            "type": "page",
+            "url": YTM_ORIGIN,
+            "webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/target-1"
+        }))
+        .unwrap();
+        assert_eq!(target.id, "target-1");
+        assert_eq!(
+            target.websocket_url,
+            "ws://127.0.0.1/devtools/page/target-1"
+        );
+    }
+
+    #[test]
+    fn rejects_old_auth_source_kinds() {
+        let config: AuthConfig = serde_json::from_value(json!({
+            "schema": 1,
+            "source": {"kind": "browser", "browser": "chrome"},
+            "headers": {
+                "cookie": "__Secure-3PAPISID=secret",
+                "origin": YTM_ORIGIN
+            }
+        }))
+        .unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("ytm-radio-login"));
     }
 
     #[test]
@@ -931,7 +1301,14 @@ mod tests {
             domain: ".youtube.com".to_string(),
             expires: 0.0,
         }];
-        let mut config = auth_from_cdp_cookies("dia-cdp", Some("dia"), &cookies, "Dia UA").unwrap();
+        let mut config = auth_from_cdp_cookies_with_error(
+            "login-window",
+            Some("chrome"),
+            &cookies,
+            "Browser UA",
+            "missing login",
+        )
+        .unwrap();
         apply_browser_session(
             &mut config,
             BrowserSession {
@@ -957,77 +1334,111 @@ mod tests {
     }
 
     #[test]
-    fn loads_legacy_auth_without_context() {
-        let config: AuthConfig = serde_json::from_value(json!({
-            "schema": 1,
-            "source": {"kind": "browser", "browser": "test"},
-            "headers": {
-                "cookie": "__Secure-3PAPISID=secret",
-                "origin": YTM_ORIGIN
-            }
-        }))
-        .unwrap();
-        config.validate().unwrap();
-        assert!(config.innertube_context.is_none());
+    fn resolves_login_browser_from_explicit_path() {
+        let directory = temporary_test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let browser = directory.join("Test Browser");
+        fs::write(&browser, "").unwrap();
+
+        let resolved = resolve_login_browser(Some(browser.to_str().unwrap())).unwrap();
+
+        assert_eq!(resolved.name, "Test Browser");
+        assert_eq!(resolved.executable, browser);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn rejects_dia_browser_cookie_import_with_actionable_error() {
-        let directory = temporary_test_directory();
-        fs::create_dir_all(&directory).unwrap();
-        let auth_file = directory.join("auth.json");
-        let error = import_browser("dia", &auth_file, "yt-dlp").unwrap_err();
-        assert!(error.contains("Dia cookie import is not supported"));
-        assert!(error.contains("auth import-dia"));
-        fs::remove_dir_all(directory).unwrap();
+    fn recognizes_supported_default_browser_paths() {
+        assert_eq!(
+            supported_login_browser_name(Path::new("/Applications/Dia.app/Contents/MacOS/Dia")),
+            Some("dia")
+        );
+        assert_eq!(
+            supported_login_browser_name(Path::new(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            )),
+            Some("chrome")
+        );
+        assert_eq!(
+            supported_login_browser_name(Path::new("/usr/bin/brave-browser")),
+            Some("brave")
+        );
+        assert_eq!(
+            supported_login_browser_name(Path::new("/usr/bin/firefox")),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parses_macos_browser_process_lines() {
+        assert_eq!(
+            macos_process_line_for_executable(
+                " 1234 /Applications/Dia.app/Contents/MacOS/Dia --flag",
+                "/Applications/Dia.app/Contents/MacOS/Dia"
+            ),
+            Some("1234".to_string())
+        );
+        assert_eq!(
+            macos_process_line_for_executable(
+                " 1234 /Applications/Other.app/Contents/MacOS/Other",
+                "/Applications/Dia.app/Contents/MacOS/Dia"
+            ),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_linux_desktop_exec_command() {
+        assert_eq!(
+            desktop_exec_command(r#""/opt/google/chrome/google-chrome" %U"#),
+            Some("/opt/google/chrome/google-chrome".to_string())
+        );
+        assert_eq!(
+            desktop_exec_command("env FOO=bar brave-browser %U"),
+            Some("brave-browser".to_string())
+        );
+        assert_eq!(desktop_exec_command("%U"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_desktop_entry_exec_from_primary_section() {
+        let content = concat!(
+            "[Desktop Entry]\n",
+            "Name=Browser\n",
+            "Exec=chromium-browser %U\n",
+            "\n",
+            "[Desktop Action NewWindow]\n",
+            "Exec=ignored\n"
+        );
+        assert_eq!(desktop_entry_exec(content), Some("chromium-browser %U"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn imports_header_file_through_public_boundary() {
+    fn writes_private_login_auth_file() {
         use std::os::unix::fs::MetadataExt;
 
         let directory = temporary_test_directory();
         fs::create_dir_all(&directory).unwrap();
-        let headers_file = directory.join("headers.txt");
         let auth_file = directory.join("auth.json");
-        fs::write(
-            &headers_file,
-            "Cookie: SAPISID=secret\nUser-Agent: Browser UA\n",
-        )
-        .unwrap();
+        let config = AuthConfig {
+            schema: 1,
+            source: AuthSource {
+                kind: "login-window".to_string(),
+                browser: Some("chrome".to_string()),
+            },
+            headers: BTreeMap::from([
+                ("cookie".to_string(), "__Secure-3PAPISID=secret".to_string()),
+                ("origin".to_string(), YTM_ORIGIN.to_string()),
+            ]),
+            innertube_context: None,
+        };
 
-        let config = import_headers(&headers_file, &auth_file).unwrap();
-        assert_eq!(config.cookie("SAPISID"), Some("secret"));
-        assert_eq!(fs::metadata(&auth_file).unwrap().mode() & 0o777, 0o600);
-        assert!(AuthConfig::load(&auth_file).is_ok());
-        fs::remove_dir_all(directory).unwrap();
-    }
+        write_private_json(&auth_file, &config).unwrap();
 
-    #[cfg(unix)]
-    #[test]
-    fn imports_browser_cookies_through_yt_dlp_boundary() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        let directory = temporary_test_directory();
-        fs::create_dir_all(&directory).unwrap();
-        let fake_yt_dlp = directory.join("yt-dlp");
-        let auth_file = directory.join("auth.json");
-        fs::write(
-            &fake_yt_dlp,
-            concat!(
-                "#!/bin/sh\n",
-                "while [ \"$1\" != \"--cookies\" ]; do shift; done\n",
-                "shift\n",
-                "printf '# Netscape HTTP Cookie File\\n.youtube.com\\tTRUE\\t/\\tTRUE\\t4102444800\\t__Secure-3PAPISID\\tsecret\\n' > \"$1\"\n",
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&fake_yt_dlp, fs::Permissions::from_mode(0o700)).unwrap();
-
-        let config =
-            import_browser("chrome:Default", &auth_file, fake_yt_dlp.to_str().unwrap()).unwrap();
-        assert_eq!(config.cookie("__Secure-3PAPISID"), Some("secret"));
         assert_eq!(fs::metadata(&auth_file).unwrap().mode() & 0o777, 0o600);
         assert!(AuthConfig::load(&auth_file).is_ok());
         fs::remove_dir_all(directory).unwrap();

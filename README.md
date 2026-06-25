@@ -22,10 +22,8 @@ Implemented:
 - show the current cover, playback progress, and controls in a child-frame
   now-playing view;
 - invoke an external Rust account helper;
-- import Dia login cookies and YouTube Music page context through the browser's
-  DevTools protocol;
-- import browser cookies through `yt-dlp` into a private helper auth file;
-- import copied browser request headers into a private helper auth file;
+- import YouTube Music auth through a browser login window and the
+  browser's DevTools protocol;
 - make authenticated YouTube Music home, library, liked, and search requests;
 - normalize live music renderers into playable tracks;
 - preserve non-track YouTube Music items such as albums, artists, playlists,
@@ -70,8 +68,8 @@ Load the Emacs package:
 ```
 
 Opening `M-x ytm-radio` does not prompt for a URL when the catalog is empty.
-Use `A` once for login, then `H`, `E`, `L`, `/`, or `a` to browse account
-pages, search, or add a URL.
+When account access is needed, ytm-radio opens the login flow automatically.
+Use `H`, `E`, `L`, `/`, or `a` to browse account pages, search, or add a URL.
 
 The main `*ytm-radio*` buffer is the YouTube Music browser. It renders Home,
 Explore, Library, Search, and URL-backed pages as vertical Emacs sections with
@@ -111,7 +109,6 @@ directory, and the auth file are visible from Emacs.
 - `M-x ytm-radio-home` switches to Home.
 - `M-x ytm-radio-explore` switches to Explore.
 - `M-x ytm-radio-library` switches to Library.
-- `M-x ytm-radio-auth-import` imports a logged-in browser session.
 - `M-x ytm-radio-add-url` adds a YouTube or YouTube Music URL.
 - `M-x ytm-radio-import-ytmusic-library` imports library sources.
 - `M-x ytm-radio-import-ytmusic-home` imports home recommendations.
@@ -141,7 +138,6 @@ Inside the browser buffer:
 
 | Key | Action |
 | --- | --- |
-| `A` | Import browser login |
 | `a` | Add URL |
 | `c` | Show cover child frame |
 | `H` | Switch to Home |
@@ -185,9 +181,7 @@ The CLI surface is:
 
 ```text
 ytm-radio-helper auth check --auth FILE
-ytm-radio-helper auth import-dia --output FILE [--port N] [--app PATH] [--restart]
-ytm-radio-helper auth import-browser --browser BROWSER --output FILE [--yt-dlp PROGRAM]
-ytm-radio-helper auth import-headers --input FILE --output FILE
+ytm-radio-helper auth login-window --output FILE [--browser BROWSER] [--profile-dir DIR] [--port N] [--timeout-secs N] [--restart-running]
 ytm-radio-helper browse home --auth FILE [--limit N] [--initial-only]
 ytm-radio-helper browse home --mock [--limit N] [--initial-only]
 ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N]
@@ -227,29 +221,34 @@ Responses use a stable envelope:
 
 ## Login
 
-Log in to `music.youtube.com` in Dia, Chrome, Firefox, Safari, Edge, Brave, or
-another supported browser, then run:
+There is no separate login command in normal use. When `M-x ytm-radio` opens an
+uncached account-backed view, or when Home, Explore, Library, Search, or a
+detail page needs account access, ytm-radio opens the browser login flow
+automatically. After login succeeds, ytm-radio resumes the action that required
+account access.
 
-```elisp
-M-x ytm-radio-auth-import
-```
+If the helper reports that an existing auth file is rejected, for example with
+HTTP 401 Unauthorized or HTTP 403 Forbidden, ytm-radio clears account-derived
+cache, opens the same login flow, and retries the original action after login.
 
-Choose the browser in the `Login source` prompt. Common choices include
-`chrome`, `firefox`, `safari`, `edge`, `brave`, `chrome:Default`, and `dia`.
+ytm-radio opens the login browser at `https://music.youtube.com` with the
+browser's normal profile by default. Sign in there if needed. The helper waits
+for the logged-in YouTube Music page to expose cookies and page context, then
+writes the auth JSON.
 
-For yt-dlp supported browsers, the command:
+The login browser must be started with a local DevTools endpoint. If the
+browser is already running without that endpoint, ytm-radio asks before
+restarting it once. This avoids launching a second Dia instance while still
+letting the existing normal browser profile be reused after restart.
 
-1. asks `yt-dlp` to read the selected browser's cookie store;
-2. keeps only YouTube cookies;
-3. verifies that an authenticated SAPISID cookie exists;
+The login flow:
+
+1. opens the login browser with a local DevTools endpoint;
+2. waits for sign-in to finish;
+3. reads YouTube Music cookies and `ytcfg` page context through DevTools;
 4. writes a private JSON file with mode `0600` on Unix;
-5. configures `ytm-radio-helper-auth-file`.
-
-For Dia, the same command dispatches internally to the Dia DevTools path. The
-helper reads the YouTube Music page's `ytcfg` session context in addition to
-cookies, so Home, Library, and brand-account requests use the same account
-identity as the web page. If Dia is already running without the DevTools
-endpoint, Emacs asks whether it may restart Dia once and then retries.
+5. clears the helper bootstrap cache;
+6. refreshes Home asynchronously.
 
 The default output is:
 
@@ -265,50 +264,38 @@ is missing, invalid, or older than 12 hours. If default
 `~/.emacs.d/ytm-radio/auth.json` or `state.eld` files already exist from an
 older checkout, ytm-radio copies them into the new directory on first startup.
 
-Browser or macOS Keychain permission prompts may appear during import. Close
-the browser first if its cookie database is locked.
+By default, ytm-radio opens the system default browser when that browser
+supports the Chromium DevTools login flow. On macOS this uses the default
+application for `https://` URLs. On Linux this uses the default
+`x-scheme-handler/https` desktop entry.
 
-Set a preferred browser when needed:
-
-```elisp
-(setq ytm-radio-helper-browser "firefox")
-```
-
-Dia's default executable is:
-
-```text
-/Applications/Dia.app/Contents/MacOS/Dia
-```
-
-Customize it when needed:
+Set a preferred login browser when the default browser is unsupported or when
+you want a specific browser. Use `chrome`, `brave`, `edge`, `chromium`, `dia`,
+or an executable path:
 
 ```elisp
-(setq ytm-radio-helper-dia-app
-      "/Applications/Dia.app/Contents/MacOS/Dia")
+(setq ytm-radio-helper-login-browser "chrome")
+```
+
+By default, login uses the browser's normal profile. If you want an isolated
+login profile instead, set:
+
+```elisp
+(setq ytm-radio-helper-login-profile-directory
+      "~/.ytm-radio/login-profile/")
 ```
 
 The default local DevTools port is `29317`:
 
 ```elisp
-(setq ytm-radio-helper-dia-cdp-port 29317)
+(setq ytm-radio-helper-login-cdp-port 29317)
 ```
 
-## Header Fallback
+The default login timeout is 180 seconds:
 
-`M-x ytm-radio-auth-import-headers` remains available as a debugging fallback
-if browser import fails:
-
-1. Open `https://music.youtube.com` in Dia while logged in.
-2. Open DevTools, then the Network tab.
-3. Reload the page or click a library/home item.
-4. Select a `browse` request to `music.youtube.com/youtubei/v1/browse`.
-5. Copy the request headers into a local text file. The file must include the
-   `cookie` header; `user-agent`, `x-goog-authuser`, `x-goog-pageid`,
-   `x-origin`, and `referer` are also used when present.
-6. Run `M-x ytm-radio-auth-import-headers` and pick that file.
-
-The request header file contains account session material. Delete it after
-importing, and keep the generated auth JSON out of git.
+```elisp
+(setq ytm-radio-helper-login-timeout 180)
+```
 
 For deterministic local testing without account access:
 
@@ -316,15 +303,15 @@ For deterministic local testing without account access:
 (setq ytm-radio-helper-use-mock-data t)
 ```
 
-Then run one of the account import commands. Mock mode does not require an auth
-file.
+Then open Home, Explore, Library, Search, or a detail page. Mock mode does not
+require an auth file.
 
 The default file is reused automatically in future Emacs sessions. For a
 custom location:
 
 ```elisp
 (setq ytm-radio-helper-auth-file
-      "~/.ytm-radio/browser-headers.json")
+      "~/.ytm-radio/custom-auth.json")
 ```
 
 The auth file may contain account session material. Keep it out of git and
@@ -336,11 +323,14 @@ remains machine-readable JSON.
 
 ## Protocol References
 
-- [yt-dlp browser cookie extraction](https://github.com/yt-dlp/yt-dlp#filesystem-options)
+- [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/)
 - [ytmusicapi browser authentication](https://github.com/sigma67/ytmusicapi/blob/master/ytmusicapi/auth/browser.py)
 - [ytmusicapi browsing requests](https://github.com/sigma67/ytmusicapi/blob/master/ytmusicapi/mixins/browsing.py)
 
 ## URL Cookies
+
+These options are for `yt-dlp` media discovery and mpv playback only. They are
+not used for ytm-radio account login.
 
 Configure discovery-time `yt-dlp` options:
 
@@ -356,18 +346,40 @@ Configure mpv's ytdl hook:
       '("cookies-from-browser=chrome"))
 ```
 
+ytm-radio asks mpv's ytdl hook for audio-only formats by default. This reduces
+startup work for YouTube Music playback:
+
+```elisp
+(setq ytm-radio-mpv-ytdl-format "bestaudio/best")
+```
+
+Set it to nil to use mpv's default ytdl format selection:
+
+```elisp
+(setq ytm-radio-mpv-ytdl-format nil)
+```
+
 ytm-radio enables a conservative mpv network cache by default for long YouTube
-Music tracks:
+Music tracks while avoiding an initial cache pause:
 
 ```elisp
 (setq ytm-radio-mpv-network-cache-args
       '("--cache=yes"
+        "--cache-pause=no"
         "--demuxer-readahead-secs=60"
         "--demuxer-max-bytes=256MiB"))
 ```
 
+When playback starts, ytm-radio also pre-resolves the next track's direct audio
+stream URL in the background.  This keeps browsing responsive while allowing the
+next track to start faster when the cached stream URL is still valid:
+
+```elisp
+(setq ytm-radio-stream-prefetch-limit 1)
+```
+
 Set `ytm-radio-mpv-extra-args` to override these values when needed. Extra args
-are passed after the default cache args, so mpv's later option wins.
+are passed after the default playback args, so mpv's later option wins.
 
 ## Development
 

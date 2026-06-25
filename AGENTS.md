@@ -98,13 +98,15 @@ repository. It is adapted from `~/repos/coding-guidelines/general.md` and
   a Python helper or an Emacs dynamic module.
 - Keep the helper short-lived by default: one command reads configuration,
   writes one JSON response to stdout, and exits.
-- Delegate browser-cookie database compatibility and decryption to `yt-dlp`;
-  do not duplicate browser-specific crypto in Rust.
+- The supported account-auth workflow is a browser login window
+  driven through DevTools by `auth login-window`. Do not add browser-cookie
+  database import, copied-header import, Dia-specific restart commands, or
+  other fallback auth paths unless the product decision changes.
+- Do not duplicate browser-specific cookie database crypto in Rust.
 - Version the helper JSON envelope. Emacs must reject unsupported schema
   versions instead of guessing.
-- Cookie support must be explicit user configuration. Store browser/source
-  options in Emacs configuration or state; store session material only in the
-  dedicated helper auth file with private permissions.
+- Store login browser options in Emacs configuration; store session material
+  only in the dedicated helper auth file with private permissions.
 - Never write cookie contents or auth headers to Emacs durable state, stdout,
   logs, fixtures, or test failure messages.
 - Store durable state separately from process state. Do not persist process
