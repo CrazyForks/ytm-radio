@@ -258,9 +258,11 @@ The default output is:
 
 Runtime data defaults to `~/.ytm-radio/`: `auth.json` stores the helper session,
 `bootstrap-cache.json` stores non-secret YouTube Music client bootstrap data,
+`response-cache/` stores short-lived helper API responses scoped by account,
 `state.eld` stores imported sources and the last track, and `covers/` caches
 cover images. The helper refreshes `bootstrap-cache.json` automatically when it
-is missing, invalid, or older than 12 hours. If default
+is missing, invalid, or older than 12 hours. Helper API responses use short TTLs
+and are cleared after login refresh. If default
 `~/.emacs.d/ytm-radio/auth.json` or `state.eld` files already exist from an
 older checkout, ytm-radio copies them into the new directory on first startup.
 

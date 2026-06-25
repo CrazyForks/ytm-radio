@@ -17,6 +17,11 @@ const YTM_ORIGIN: &str = "https://music.youtube.com";
 const HOME_CONTINUATION_PAGE_LIMIT: usize = 8;
 const BOOTSTRAP_CACHE_SCHEMA_VERSION: u32 = 1;
 const BOOTSTRAP_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
+const RESPONSE_CACHE_SCHEMA_VERSION: u32 = 1;
+const RESPONSE_CACHE_TTL_SECS: u64 = 5 * 60;
+const RESPONSE_CACHE_SEARCH_TTL_SECS: u64 = 2 * 60;
+const RESPONSE_CACHE_DETAIL_TTL_SECS: u64 = 30 * 60;
+const RESPONSE_CACHE_MAX_ENTRIES: usize = 80;
 const TIMINGS_ENV: &str = "YTM_RADIO_TIMINGS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,15 +56,34 @@ pub fn browse(
         .build()
         .map_err(|error| format!("cannot create HTTP client: {error}"))?;
     let bootstrap = bootstrap_with_cache(&client, auth, bootstrap_cache)?;
+    let response_cache_dir = bootstrap_cache.map(response_cache_dir);
     if matches!(target, BrowseTarget::Library) {
-        return browse_library(&client, auth, &bootstrap, limit);
+        return browse_library(
+            &client,
+            auth,
+            &bootstrap,
+            limit,
+            response_cache_dir.as_deref(),
+        );
     }
-    let response = request_browse(&client, auth, &bootstrap, target)?;
+    let response = request_browse(
+        &client,
+        auth,
+        &bootstrap,
+        target,
+        response_cache_dir.as_deref(),
+    )?;
     if matches!(target, BrowseTarget::Home) {
         if initial_only {
             Ok(normalize_sectioned_response(target, limit, &response))
         } else {
-            let responses = request_home_continuations(&client, auth, &bootstrap, response)?;
+            let responses = request_home_continuations(
+                &client,
+                auth,
+                &bootstrap,
+                response,
+                response_cache_dir.as_deref(),
+            )?;
             Ok(normalize_sectioned_responses(target, limit, &responses))
         }
     } else if matches!(target, BrowseTarget::Explore) {
@@ -80,7 +104,13 @@ pub fn continuation(
         .build()
         .map_err(|error| format!("cannot create HTTP client: {error}"))?;
     let bootstrap = bootstrap_with_cache(&client, auth, bootstrap_cache)?;
-    let response = request_continuation(&client, auth, &bootstrap, token)?;
+    let response = request_continuation(
+        &client,
+        auth,
+        &bootstrap,
+        token,
+        bootstrap_cache.map(response_cache_dir).as_deref(),
+    )?;
     Ok(normalize_home_continuation_response(
         token, limit, &response,
     ))
@@ -98,7 +128,14 @@ pub fn browse_id(
         .build()
         .map_err(|error| format!("cannot create HTTP client: {error}"))?;
     let bootstrap = bootstrap_with_cache(&client, auth, bootstrap_cache)?;
-    let response = request_browse_id(&client, auth, &bootstrap, browse_id, params)?;
+    let response = request_browse_id(
+        &client,
+        auth,
+        &bootstrap,
+        browse_id,
+        params,
+        bootstrap_cache.map(response_cache_dir).as_deref(),
+    )?;
     Ok(normalize_browse_id_response(browse_id, limit, &response))
 }
 
@@ -113,7 +150,13 @@ pub fn search(
         .build()
         .map_err(|error| format!("cannot create HTTP client: {error}"))?;
     let bootstrap = bootstrap_with_cache(&client, auth, bootstrap_cache)?;
-    let response = request_search(&client, auth, &bootstrap, query)?;
+    let response = request_search(
+        &client,
+        auth,
+        &bootstrap,
+        query,
+        bootstrap_cache.map(response_cache_dir).as_deref(),
+    )?;
     Ok(normalize_search_response(query, limit, &response))
 }
 
@@ -133,6 +176,14 @@ struct BootstrapCache {
     client_version: String,
     visitor_data: Option<String>,
     context: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ResponseCache {
+    schema: u32,
+    fetched_at: u64,
+    ttl_secs: u64,
+    value: Value,
 }
 
 impl From<BootstrapCache> for Bootstrap {
@@ -206,6 +257,96 @@ fn save_bootstrap_cache(path: &Path, bootstrap: &Bootstrap) -> Result<(), String
     write_private_bytes(path, &content)
 }
 
+fn response_cache_dir(bootstrap_cache_path: &Path) -> PathBuf {
+    bootstrap_cache_path.with_file_name("response-cache")
+}
+
+fn response_cache_key(
+    auth: &AuthConfig,
+    bootstrap: &Bootstrap,
+    path: &str,
+    body: &Value,
+) -> Result<String, String> {
+    let mut hasher = Sha1::new();
+    hasher.update(path.as_bytes());
+    hasher.update([0]);
+    hasher.update(bootstrap.client_version.as_bytes());
+    hasher.update([0]);
+    if let Some(cookie) = auth.header("cookie") {
+        hasher.update(cookie.as_bytes());
+    }
+    hasher.update([0]);
+    if let Some(auth_user) = auth.header("x-goog-authuser") {
+        hasher.update(auth_user.as_bytes());
+    }
+    hasher.update([0]);
+    if let Some(page_id) = auth.header("x-goog-pageid") {
+        hasher.update(page_id.as_bytes());
+    }
+    hasher.update([0]);
+    let body_bytes =
+        serde_json::to_vec(body).map_err(|error| format!("cannot encode cache key: {error}"))?;
+    hasher.update(body_bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn response_cache_file(cache_dir: &Path, key: &str) -> PathBuf {
+    cache_dir.join(format!("{key}.json"))
+}
+
+fn load_response_cache(path: &Path) -> Option<Value> {
+    let content = fs::read_to_string(path).ok()?;
+    let cache: ResponseCache = serde_json::from_str(&content).ok()?;
+    if cache.schema != RESPONSE_CACHE_SCHEMA_VERSION {
+        return None;
+    }
+    let now = current_timestamp().ok()?;
+    if cache.fetched_at > now || now.saturating_sub(cache.fetched_at) > cache.ttl_secs {
+        return None;
+    }
+    Some(cache.value)
+}
+
+fn save_response_cache(path: &Path, value: &Value, ttl_secs: u64) -> Result<(), String> {
+    let cache = ResponseCache {
+        schema: RESPONSE_CACHE_SCHEMA_VERSION,
+        fetched_at: current_timestamp()?,
+        ttl_secs,
+        value: value.clone(),
+    };
+    let content = serde_json::to_vec(&cache)
+        .map_err(|error| format!("cannot encode response cache: {error}"))?;
+    write_private_bytes(path, &content)
+}
+
+fn prune_response_cache(cache_dir: &Path) {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    let mut files = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH);
+            Some((path, modified))
+        })
+        .collect::<Vec<_>>();
+    if files.len() <= RESPONSE_CACHE_MAX_ENTRIES {
+        return;
+    }
+    files.sort_by_key(|(_, modified)| *modified);
+    let remove_count = files.len() - RESPONSE_CACHE_MAX_ENTRIES;
+    for (path, _) in files.into_iter().take(remove_count) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 fn write_private_bytes(path: &Path, content: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -265,6 +406,7 @@ fn request_browse(
     auth: &AuthConfig,
     bootstrap: &Bootstrap,
     target: &BrowseTarget,
+    cache_dir: Option<&Path>,
 ) -> Result<Value, String> {
     let (browse_id, params) = match target {
         BrowseTarget::Home => ("FEmusic_home", None),
@@ -276,7 +418,15 @@ fn request_browse(
         BrowseTarget::LibraryPlaylists => ("FEmusic_liked_playlists", None),
         BrowseTarget::Liked => ("VLLM", None),
     };
-    request_browse_id(client, auth, bootstrap, browse_id, params)
+    request_browse_id_with_ttl(
+        client,
+        auth,
+        bootstrap,
+        browse_id,
+        params,
+        cache_dir,
+        RESPONSE_CACHE_TTL_SECS,
+    )
 }
 
 fn request_browse_id(
@@ -285,9 +435,30 @@ fn request_browse_id(
     bootstrap: &Bootstrap,
     browse_id: &str,
     params: Option<&str>,
+    cache_dir: Option<&Path>,
+) -> Result<Value, String> {
+    request_browse_id_with_ttl(
+        client,
+        auth,
+        bootstrap,
+        browse_id,
+        params,
+        cache_dir,
+        RESPONSE_CACHE_DETAIL_TTL_SECS,
+    )
+}
+
+fn request_browse_id_with_ttl(
+    client: &Client,
+    auth: &AuthConfig,
+    bootstrap: &Bootstrap,
+    browse_id: &str,
+    params: Option<&str>,
+    cache_dir: Option<&Path>,
+    ttl_secs: u64,
 ) -> Result<Value, String> {
     let body = browse_id_request_body(auth, bootstrap, browse_id, params);
-    request_youtubei(client, auth, bootstrap, &body)
+    request_youtubei(client, auth, bootstrap, &body, cache_dir, ttl_secs)
 }
 
 fn browse_id_request_body(
@@ -395,6 +566,7 @@ fn browse_library(
     auth: &AuthConfig,
     bootstrap: &Bootstrap,
     limit: usize,
+    cache_dir: Option<&Path>,
 ) -> Result<Value, String> {
     let normalized_sections = thread::scope(|scope| {
         let handles = LIBRARY_TARGETS
@@ -402,7 +574,7 @@ fn browse_library(
             .map(|target| {
                 let client = client.clone();
                 scope.spawn(move || {
-                    let response = request_browse(&client, auth, bootstrap, &target)?;
+                    let response = request_browse(&client, auth, bootstrap, &target, cache_dir)?;
                     Ok::<Value, String>(normalize_single_source_response(&target, limit, &response))
                 })
             })
@@ -433,12 +605,21 @@ fn request_search(
     auth: &AuthConfig,
     bootstrap: &Bootstrap,
     query: &str,
+    cache_dir: Option<&Path>,
 ) -> Result<Value, String> {
     let body = json!({
         "context": youtubei_context(auth, bootstrap),
         "query": query
     });
-    request_youtubei_path(client, auth, bootstrap, "search", &body)
+    request_youtubei_path(
+        client,
+        auth,
+        bootstrap,
+        "search",
+        &body,
+        cache_dir,
+        RESPONSE_CACHE_SEARCH_TTL_SECS,
+    )
 }
 
 fn request_continuation(
@@ -446,12 +627,20 @@ fn request_continuation(
     auth: &AuthConfig,
     bootstrap: &Bootstrap,
     continuation: &str,
+    cache_dir: Option<&Path>,
 ) -> Result<Value, String> {
     let body = json!({
         "context": youtubei_context(auth, bootstrap),
         "continuation": continuation
     });
-    request_youtubei(client, auth, bootstrap, &body)
+    request_youtubei(
+        client,
+        auth,
+        bootstrap,
+        &body,
+        cache_dir,
+        RESPONSE_CACHE_TTL_SECS,
+    )
 }
 
 fn request_youtubei(
@@ -459,8 +648,10 @@ fn request_youtubei(
     auth: &AuthConfig,
     bootstrap: &Bootstrap,
     body: &Value,
+    cache_dir: Option<&Path>,
+    ttl_secs: u64,
 ) -> Result<Value, String> {
-    request_youtubei_path(client, auth, bootstrap, "browse", body)
+    request_youtubei_path(client, auth, bootstrap, "browse", body, cache_dir, ttl_secs)
 }
 
 fn request_youtubei_path(
@@ -469,7 +660,24 @@ fn request_youtubei_path(
     bootstrap: &Bootstrap,
     path: &str,
     body: &Value,
+    cache_dir: Option<&Path>,
+    ttl_secs: u64,
 ) -> Result<Value, String> {
+    let cache_file = cache_dir
+        .map(|cache_dir| {
+            response_cache_key(auth, bootstrap, path, body)
+                .map(|key| response_cache_file(cache_dir, &key))
+        })
+        .transpose()?;
+    if let Some(cache_file) = &cache_file {
+        let started = Instant::now();
+        if let Some(value) = load_response_cache(cache_file) {
+            log_diagnostic(&format!("response-cache=hit path={path}"));
+            log_timing(&format!("response-cache-read-{path}"), started);
+            return Ok(value);
+        }
+        log_diagnostic(&format!("response-cache=miss path={path}"));
+    }
     let mut headers = base_headers(auth)?;
     insert_header(
         &mut headers,
@@ -512,8 +720,16 @@ fn request_youtubei_path(
             .unwrap_or_else(|| "request rejected".to_string());
         return Err(format!("YouTube Music returned HTTP {status}: {message}"));
     }
-    serde_json::from_str(&response_body)
-        .map_err(|error| format!("invalid YouTube Music response: {error}"))
+    let value = serde_json::from_str(&response_body)
+        .map_err(|error| format!("invalid YouTube Music response: {error}"))?;
+    if let Some(cache_file) = &cache_file {
+        if let Err(error) = save_response_cache(cache_file, &value, ttl_secs) {
+            log_diagnostic(&format!("response-cache-write-error={error}"));
+        } else if let Some(cache_dir) = cache_file.parent() {
+            prune_response_cache(cache_dir);
+        }
+    }
+    Ok(value)
 }
 
 fn request_home_continuations(
@@ -521,6 +737,7 @@ fn request_home_continuations(
     auth: &AuthConfig,
     bootstrap: &Bootstrap,
     first_response: Value,
+    cache_dir: Option<&Path>,
 ) -> Result<Vec<Value>, String> {
     let mut responses = vec![first_response];
     let mut seen_tokens = HashSet::new();
@@ -531,7 +748,9 @@ fn request_home_continuations(
         if !seen_tokens.insert(token.clone()) {
             break;
         }
-        responses.push(request_continuation(client, auth, bootstrap, &token)?);
+        responses.push(request_continuation(
+            client, auth, bootstrap, &token, cache_dir,
+        )?);
     }
     Ok(responses)
 }
@@ -2113,6 +2332,62 @@ mod tests {
 
         assert!(load_bootstrap_cache(&cache_file).is_none());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn response_cache_round_trips_recent_entries() {
+        let directory = temporary_test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let cache_file = directory.join("response.json");
+        let value = json!({"contents": [{"title": "cached"}]});
+
+        save_response_cache(&cache_file, &value, 60).unwrap();
+        let loaded = load_response_cache(&cache_file).expect("response cache");
+
+        assert_eq!(loaded, value);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn response_cache_ignores_stale_entries() {
+        let directory = temporary_test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let cache_file = directory.join("response.json");
+        let cache = ResponseCache {
+            schema: RESPONSE_CACHE_SCHEMA_VERSION,
+            fetched_at: 1,
+            ttl_secs: 60,
+            value: json!({"contents": []}),
+        };
+        fs::write(&cache_file, serde_json::to_vec(&cache).unwrap()).unwrap();
+
+        assert!(load_response_cache(&cache_file).is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn response_cache_key_is_scoped_to_auth_identity() {
+        let bootstrap = Bootstrap {
+            api_key: "key".to_string(),
+            client_version: "client-version".to_string(),
+            visitor_data: None,
+            context: None,
+        };
+        let body = json!({
+            "context": youtubei_context(&test_auth(), &bootstrap),
+            "browseId": "FEmusic_home"
+        });
+        let first = response_cache_key(&test_auth(), &bootstrap, "browse", &body).unwrap();
+        let second_auth = AuthConfig {
+            headers: BTreeMap::from([
+                ("cookie".to_string(), "__Secure-3PAPISID=other".to_string()),
+                ("origin".to_string(), YTM_ORIGIN.to_string()),
+            ]),
+            ..test_auth()
+        };
+        let second = response_cache_key(&second_auth, &bootstrap, "browse", &body).unwrap();
+
+        assert_ne!(first, second);
     }
 
     #[test]

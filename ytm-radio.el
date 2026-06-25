@@ -1030,10 +1030,15 @@ that does not expose DevTools."
      (file-name-directory (expand-file-name ytm-radio-helper-auth-file)))))
 
 (defun ytm-radio--clear-helper-bootstrap-cache ()
-  "Delete the helper bootstrap cache file when it exists."
-  (when-let* ((file (ytm-radio--helper-bootstrap-cache-file))
-              ((file-exists-p file)))
-    (delete-file file)))
+  "Delete helper account cache files when they exist."
+  (when-let* ((file (ytm-radio--helper-bootstrap-cache-file)))
+    (when (file-exists-p file)
+      (delete-file file))
+    (let ((response-cache
+           (expand-file-name "response-cache"
+                             (file-name-directory file))))
+      (when (file-directory-p response-cache)
+        (delete-directory response-cache t)))))
 
 (defun ytm-radio--call-helper (arguments)
   "Run the external helper with ARGUMENTS and return parsed JSON."

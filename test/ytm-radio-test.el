@@ -1653,17 +1653,22 @@
         (delete-file auth-file)))))
 
 (ert-deftest ytm-radio-clear-helper-bootstrap-cache ()
-  "Delete the helper bootstrap cache beside the configured auth file."
+  "Delete helper caches beside the configured auth file."
   (let* ((directory (make-temp-file "ytm-radio-auth-" t))
          (ytm-radio-helper-auth-file
           (expand-file-name "auth.json" directory))
-         (cache-file (expand-file-name "bootstrap-cache.json" directory)))
+         (cache-file (expand-file-name "bootstrap-cache.json" directory))
+         (response-cache (expand-file-name "response-cache" directory)))
     (unwind-protect
         (progn
           (with-temp-file cache-file
             (insert "{}"))
+          (make-directory response-cache)
+          (with-temp-file (expand-file-name "entry.json" response-cache)
+            (insert "{}"))
           (ytm-radio--clear-helper-bootstrap-cache)
-          (should-not (file-exists-p cache-file)))
+          (should-not (file-exists-p cache-file))
+          (should-not (file-exists-p response-cache)))
       (delete-directory directory t))))
 
 (ert-deftest ytm-radio-helper-envelope-validates-schema ()
