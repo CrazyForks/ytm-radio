@@ -339,6 +339,9 @@ cropped or shifting the following text."
 (defconst ytm-radio--detail-header-cover-slice-overlap 1
   "Pixels of overlap between adjacent detail header cover slices.")
 
+(defconst ytm-radio--detail-header-row-height-padding-ratio 0.25
+  "Extra detail header row height ratio for fallback font line boxes.")
+
 ;;; State
 
 (cl-defun ytm-radio--make-track
@@ -1316,14 +1319,6 @@ SOURCE-ID and SOURCE-KIND identify the imported helper source."
   (dolist (target '("home" "explore" "library" "liked" "search" "browse"))
     (ytm-radio--drop-helper-target-sources target)))
 
-(defun ytm-radio--import-sources (sources)
-  "Import SOURCES into state and return the number imported."
-  (dolist (source sources)
-    (ytm-radio--put-source source))
-  (ytm-radio--save)
-  (ytm-radio--render)
-  (length sources))
-
 (defun ytm-radio--helper-track-count (sources)
   "Return total track count across SOURCES."
   (seq-reduce
@@ -1543,12 +1538,16 @@ When ID is non-nil, use it as the header source id."
         (cons header sources)
       sources))))
 
-(defun ytm-radio--start-browse-id-load (browse-id params &optional context)
+(defun ytm-radio--start-browse-id-load
+    (browse-id params &optional context history-entry)
   "Start asynchronous detail loading for BROWSE-ID and PARAMS.
-CONTEXT is optional browser metadata from the item that opened the detail."
+CONTEXT is optional browser metadata from the item that opened the detail.
+HISTORY-ENTRY is the browser location to return to from detail."
   (ytm-radio--ensure-loaded)
   (ytm-radio--ensure-browser-load-idle)
-  (let ((origin-view (ytm-radio--current-root-view)))
+  (let ((origin-view (ytm-radio--current-root-view))
+        (history-entry (or history-entry
+                           (ytm-radio--browser-history-snapshot))))
     (ytm-radio--with-account-auth
      (lambda ()
        (ytm-radio--set-browser-loading "Loading detail..." nil)
@@ -1582,15 +1581,19 @@ CONTEXT is optional browser metadata from the item that opened the detail."
                      (when context
                        (list (cons :context context)))
                      (when origin-view
-                       (list (cons :origin-view origin-view)))))
-                 (ytm-radio--enter-source (car detail-sources) origin-view)))))
+                       (list (cons :origin-view origin-view))))
+                    nil
+                    history-entry)
+                 (ytm-radio--enter-source
+                  (car detail-sources) origin-view history-entry)))))
          (lambda (diagnostic)
            (ytm-radio--clear-browser-loading)
            (ytm-radio--render-browser)
            (ytm-radio--handle-account-helper-error
             diagnostic
             (lambda ()
-              (ytm-radio--start-browse-id-load browse-id params context)))))))
+              (ytm-radio--start-browse-id-load
+               browse-id params context history-entry)))))))
      "YouTube Music login required")))
 
 ;;; Playback
@@ -2720,10 +2723,81 @@ The bar is measured between LEFT-LABEL and RIGHT-LABEL."
     (or (and (memq origin '(home explore library)) origin)
         (and (memq kind '(home explore library)) kind))))
 
-(defun ytm-radio--set-browser-view (view &optional replace)
-  "Set browser VIEW and remember history unless REPLACE is non-nil."
+(defun ytm-radio--browser-history-item-key (item)
+  "Return a stable history key for ITEM, or nil."
+  (when item
+    (list (cons :id (ytm-radio--item-id item))
+          (cons :url (ytm-radio--item-url item))
+          (cons :title (ytm-radio--item-title item))
+          (cons :type (ytm-radio--item-type item)))))
+
+(defun ytm-radio--browser-history-snapshot (&optional source item)
+  "Return a snapshot of the current browser view.
+When SOURCE or ITEM are non-nil, use them as the semantic return target."
+  (let* ((buffer (get-buffer ytm-radio--library-buffer-name))
+         (window (and buffer (get-buffer-window buffer t)))
+         point
+         window-start)
+    (when buffer
+      (with-current-buffer buffer
+        (setq point (if (window-live-p window)
+                        (window-point window)
+                      (point)))
+        (setq window-start (and (window-live-p window)
+                                (window-start window)))
+        (unless source
+          (setq source (ytm-radio--line-source-at-point)))
+        (unless item
+          (setq item (ytm-radio--line-item-at-point)))))
+    (append
+     (list (cons :view ytm-radio--browser-view))
+     (when point
+       (list (cons :point point)))
+     (when window-start
+       (list (cons :window-start window-start)))
+     (when-let* ((source-id (map-elt source :id)))
+       (list (cons :source-id source-id)))
+     (when-let* ((item-key (ytm-radio--browser-history-item-key item)))
+       (list (cons :item-key item-key))))))
+
+(defun ytm-radio--browser-history-entry-view (entry)
+  "Return browser view stored in history ENTRY."
+  (if (and (listp entry) (assq :view entry))
+      (map-elt entry :view)
+    entry))
+
+(defun ytm-radio--browser-history-entry-point (entry)
+  "Return browser point stored in history ENTRY, or nil."
+  (and (listp entry)
+       (assq :view entry)
+       (map-elt entry :point)))
+
+(defun ytm-radio--browser-history-entry-window-start (entry)
+  "Return browser window start stored in history ENTRY, or nil."
+  (and (listp entry)
+       (assq :view entry)
+       (map-elt entry :window-start)))
+
+(defun ytm-radio--browser-history-entry-source-id (entry)
+  "Return source id stored in history ENTRY, or nil."
+  (and (listp entry)
+       (assq :view entry)
+       (map-elt entry :source-id)))
+
+(defun ytm-radio--browser-history-entry-item-key (entry)
+  "Return item key stored in history ENTRY, or nil."
+  (and (listp entry)
+       (assq :view entry)
+       (map-elt entry :item-key)))
+
+(defun ytm-radio--set-browser-view
+    (view &optional replace history-entry)
+  "Set browser VIEW and remember history unless REPLACE is non-nil.
+When HISTORY-ENTRY is non-nil, store it as the return entry."
   (unless replace
-    (push ytm-radio--browser-view ytm-radio--browser-history))
+    (push (or history-entry
+              (ytm-radio--browser-history-snapshot))
+          ytm-radio--browser-history))
   (setq ytm-radio--browser-view view)
   (ytm-radio--render-browser t))
 
@@ -2903,9 +2977,10 @@ The bar is measured between LEFT-LABEL and RIGHT-LABEL."
               ((ytm-radio--source-has-hidden-items-p source)))
     source))
 
-(defun ytm-radio--enter-source (source &optional origin-view)
+(defun ytm-radio--enter-source (source &optional origin-view history-entry)
   "Show SOURCE as a focused section.
-ORIGIN-VIEW is the top-level browser view that opened SOURCE."
+ORIGIN-VIEW is the top-level browser view that opened SOURCE.
+HISTORY-ENTRY is the browser location to return to from the section."
   (let ((origin-view (or origin-view (ytm-radio--current-root-view))))
     (ytm-radio--set-browser-view
      (append
@@ -2913,7 +2988,9 @@ ORIGIN-VIEW is the top-level browser view that opened SOURCE."
             (cons :source-id (map-elt source :id))
             (cons :title (ytm-radio--source-display-title source)))
       (when origin-view
-        (list (cons :origin-view origin-view)))))))
+        (list (cons :origin-view origin-view))))
+     nil
+     history-entry)))
 
 (defun ytm-radio--playlist-browse-id (playlist-id)
   "Return the YouTube Music browse id for PLAYLIST-ID."
@@ -2993,11 +3070,13 @@ ORIGIN-VIEW is the top-level browser view that opened SOURCE."
   "Fetch URL as a source asynchronously and show it."
   (ytm-radio--start-url-import url #'ytm-radio--enter-source))
 
-(defun ytm-radio--open-browse-id-as-source (browse-id &optional params context)
+(defun ytm-radio--open-browse-id-as-source
+    (browse-id &optional params context history-entry)
   "Fetch YouTube Music BROWSE-ID as a source and show it.
 PARAMS is the optional YouTube Music browse endpoint params string.
-CONTEXT is optional metadata from the item that opened the detail."
-  (ytm-radio--start-browse-id-load browse-id params context))
+CONTEXT is optional metadata from the item that opened the detail.
+HISTORY-ENTRY is the browser location to return to from detail."
+  (ytm-radio--start-browse-id-load browse-id params context history-entry))
 
 (defun ytm-radio--open-item (source item)
   "Open ITEM from SOURCE using the browser's default action."
@@ -3009,7 +3088,11 @@ CONTEXT is optional metadata from the item that opened the detail."
       (ytm-radio--set-playback-queue (map-elt source :tracks) track)
       (ytm-radio--play-track track))
      (browse
-      (ytm-radio--open-browse-id-as-source (car browse) (cdr browse) item))
+      (ytm-radio--open-browse-id-as-source
+       (car browse)
+       (cdr browse)
+       item
+       (ytm-radio--browser-history-snapshot source item)))
      (url
       (ytm-radio--open-url-as-source url))
      (t
@@ -3071,15 +3154,53 @@ CONTEXT is optional metadata from the item that opened the detail."
       (ytm-radio--first-property-position 'ytm-radio-section)
       (point-min)))
 
-(defun ytm-radio--restore-browser-point (old-point reset)
+(defun ytm-radio--browser-history-position (entry)
+  "Return rendered buffer position for history ENTRY, or nil."
+  (let ((source-id (ytm-radio--browser-history-entry-source-id entry))
+        (item-key (ytm-radio--browser-history-entry-item-key entry))
+        position)
+    (when (or source-id item-key)
+      (save-excursion
+        (goto-char (point-min))
+        (while (and (not position) (< (point) (point-max)))
+          (let* ((source (get-text-property (point) 'ytm-radio-source))
+                 (item (get-text-property (point) 'ytm-radio-item))
+                 (current-source-id (map-elt source :id))
+                 (current-item-key
+                  (and item (ytm-radio--browser-history-item-key item))))
+            (when (and (or (null source-id)
+                           (equal current-source-id source-id))
+                       (or (null item-key)
+                           (equal current-item-key item-key)))
+              (setq position (point))))
+          (forward-char 1))))
+    position))
+
+(defun ytm-radio--restore-browser-point (old-point reset &optional history-entry)
   "Restore browser point after render.
 OLD-POINT is the buffer position before render.  When RESET is non-nil,
-move to the preferred content start."
-  (if reset
-      (goto-char (ytm-radio--browser-start-position))
-    (goto-char (min (max old-point (point-min)) (point-max)))
-    (when (eobp)
-      (goto-char (ytm-radio--browser-start-position)))))
+move to the preferred content start.
+When HISTORY-ENTRY is non-nil, restore its stored browser position."
+  (if history-entry
+      (let ((position (or (ytm-radio--browser-history-position history-entry)
+                          (ytm-radio--browser-history-entry-point history-entry)
+                          (ytm-radio--browser-start-position)))
+            (window-start
+             (ytm-radio--browser-history-entry-window-start history-entry)))
+        (goto-char (min (max position (point-min)) (point-max)))
+        (when-let* ((window (get-buffer-window (current-buffer) t))
+                    ((window-live-p window)))
+          (set-window-point window (point))
+          (when (integerp window-start)
+            (set-window-start
+             window
+             (min (max window-start (point-min)) (point-max))
+             t))))
+    (if reset
+        (goto-char (ytm-radio--browser-start-position))
+      (goto-char (min (max old-point (point-min)) (point-max)))
+      (when (eobp)
+        (goto-char (ytm-radio--browser-start-position))))))
 
 (defun ytm-radio--move-item-line (direction)
   "Move point to the next item line in DIRECTION."
@@ -3356,28 +3477,43 @@ When FACE is non-nil, use it as the button face."
 
 (defun ytm-radio--detail-header-row-height ()
   "Return one detail header row height in pixels."
-  (frame-char-height (selected-frame)))
+  (let* ((window (get-buffer-window (current-buffer) t))
+         (frame (if (window-live-p window)
+                    (window-frame window)
+                  (selected-frame)))
+         (char-height (frame-char-height frame))
+         (padding (ceiling
+                   (* char-height
+                      ytm-radio--detail-header-row-height-padding-ratio))))
+    (+ char-height padding)))
 
-(defun ytm-radio--detail-header-row-count ()
-  "Return the number of text rows reserved for detail headers."
+(defun ytm-radio--detail-header-row-count (&optional row-height)
+  "Return the number of text rows reserved for detail headers.
+When ROW-HEIGHT is non-nil, use it as the row height in pixels."
   (max 6
        (ceiling (/ (float ytm-radio-browser-header-height)
-                   (max 1 (ytm-radio--detail-header-row-height))))))
+                   (max 1 (or row-height
+                              (ytm-radio--detail-header-row-height)))))))
 
-(defun ytm-radio--detail-header-cover-size ()
-  "Return detail header cover edge size in pixels."
-  (* (ytm-radio--detail-header-row-count)
-     (ytm-radio--detail-header-row-height)))
+(defun ytm-radio--detail-header-cover-size (&optional row-height row-count)
+  "Return detail header cover edge size in pixels.
+When ROW-HEIGHT and ROW-COUNT are non-nil, use them for the size."
+  (let* ((row-height (or row-height (ytm-radio--detail-header-row-height)))
+         (row-count (or row-count
+                        (ytm-radio--detail-header-row-count row-height))))
+    (* row-count row-height)))
 
-(defun ytm-radio--svg-detail-header-cover-image (file)
-  "Return a fixed-canvas detail header cover image for FILE."
+(defun ytm-radio--svg-detail-header-cover-image
+    (file &optional row-height row-count)
+  "Return a fixed-canvas detail header cover image for FILE.
+When ROW-HEIGHT and ROW-COUNT are non-nil, size the canvas from them."
   (when (and (featurep 'svg)
              (image-type-available-p 'svg)
              (fboundp 'svg-create)
              (file-readable-p file))
     (when-let* ((mime-type (ytm-radio--image-mime-type file))
                 (dimensions (ytm-radio--image-file-dimensions file)))
-      (let* ((size (ytm-radio--detail-header-cover-size))
+      (let* ((size (ytm-radio--detail-header-cover-size row-height row-count))
              (svg (svg-create size size))
              (fit (ytm-radio--fit-rect (ceiling (car dimensions))
                                        (ceiling (cdr dimensions))
@@ -3568,14 +3704,16 @@ When FACE is non-nil, use it as the button face."
                (_ "item")))
     (title . ,(ytm-radio--source-display-title source))))
 
-(defun ytm-radio--svg-detail-header-placeholder-image (source)
-  "Return a fixed-canvas square detail placeholder image for SOURCE."
+(defun ytm-radio--svg-detail-header-placeholder-image
+    (source &optional row-height row-count)
+  "Return a fixed-canvas square detail placeholder image for SOURCE.
+When ROW-HEIGHT and ROW-COUNT are non-nil, size the canvas from them."
   (when (and (display-graphic-p)
              (featurep 'svg)
              (image-type-available-p 'svg)
              (fboundp 'svg-create))
     (let* ((item (ytm-radio--source-placeholder-item source))
-           (size (ytm-radio--detail-header-cover-size))
+           (size (ytm-radio--detail-header-cover-size row-height row-count))
            (font-size (max 18 (floor (* size 0.18))))
            (svg (svg-create size size)))
       (svg-rectangle svg 0 0 size size
@@ -3934,23 +4072,27 @@ When COMPACT is non-nil, render only the title row."
 
 (defun ytm-radio--source-header-cover-image (source)
   "Return a sliced detail header cover image descriptor for SOURCE."
-  (let ((cover
-         (when-let* ((url (and (display-graphic-p)
-                               (ytm-radio--source-thumbnail-url source)))
-                     (file (ytm-radio--ensure-cover-file
-                            url
-                            (lambda (_url _file)
-                              (ytm-radio--render-browser)))))
-           (ytm-radio--svg-detail-header-cover-image file))))
+  (let* ((row-height (ytm-radio--detail-header-row-height))
+         (row-count (ytm-radio--detail-header-row-count row-height))
+         (cover
+          (when-let* ((url (and (display-graphic-p)
+                                (ytm-radio--source-thumbnail-url source)))
+                      (file (ytm-radio--ensure-cover-file
+                             url
+                             (lambda (_url _file)
+                               (ytm-radio--render-browser)))))
+            (ytm-radio--svg-detail-header-cover-image
+             file row-height row-count))))
     (when (and (not cover)
                (display-graphic-p)
                (ytm-radio--source-square-header-p source))
-      (setq cover (ytm-radio--svg-detail-header-placeholder-image source)))
+      (setq cover (ytm-radio--svg-detail-header-placeholder-image
+                   source row-height row-count)))
     (when cover
       (list cover
-            (ytm-radio--detail-header-cover-size)
-            (ytm-radio--detail-header-row-height)
-            (ytm-radio--detail-header-row-count)))))
+            (ytm-radio--detail-header-cover-size row-height row-count)
+            row-height
+            row-count))))
 
 (defun ytm-radio--source-header-banner-image (source)
   "Return a wide detail banner image for SOURCE."
@@ -4088,6 +4230,13 @@ When SHUFFLE is non-nil, start from a random track."
                     (cons row-height row-height))
                 t)))
 
+(defun ytm-radio--detail-header-apply-row-height (line cover)
+  "Return LINE with the same row height as COVER, when available."
+  (if cover
+      (let ((row-height (nth 2 cover)))
+        (propertize line 'line-height (cons row-height row-height)))
+    line))
+
 (defun ytm-radio--insert-detail-header-cover-cell (cover row)
   "Insert COVER cell for ROW."
   (when cover
@@ -4184,7 +4333,8 @@ When OMIT-LEADING-SPACE is non-nil, do not insert the leading blank line."
               (ytm-radio--insert-detail-header-actions)
             (when-let* ((line (ytm-radio--detail-header-line
                                row title subtitle summary)))
-              (insert line)))
+              (insert (ytm-radio--detail-header-apply-row-height
+                       line cover))))
           (insert (ytm-radio--detail-header-row-newline cover)))
         (unless inline-actions-p
           (when (ytm-radio--detail-view-tracks)
@@ -4245,9 +4395,10 @@ When OMIT-LEADING-SPACE is non-nil, do not insert the leading blank line."
                                (list 'ytm-radio-source source)))
         (insert "\n")))))
 
-(defun ytm-radio--render-browser (&optional reset-point)
+(defun ytm-radio--render-browser (&optional reset-point history-entry)
   "Render the current package state into the browser buffer.
-When RESET-POINT is non-nil, move point to the first browser content item."
+When RESET-POINT is non-nil, move point to the first browser content item.
+When HISTORY-ENTRY is non-nil, restore its stored browser position."
   (when-let* ((buffer (get-buffer ytm-radio--library-buffer-name)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t)
@@ -4286,7 +4437,7 @@ When RESET-POINT is non-nil, move point to the first browser content item."
                      do (ytm-radio--insert-source-section
                         source
                         (and first omit-first-leading-space))))))
-        (ytm-radio--restore-browser-point old-point reset-point)
+        (ytm-radio--restore-browser-point old-point reset-point history-entry)
         (ytm-radio--maybe-lazy-load-home)))))
 
 (defun ytm-radio--cover-cache-path (url)
@@ -4907,7 +5058,10 @@ When FOCUS is non-nil, focus the now-playing child frame."
   "Return to the previous ytm-radio browser view."
   (interactive)
   (if-let* ((previous (pop ytm-radio--browser-history)))
-      (ytm-radio--set-browser-view previous t)
+      (progn
+        (setq ytm-radio--browser-view
+              (ytm-radio--browser-history-entry-view previous))
+        (ytm-radio--render-browser nil previous))
     (user-error "No previous ytm-radio view")))
 
 ;;;###autoload

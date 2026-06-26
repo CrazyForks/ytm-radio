@@ -969,6 +969,37 @@
         (should (equal (seq-filter #'identity (nreverse line-heights))
                        '((10 . 10) (10 . 10) (10 . 10))))))))
 
+(ert-deftest ytm-radio-detail-header-row-height-adds-cjk-padding ()
+  "Apply padded detail header row height to cover and text rows."
+  (let* ((row-height (ytm-radio--detail-header-row-height))
+         (source (ytm-radio--make-source
+                  :id "ytm:browse:VLPL1:header"
+                  :kind 'youtube-music-playlist
+                  :title "新加坡百佳音乐视频"
+                  :subtitle "排行榜 - YouTube Music"))
+         cover-called)
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'ytm-radio--source-header-cover-image)
+                 (lambda (_source)
+                   (setq cover-called t)
+                   (list 'cover-image (* row-height 3) row-height 3)))
+                ((symbol-function 'ytm-radio--detail-view-tracks)
+                 (lambda () nil)))
+        (ytm-radio--insert-source-header source t))
+      (should cover-called)
+      (goto-char (point-min))
+      (should (search-forward "新加坡百佳音乐视频" nil t))
+      (should (equal (get-text-property (match-beginning 0) 'line-height)
+                     (cons row-height row-height)))
+      (let (line-heights)
+        (goto-char (point-min))
+        (while (search-forward "\n" nil t)
+          (push (get-text-property (1- (point)) 'line-height)
+                line-heights))
+        (should (equal (seq-filter #'identity (nreverse line-heights))
+                       (make-list 3
+                                  (cons row-height row-height))))))))
+
 (ert-deftest ytm-radio-detail-header-actions-align-with-last-cover-slice ()
   "Place detail header actions on the last cover row."
   (let* ((track (ytm-radio--make-track
@@ -1029,7 +1060,8 @@
     (cl-letf (((symbol-function 'display-graphic-p)
                (lambda (&optional _display) t))
               ((symbol-function 'ytm-radio--svg-detail-header-placeholder-image)
-               (lambda (_source) 'placeholder-cover)))
+               (lambda (_source &optional _row-height _row-count)
+                 'placeholder-cover)))
       (let ((cover (ytm-radio--source-header-cover-image source)))
         (should (equal (car cover) 'placeholder-cover))
         (should (= (nth 1 cover) (ytm-radio--detail-header-cover-size)))))))
@@ -1700,7 +1732,7 @@
         (browser-rendered nil)
         (now-playing-rendered nil))
     (cl-letf (((symbol-function 'ytm-radio--render-browser)
-               (lambda (&optional _reset-point)
+               (lambda (&optional _reset-point _history-entry)
                  (setq browser-rendered t)))
               ((symbol-function 'ytm-radio--render-now-playing-without-fit)
                (lambda ()
@@ -2845,12 +2877,14 @@
         called-browse-id
         called-params
         called-context
+        called-history-entry
         fetched-url)
     (cl-letf (((symbol-function 'ytm-radio--open-browse-id-as-source)
-               (lambda (browse-id &optional params context)
+               (lambda (browse-id &optional params context history-entry)
                  (setq called-browse-id browse-id)
                  (setq called-params params)
-                 (setq called-context context)))
+                 (setq called-context context)
+                 (setq called-history-entry history-entry)))
               ((symbol-function 'ytm-radio--open-url-as-source)
                (lambda (url)
                  (setq fetched-url url))))
@@ -2858,6 +2892,7 @@
       (should (equal called-browse-id "VLPL1"))
       (should-not called-params)
       (should (eq called-context item))
+      (should called-history-entry)
       (should-not fetched-url))))
 
 (ert-deftest ytm-radio-open-browse-id-enters-detail-view-for-sections ()
@@ -2899,7 +2934,9 @@
                      '("ytm:browse:UC1:header"
                        "ytm:browse:UC1:1:songs")))
       (should (eq (ytm-radio--view-value :origin-view) 'home))
-      (should (equal ytm-radio--browser-history '(home))))))
+      (should (equal (mapcar #'ytm-radio--browser-history-entry-view
+                             ytm-radio--browser-history)
+                     '(home))))))
 
 (ert-deftest ytm-radio-open-browse-id-single-source-uses-context-header ()
   "Show album/playlist detail headers even when the helper returns one source."
@@ -2947,7 +2984,69 @@
         (should (equal (map-elt header :thumbnail-url)
                        "https://example.com/adele-mix.jpg")))
       (should (eq (ytm-radio--view-value :origin-view) 'home))
-      (should (equal ytm-radio--browser-history '(home))))))
+      (should (equal (mapcar #'ytm-radio--browser-history-entry-view
+                             ytm-radio--browser-history)
+                     '(home))))))
+
+(ert-deftest ytm-radio-back-restores-position-after-detail-load ()
+  "Return from async detail navigation to the item that opened it."
+  (let* ((source-a (ytm-radio--make-source
+                    :id "ytm:home:first"
+                    :kind 'youtube-music-home-section
+                    :title "First"
+                    :items '(((type . "track")
+                              (id . "a")
+                              (title . "Song A")
+                              (url . "https://music.youtube.com/watch?v=a")))))
+         (item-b '((type . "playlist")
+                   (id . "VLPL1")
+                   (title . "Adele Mix")
+                   (browse-id . "VLPL1")
+                   (subtitle . "Playlist - YouTube Music")))
+         (source-b (ytm-radio--make-source
+                    :id "ytm:home:second"
+                    :kind 'youtube-music-home-section
+                    :title "Second"
+                    :items (list item-b)))
+         (detail (ytm-radio--make-source
+                  :id "ytm:browse:VLPL1"
+                  :kind 'youtube-music-playlist
+                  :title "Adele Mix"
+                  :items nil
+                  :tracks nil))
+         (ytm-radio-helper-use-mock-data t)
+         (ytm-radio--loaded t)
+         (ytm-radio--browser-view 'home)
+         (ytm-radio--browser-history nil)
+         (ytm-radio--browser-load-process nil)
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons (map-elt source-a :id) source-a)
+                          (cons (map-elt source-b :id) source-b))))
+         (ytm-radio--player (ytm-radio--make-player)))
+    (with-current-buffer (ytm-radio--buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (ytm-radio--render-browser)
+    (with-current-buffer "*ytm-radio*"
+      (goto-char (point-min))
+      (search-forward "Adele Mix")
+      (cl-letf (((symbol-function 'ytm-radio--call-helper-async)
+                 (lambda (_arguments success _error-callback)
+                   (funcall success 'data)
+                   nil))
+                ((symbol-function 'ytm-radio--helper-sources)
+                 (lambda (_data) (list detail)))
+                ((symbol-function 'ytm-radio--save) #'ignore))
+        (ytm-radio-open-at-point))
+      (should (eq (ytm-radio--view-kind) 'detail))
+      (ytm-radio-back)
+      (should (eq ytm-radio--browser-view 'home))
+      (should (equal (ytm-radio--source-display-title
+                      (ytm-radio--line-source-at-point))
+                     "Second"))
+      (should (equal (ytm-radio--item-title (ytm-radio--line-item-at-point))
+                     "Adele Mix")))))
 
 (ert-deftest ytm-radio-open-browse-id-preserves-root-origin ()
   "Keep the originating root tab active when opening detail views."
@@ -2987,7 +3086,9 @@
       (should (eq (ytm-radio--view-value :origin-view) 'library))
       (should (ytm-radio--browser-root-active-p 'library))
       (should-not (ytm-radio--browser-root-active-p 'home))
-      (should (equal ytm-radio--browser-history '(library))))))
+      (should (equal (mapcar #'ytm-radio--browser-history-entry-view
+                             ytm-radio--browser-history)
+                     '(library))))))
 
 (ert-deftest ytm-radio-enter-source-preserves-root-origin ()
   "Keep the originating root tab active when focusing one section."

@@ -23,12 +23,23 @@ repository. It is adapted from `~/repos/coding-guidelines/general.md` and
 
 - Find the root cause before changing behavior. Be able to name the failing
   layer before patching timing, caching, rendering, or control flow.
-- If one fix fails, narrow the hypothesis and gather more evidence.
+- Do not present a plausible explanation as root cause. Mark it as a
+  hypothesis until code inspection, a reproduction, or a failing test confirms
+  the actual failing path.
+- If one fix fails, narrow the hypothesis and gather more evidence. Do not
+  stack another speculative patch on top.
 - After two failed fixes on the same issue, stop patching and switch to
-  diagnosis only.
+  diagnosis only until the failing path is confirmed.
 - Fix the layer that owns the problem instead of compensating elsewhere.
 - Keep experiments narrow. Prove a new direction with the smallest useful
   slice before expanding scope.
+- For dispatcher bugs, test the real dispatch path: keymaps, buttons,
+  commands, hooks, async callbacks, and public entry points. Helper-level tests
+  are not enough when the bug is in routing.
+- For user-visible bug fixes, prefer red before green: reproduce the failure in
+  a test or a minimal live check, confirm it fails, then change behavior.
+- Do not leave heuristic shortcuts, silent partial implementations, duplicated
+  logic, or dead code introduced during diagnosis.
 
 ## Emacs Lisp Rules
 
