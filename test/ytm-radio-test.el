@@ -2291,6 +2291,96 @@
             (should (string-match-p "^auth[[:space:]]+OK" report))))
       (delete-directory directory t))))
 
+(ert-deftest ytm-radio-ensure-program-reports-missing-absolute-path ()
+  "Report missing absolute helper paths without blaming `exec-path'."
+  (let* ((missing (expand-file-name "missing-helper" temporary-file-directory))
+         (error (should-error
+                 (ytm-radio--ensure-program missing "ytm-radio-helper")
+                 :type 'user-error)))
+    (should (string-match-p "Cannot execute ytm-radio-helper at"
+                            (error-message-string error)))
+    (should-not (string-match-p "exec-path" (error-message-string error)))))
+
+(ert-deftest ytm-radio-ensure-program-reports-missing-command-name ()
+  "Report missing command names through `exec-path'."
+  (let* ((command "ytm-radio-test-missing-helper")
+         (error (should-error
+                 (ytm-radio--ensure-program command "ytm-radio-helper")
+                 :type 'user-error)))
+    (should (string-match-p "Cannot find ytm-radio-helper"
+                            (error-message-string error)))
+    (should (string-match-p "exec-path" (error-message-string error)))))
+
+(ert-deftest ytm-radio-helper-release-asset-name-detects-platform ()
+  "Build helper release asset names from the current platform."
+  (let ((system-type 'darwin)
+        (system-configuration "aarch64-apple-darwin"))
+    (should (equal (ytm-radio--helper-release-asset-name)
+                   "ytm-radio-helper-aarch64-apple-darwin")))
+  (let ((system-type 'darwin)
+        (system-configuration "x86_64-apple-darwin"))
+    (should (equal (ytm-radio--helper-release-asset-name)
+                   "ytm-radio-helper-x86_64-apple-darwin")))
+  (let ((system-type 'gnu/linux)
+        (system-configuration "x86_64-pc-linux-gnu"))
+    (should (equal (ytm-radio--helper-release-asset-name)
+                   "ytm-radio-helper-x86_64-unknown-linux-gnu"))))
+
+(ert-deftest ytm-radio-helper-command-falls-back-to-installed-helper ()
+  "Use the installed helper when the default repo helper is missing."
+  (let* ((directory (make-temp-file "ytm-radio-helper-command-" t))
+         (ytm-radio-helper-install-directory (expand-file-name "bin" directory))
+         (ytm-radio--default-helper-command
+          (expand-file-name "missing-repo-helper" directory))
+         (ytm-radio-helper-command ytm-radio--default-helper-command)
+         (installed (ytm-radio--installed-helper-command)))
+    (unwind-protect
+        (progn
+          (make-directory (file-name-directory installed) t)
+          (with-temp-file installed
+            (insert "#!/bin/sh\n"))
+          (set-file-modes installed #o700)
+          (should (equal (ytm-radio--helper-command) installed)))
+      (delete-directory directory t))))
+
+(ert-deftest ytm-radio-call-helper-missing-suggests-installer ()
+  "Suggest the helper installer when the helper is missing."
+  (let* ((directory (make-temp-file "ytm-radio-helper-missing-" t))
+         (ytm-radio-helper-install-directory (expand-file-name "bin" directory))
+         (ytm-radio--default-helper-command
+          (expand-file-name "missing-repo-helper" directory))
+         (ytm-radio-helper-command ytm-radio--default-helper-command)
+         (error (should-error
+                 (ytm-radio--call-helper-async nil #'ignore #'ignore)
+                 :type 'user-error)))
+    (unwind-protect
+        (should (string-match-p "M-x ytm-radio-install-helper"
+                                (error-message-string error)))
+      (delete-directory directory t))))
+
+(ert-deftest ytm-radio-install-helper-downloads-release-asset ()
+  "Download the current platform helper release asset."
+  (let* ((directory (make-temp-file "ytm-radio-helper-install-" t))
+         (ytm-radio-helper-install-directory (expand-file-name "bin" directory))
+         (ytm-radio-helper-release-base-url
+          "https://example.invalid/ytm-radio/releases/latest/download")
+         (system-type 'darwin)
+         (system-configuration "aarch64-apple-darwin")
+         copied-url)
+    (unwind-protect
+        (cl-letf (((symbol-function 'ytm-radio--copy-url-to-file)
+                   (lambda (url file)
+                     (setq copied-url url)
+                     (with-temp-file file
+                       (insert "#!/bin/sh\n")))))
+          (let ((installed (ytm-radio-install-helper t)))
+            (should (equal copied-url
+                           "https://example.invalid/ytm-radio/releases/latest/download/ytm-radio-helper-aarch64-apple-darwin"))
+            (should (equal installed (ytm-radio--installed-helper-command)))
+            (should (equal ytm-radio-helper-command installed))
+            (should (file-executable-p installed))))
+      (delete-directory directory t))))
+
 (ert-deftest ytm-radio-progress-bar-renders-unicode ()
   "Render compact Unicode progress bars."
   (should (equal (substring-no-properties

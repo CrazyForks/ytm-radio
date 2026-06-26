@@ -50,23 +50,23 @@ YouTube Music page instead of hardcoding the API key.
 - `transient`
 - `yt-dlp`
 - `mpv`
-- a Rust toolchain for building the optional account helper
+- a Rust toolchain only when building the account helper locally
 
 No Python runtime or Python package is used.
 
 ## Setup
-
-Build the helper:
-
-```sh
-cargo build --manifest-path helper/Cargo.toml
-```
 
 Load the Emacs package:
 
 ```elisp
 (add-to-list 'load-path "/Users/luciuschen/repos/ytm-radio")
 (require 'ytm-radio)
+```
+
+Install the account helper from the latest GitHub release:
+
+```text
+M-x ytm-radio-install-helper
 ```
 
 Opening `M-x ytm-radio` does not prompt for a URL when the catalog is empty.
@@ -86,14 +86,32 @@ The child frame is a compact now-playing surface. It fits itself to the current
 cover image, shows title, artist, time, and progress, and exposes the core
 playback controls without turning the child frame into the main browser.
 
-The default helper path points to:
+`M-x ytm-radio-install-helper` downloads a platform-specific
+`ytm-radio-helper` binary to:
+
+```text
+~/.ytm-radio/bin/ytm-radio-helper
+```
+
+Release downloads currently support macOS arm64, macOS x86_64, and Linux
+x86_64.
+
+When developing from a checkout, you can also build the helper locally:
+
+```sh
+cargo build --manifest-path helper/Cargo.toml
+```
+
+The in-repository helper path is:
 
 ```text
 helper/target/debug/ytm-radio-helper
 ```
 
-Set `ytm-radio-helper-command` explicitly when installing the binary
-elsewhere:
+ytm-radio uses the configured `ytm-radio-helper-command` when it is executable.
+If the default in-repository helper is missing, it falls back to the installed
+release helper. Set `ytm-radio-helper-command` explicitly when installing the
+binary elsewhere:
 
 ```elisp
 (setq ytm-radio-helper-command
@@ -108,6 +126,8 @@ directory, and the auth file are visible from Emacs.
 
 - `M-x ytm-radio` opens the YouTube Music browser buffer.
 - `M-x ytm-radio-doctor` shows a setup diagnostic report.
+- `M-x ytm-radio-install-helper` downloads the helper binary from GitHub
+  Releases.
 - `M-x ytm-radio-home` switches to Home.
 - `M-x ytm-radio-explore` switches to Explore.
 - `M-x ytm-radio-library` switches to Library.

@@ -31,6 +31,10 @@
   (file-name-directory (or load-file-name buffer-file-name default-directory))
   "Directory containing the loaded ytm-radio package.")
 
+(defconst ytm-radio--default-helper-command
+  (expand-file-name "helper/target/debug/ytm-radio-helper" ytm-radio--directory)
+  "Default in-repository helper executable path.")
+
 ;;; Customization
 
 (defgroup ytm-radio nil
@@ -149,7 +153,7 @@ The browser login window uses the browser or system proxy configuration."
   :group 'ytm-radio)
 
 (defcustom ytm-radio-helper-command
-  (expand-file-name "helper/target/debug/ytm-radio-helper" ytm-radio--directory)
+  ytm-radio--default-helper-command
   "External helper executable used to fetch account data."
   :type 'file
   :group 'ytm-radio)
@@ -158,6 +162,18 @@ The browser login window uses the browser or system proxy configuration."
   (expand-file-name "~/.ytm-radio/")
   "Directory used for ytm-radio runtime data."
   :type 'directory
+  :group 'ytm-radio)
+
+(defcustom ytm-radio-helper-install-directory
+  (expand-file-name "bin/" ytm-radio-data-directory)
+  "Directory used by `ytm-radio-install-helper' for helper binaries."
+  :type 'directory
+  :group 'ytm-radio)
+
+(defcustom ytm-radio-helper-release-base-url
+  "https://github.com/LuciusChen/ytm-radio/releases/latest/download/"
+  "Base URL used by `ytm-radio-install-helper' to download helper releases."
+  :type 'string
   :group 'ytm-radio)
 
 (defcustom ytm-radio-helper-auth-file
@@ -559,10 +575,96 @@ USING-STREAM-CACHE, and RETRIED-ORIGINAL-URL are ephemeral runtime fields."
 
 (defun ytm-radio--ensure-program (program label)
   "Signal a user error unless PROGRAM named LABEL is executable."
-  (unless (or (and (file-name-absolute-p program)
-                   (file-executable-p program))
-              (executable-find program))
-    (user-error "Cannot find %s in `exec-path'" label)))
+  (cond
+   ((or (not (stringp program))
+        (string-empty-p program))
+    (user-error "%s program is not configured" label))
+   ((file-name-absolute-p program)
+    (unless (file-executable-p program)
+      (user-error "Cannot execute %s at %s" label program)))
+   ((not (executable-find program))
+    (user-error "Cannot find %s (%s) in `exec-path'" label program))))
+
+(defun ytm-radio--program-executable-p (program)
+  "Return non-nil when PROGRAM is executable."
+  (and (stringp program)
+       (not (string-empty-p program))
+       (if (file-name-absolute-p program)
+           (file-executable-p program)
+         (executable-find program))))
+
+(defun ytm-radio--installed-helper-command ()
+  "Return the helper path installed by `ytm-radio-install-helper'."
+  (expand-file-name "ytm-radio-helper" ytm-radio-helper-install-directory))
+
+(defun ytm-radio--helper-command ()
+  "Return the helper executable path to use."
+  (let ((installed (ytm-radio--installed-helper-command)))
+    (cond
+     ((ytm-radio--program-executable-p ytm-radio-helper-command)
+      ytm-radio-helper-command)
+     ((and (equal ytm-radio-helper-command ytm-radio--default-helper-command)
+           (file-executable-p installed))
+      installed)
+     (t ytm-radio-helper-command))))
+
+(defun ytm-radio--helper-release-target ()
+  "Return the release helper target for the current platform."
+  (let ((configuration system-configuration))
+    (cond
+     ((and (eq system-type 'darwin)
+           (string-match-p "\\(?:aarch64\\|arm64\\)" configuration))
+      "aarch64-apple-darwin")
+     ((and (eq system-type 'darwin)
+           (string-match-p "\\(?:x86_64\\|amd64\\)" configuration))
+      "x86_64-apple-darwin")
+     ((and (eq system-type 'gnu/linux)
+           (string-match-p "\\(?:x86_64\\|amd64\\)" configuration))
+      "x86_64-unknown-linux-gnu")
+     (t
+      (user-error "No ytm-radio helper release is available for %s"
+                  configuration)))))
+
+(defun ytm-radio--helper-release-asset-name ()
+  "Return the helper release asset name for the current platform."
+  (concat "ytm-radio-helper-" (ytm-radio--helper-release-target)))
+
+(defun ytm-radio--helper-release-url ()
+  "Return the helper release download URL for the current platform."
+  (concat (if (string-suffix-p "/" ytm-radio-helper-release-base-url)
+              ytm-radio-helper-release-base-url
+            (concat ytm-radio-helper-release-base-url "/"))
+          (ytm-radio--helper-release-asset-name)))
+
+(defun ytm-radio--copy-url-to-file (url file)
+  "Copy URL to FILE, replacing FILE when it exists."
+  (url-copy-file url file t))
+
+;;;###autoload
+(defun ytm-radio-install-helper (&optional force)
+  "Download and install the ytm-radio helper release binary.
+With prefix argument FORCE, replace an existing installed helper without
+prompting."
+  (interactive "P")
+  (let* ((url (ytm-radio--helper-release-url))
+         (destination (ytm-radio--installed-helper-command))
+         (temporary (make-temp-file "ytm-radio-helper-download-")))
+    (when (and (file-exists-p destination)
+               (not force)
+               (not (y-or-n-p (format "Replace %s? " destination))))
+      (user-error "Helper install cancelled"))
+    (unwind-protect
+        (progn
+          (make-directory (file-name-directory destination) t)
+          (message "Downloading ytm-radio helper from %s..." url)
+          (ytm-radio--copy-url-to-file url temporary)
+          (set-file-modes temporary #o700)
+          (rename-file temporary destination t)
+          (setq ytm-radio-helper-command destination)
+          (message "Installed ytm-radio helper to %s" destination)
+          destination)
+      (when (file-exists-p temporary)
+        (delete-file temporary)))))
 
 (defun ytm-radio--doctor-program-path (program)
   "Return the executable path for PROGRAM, or nil."
@@ -619,7 +721,7 @@ USING-STREAM-CACHE, and RETRIED-ORIGINAL-URL are ephemeral runtime fields."
    (list
     "ytm-radio doctor"
     ""
-    (ytm-radio--doctor-program-line "helper" ytm-radio-helper-command)
+    (ytm-radio--doctor-program-line "helper" (ytm-radio--helper-command))
     (ytm-radio--doctor-program-line "mpv" ytm-radio-mpv-program)
     (ytm-radio--doctor-program-line "yt-dlp" ytm-radio-yt-dlp-program)
     (ytm-radio--doctor-data-line)
@@ -1071,17 +1173,22 @@ that does not expose DevTools."
   "Run the external helper with ARGUMENTS asynchronously.
 SUCCESS is called with helper data.  ERROR-CALLBACK is called with a diagnostic
 string."
-  (ytm-radio--call-json-process-async
-   ytm-radio-helper-command
-   arguments
-   (lambda (diagnostic)
-     (format "Account helper failed: %s" diagnostic))
-   (lambda (envelope)
-     (condition-case error
-         (funcall success (ytm-radio--helper-envelope-data envelope))
-       (error
-        (funcall error-callback (error-message-string error)))))
-   error-callback))
+  (condition-case error
+      (ytm-radio--call-json-process-async
+       (ytm-radio--helper-command)
+       arguments
+       (lambda (diagnostic)
+         (format "Account helper failed: %s" diagnostic))
+       (lambda (envelope)
+         (condition-case error
+             (funcall success (ytm-radio--helper-envelope-data envelope))
+           (error
+            (funcall error-callback (error-message-string error)))))
+       error-callback)
+    (user-error
+     (user-error
+      "%s. Run M-x ytm-radio-install-helper, build the helper with Cargo, or set `ytm-radio-helper-command'"
+      (error-message-string error)))))
 
 (defun ytm-radio--helper-envelope-data (envelope)
   "Return the data alist from helper ENVELOPE."

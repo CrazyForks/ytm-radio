@@ -89,6 +89,10 @@ and useful.
   browser login window, and helper JSON envelopes. Elisp may choose targets and
   update local display state, but it must not persist YouTube Music feedback
   tokens or duplicate Innertube request assembly.
+- The helper may be built locally during development or installed as a
+  platform-specific release binary. Emacs may download that binary through an
+  explicit user command, but it must not silently download executable code while
+  opening or browsing.
 - A single optional proxy URL may be applied to helper account requests,
   `yt-dlp` discovery and prefetching, and mpv playback paths. The browser login
   window continues to use browser or system proxy configuration unless a future

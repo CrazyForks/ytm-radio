@@ -1,0 +1,54 @@
+name: Helper release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to upload assets to
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build helper
+        run: cargo build --manifest-path helper/Cargo.toml --release --locked --target ${{ matrix.target }}
+
+      - name: Prepare asset
+        run: |
+          asset="ytm-radio-helper-${{ matrix.target }}"
+          cp "helper/target/${{ matrix.target }}/release/ytm-radio-helper" "$asset"
+          chmod 755 "$asset"
+
+      - name: Upload asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          if [ -z "$tag" ]; then
+            tag="${{ inputs.tag }}"
+          fi
+          gh release upload "$tag" "ytm-radio-helper-${{ matrix.target }}" --clobber
