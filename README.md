@@ -25,19 +25,26 @@ Implemented:
 - invoke an external Rust account helper;
 - import YouTube Music auth through a browser login window and the
   browser's DevTools protocol;
-- make authenticated YouTube Music home, library, liked, and search requests;
+- make authenticated YouTube Music home, explore, library, liked, detail,
+  search, radio/mix, playlist mutation, rating, and library mutation requests;
 - normalize live music renderers into playable tracks;
 - preserve non-track YouTube Music items such as albums, artists, playlists,
   and recommendation cards when they are present in browse responses;
-- render Home and Library as Emacs-native section dashboards;
+- render Home, Explore, Library, Search, detail, and queue views as
+  Emacs-native sections;
+- preserve browser positions across root-view switches and back navigation;
+- cache helper bootstrap data and short-lived account API responses;
+- save/remove library tracks, add tracks to playlists, start mixes, and manage
+  the runtime queue from current-track actions;
 - import deterministic mock account data;
 - reject unsupported helper JSON schema versions.
 
 Not implemented yet:
 
-- detail pages for every album, artist, playlist, and radio renderer;
+- complete detail-page coverage for every YouTube Music renderer shape;
 - encrypted credential storage;
-- local account-data caching;
+- durable offline account catalog beyond the saved browser state and
+  short-lived helper response cache;
 - full renderer coverage for every YouTube Music web card type.
 
 The live API is an unofficial YouTube Music web protocol and can change without
