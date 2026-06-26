@@ -41,6 +41,8 @@ and useful.
 ## Non-goals
 
 - Do not embed the full YouTube Music web app.
+- Do not build or support a standalone terminal TUI; the product UI is Emacs
+  buffers and child frames.
 - Do not implement browser cookie database decryption in Rust.
 - Do not support copied request-header auth or browser-cookie database import
   as fallback login paths.

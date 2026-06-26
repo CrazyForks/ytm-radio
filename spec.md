@@ -3,6 +3,12 @@
 This file records narrow UI contracts that are easy to regress but too detailed
 for the PRD.
 
+## Interface Scope
+
+ytm-radio renders Emacs-native `special-mode` buffers and the optional
+now-playing child frame. It does not render, expose, or test a standalone
+terminal TUI outside Emacs.
+
 ## Account State Markers
 
 Track rating state comes from the normalized `:like-status` field on ytm-radio

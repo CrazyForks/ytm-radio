@@ -6,9 +6,15 @@ An experimental Emacs audio player for YouTube and YouTube Music.
 audio with video disabled. Emacs owns playback state, selection commands, and
 the YouTube Music browser UI.
 
+The UI is Emacs-native: regular `special-mode` buffers plus an optional
+child-frame now-playing view. ytm-radio does not provide or target a standalone
+terminal TUI outside Emacs.
+
 YouTube Music account access is a separate Rust CLI. It is not an Emacs
 dynamic module and does not run as a resident service. Emacs starts one
 process for a request, reads a versioned JSON response, and the process exits.
+
+![ytm-radio Home view with the now-playing child frame](assets/ytm-radio-home-now-playing.jpg)
 
 ## Status
 
