@@ -35,6 +35,18 @@
   (expand-file-name "helper/target/debug/ytm-radio-helper" ytm-radio--directory)
   "Default in-repository helper executable path.")
 
+(defconst ytm-radio--state-version 1
+  "Current durable state file version.")
+
+(defconst ytm-radio--helper-schema-version 1
+  "Supported helper JSON envelope schema version.")
+
+(defconst ytm-radio--helper-protocol-version 1
+  "Supported helper protocol version.")
+
+(defconst ytm-radio--helper-version "0.1.1"
+  "Helper binary version expected by this Elisp package.")
+
 ;;; Customization
 
 (defgroup ytm-radio nil
@@ -220,11 +232,6 @@ helper-managed non-default profile when its DevTools login flow requires one."
           :match-alternatives
           ((lambda (value)
              (and (integerp value) (< 0 value)))))
-  :group 'ytm-radio)
-
-(defcustom ytm-radio-helper-use-mock-data nil
-  "Whether account import commands should request mock helper data."
-  :type 'boolean
   :group 'ytm-radio)
 
 (defcustom ytm-radio-helper-library-limit 100
@@ -426,10 +433,15 @@ ephemeral runtime fields."
         (cons :retried-original-url retried-original-url)
         (cons :retried-playback-error retried-playback-error)))
 
-(cl-defun ytm-radio--make-state (&key sources last-track-id)
-  "Return the durable package state from SOURCES and LAST-TRACK-ID."
+(cl-defun ytm-radio--make-state
+    (&key sources last-track-id home-continuation home-continuation-known)
+  "Return the durable package state.
+SOURCES, LAST-TRACK-ID, HOME-CONTINUATION, and HOME-CONTINUATION-KNOWN are
+stored in `ytm-radio-state-file'."
   (list (cons :sources sources)
-        (cons :last-track-id last-track-id)))
+        (cons :last-track-id last-track-id)
+        (cons :home-continuation home-continuation)
+        (cons :home-continuation-known home-continuation-known)))
 
 (defvar ytm-radio--state (ytm-radio--make-state)
   "Durable state for sources and the last played track.")
@@ -516,6 +528,9 @@ ephemeral runtime fields."
 (defvar ytm-radio--browser-load-process nil
   "Current asynchronous non-Home helper process.")
 
+(defvar ytm-radio--browser-load-token nil
+  "Identity token for the current asynchronous non-Home helper request.")
+
 (defvar ytm-radio--add-url-process nil
   "Current asynchronous URL import process.")
 
@@ -531,14 +546,27 @@ ephemeral runtime fields."
 (defvar ytm-radio--initial-home-refreshed nil
   "Non-nil once Home has been refreshed on first browser open.")
 
-(defvar ytm-radio--home-continuation nil
-  "Continuation token for loading more Home sections.")
+(defun ytm-radio--home-continuation ()
+  "Return the continuation token for loading more Home sections."
+  (map-elt ytm-radio--state :home-continuation))
+
+(defun ytm-radio--set-home-continuation (continuation)
+  "Set Home CONTINUATION in durable state."
+  (setf (map-elt ytm-radio--state :home-continuation) continuation
+        (map-elt ytm-radio--state :home-continuation-known) t))
+
+(defun ytm-radio--home-continuation-known-p ()
+  "Return non-nil when Home continuation state is known."
+  (map-elt ytm-radio--state :home-continuation-known))
 
 (defvar ytm-radio--home-loading nil
   "Non-nil while Home is loading asynchronously.")
 
 (defvar ytm-radio--home-process nil
   "Current asynchronous Home helper process.")
+
+(defvar ytm-radio--home-load-token nil
+  "Identity token for the current asynchronous Home helper request.")
 
 (defconst ytm-radio--browser-section-limit 8
   "Maximum items shown per source in overview browser views.")
@@ -587,22 +615,89 @@ ephemeral runtime fields."
   "Persist durable state to `ytm-radio-state-file'."
   (make-directory (file-name-directory ytm-radio-state-file) t)
   (with-temp-file ytm-radio-state-file
-    (prin1 (list (cons :version 1)
+    (prin1 (list (cons :version ytm-radio--state-version)
                  (cons :sources (map-elt ytm-radio--state :sources))
                  (cons :last-track-id
-	                       (map-elt ytm-radio--state :last-track-id)))
+	                       (map-elt ytm-radio--state :last-track-id))
+                 (cons :home-continuation
+                       (map-elt ytm-radio--state :home-continuation)))
 	           (current-buffer))))
+
+(defun ytm-radio--state-track-p (track)
+  "Return non-nil when TRACK has the durable track shape."
+  (and (listp track)
+       (or (stringp (map-elt track :id))
+           (stringp (map-elt track :url)))
+       (or (null (map-elt track :title))
+           (stringp (map-elt track :title)))
+       (or (null (map-elt track :url))
+           (stringp (map-elt track :url)))))
+
+(defun ytm-radio--state-source-p (cell)
+  "Return non-nil when CELL has the durable source shape."
+  (let ((source (cdr-safe cell)))
+    (and (consp cell)
+         (stringp (car cell))
+         (listp source)
+         (equal (car cell) (map-elt source :id))
+         (symbolp (map-elt source :kind))
+         (or (null (map-elt source :title))
+             (stringp (map-elt source :title)))
+         (or (null (map-elt source :url))
+             (stringp (map-elt source :url)))
+         (listp (map-elt source :tracks))
+         (seq-every-p #'ytm-radio--state-track-p
+                      (or (map-elt source :tracks) nil))
+         (listp (map-elt source :items)))))
+
+(defun ytm-radio--state-data-p (data)
+  "Return non-nil when DATA has the supported durable state shape."
+  (and (listp data)
+       (equal (map-elt data :version) ytm-radio--state-version)
+       (listp (map-elt data :sources))
+       (seq-every-p #'ytm-radio--state-source-p
+                    (or (map-elt data :sources) nil))
+       (or (null (map-elt data :last-track-id))
+           (stringp (map-elt data :last-track-id)))
+       (or (not (assq :home-continuation data))
+           (null (map-elt data :home-continuation))
+           (stringp (map-elt data :home-continuation)))))
+
+(defun ytm-radio--read-state-file ()
+  "Read and validate `ytm-radio-state-file'."
+  (let* ((read-eval-symbol (intern "read-eval"))
+         (read-eval-bound (boundp read-eval-symbol))
+         (old-read-eval (and read-eval-bound
+                             (symbol-value read-eval-symbol)))
+         data)
+    (unwind-protect
+        (progn
+          (set read-eval-symbol nil)
+          (setq data
+                (with-temp-buffer
+                  (insert-file-contents ytm-radio-state-file)
+                  (read (current-buffer)))))
+      (if read-eval-bound
+          (set read-eval-symbol old-read-eval)
+        (makunbound read-eval-symbol)))
+    (unless (equal (map-elt data :version) ytm-radio--state-version)
+      (user-error "Unsupported ytm-radio state version %S"
+                  (map-elt data :version)))
+    (unless (ytm-radio--state-data-p data)
+      (user-error "Invalid ytm-radio state file %s" ytm-radio-state-file))
+    data))
 
 (defun ytm-radio--load ()
   "Load durable state from `ytm-radio-state-file'."
   (when (file-exists-p ytm-radio-state-file)
-    (let ((data (with-temp-buffer
-                  (insert-file-contents ytm-radio-state-file)
-                  (read (current-buffer)))))
+    (let ((data (ytm-radio--read-state-file)))
       (setq ytm-radio--state
             (ytm-radio--make-state
              :sources (map-elt data :sources)
-             :last-track-id (map-elt data :last-track-id))))))
+             :last-track-id (map-elt data :last-track-id)
+             :home-continuation (map-elt data :home-continuation)
+             :home-continuation-known
+             (and (assq :home-continuation data) t))))))
 
 (defun ytm-radio--ensure-loaded ()
   "Load durable state once for the current Emacs session."
@@ -749,6 +844,39 @@ prompting."
     (ytm-radio--doctor-status-line
      label "MISSING" (or program "not configured"))))
 
+(defun ytm-radio--doctor-helper-version-line ()
+  "Return a diagnostic line for the helper protocol version."
+  (let ((program (ytm-radio--helper-command)))
+    (if (not (ytm-radio--program-executable-p program))
+        (ytm-radio--doctor-status-line "protocol" "MISSING" "helper not executable")
+      (let ((stdout (generate-new-buffer " *ytm-radio-version-stdout*")))
+        (unwind-protect
+            (let ((exit-code (process-file program nil
+                                           (list stdout t)
+                                           nil
+                                           "version")))
+              (if (not (zerop exit-code))
+                  (ytm-radio--doctor-status-line
+                   "protocol"
+                   "ERROR"
+                   (ytm-radio--trim-buffer stdout))
+                (condition-case error
+                    (let* ((envelope (ytm-radio--parse-json-buffer stdout))
+                           (_data (ytm-radio--helper-envelope-data envelope)))
+                      (ytm-radio--doctor-status-line
+                       "protocol"
+                       "OK"
+                       (format "helper %s protocol %d"
+                               (map-elt envelope 'helper-version)
+                               (map-elt envelope 'protocol))))
+                  (error
+                   (ytm-radio--doctor-status-line
+                    "protocol"
+                    "ERROR"
+                    (error-message-string error))))))
+          (when (buffer-live-p stdout)
+            (kill-buffer stdout)))))))
+
 (defun ytm-radio--doctor-data-line ()
   "Return a diagnostic line for `ytm-radio-data-directory'."
   (let* ((directory (file-name-as-directory
@@ -767,9 +895,7 @@ prompting."
 
 (defun ytm-radio--doctor-auth-line ()
   "Return a diagnostic line for `ytm-radio-helper-auth-file'."
-  (cond (ytm-radio-helper-use-mock-data
-         (ytm-radio--doctor-status-line "auth" "SKIPPED" "mock data enabled"))
-        ((and ytm-radio-helper-auth-file
+  (cond ((and ytm-radio-helper-auth-file
               (file-readable-p ytm-radio-helper-auth-file))
          (ytm-radio--doctor-status-line
           "auth" "OK" (expand-file-name ytm-radio-helper-auth-file)))
@@ -785,13 +911,11 @@ prompting."
     "ytm-radio doctor"
     ""
     (ytm-radio--doctor-program-line "helper" (ytm-radio--helper-command))
+    (ytm-radio--doctor-helper-version-line)
     (ytm-radio--doctor-program-line "mpv" ytm-radio-mpv-program)
     (ytm-radio--doctor-program-line "yt-dlp" ytm-radio-yt-dlp-program)
     (ytm-radio--doctor-data-line)
     (ytm-radio--doctor-auth-line)
-    (ytm-radio--doctor-status-line
-     "mock" (if ytm-radio-helper-use-mock-data "ON" "OFF")
-     "ytm-radio-helper-use-mock-data")
     ""
     "Set YTM_RADIO_TIMINGS=1 before running Emacs to see helper timings in stderr.")
    "\n"))
@@ -1002,14 +1126,12 @@ build a watch URL when yt-dlp returns only a video id."
     (user-error "A URL is already being imported")))
 
 (defun ytm-radio--finish-url-import (url source after-success)
-  "Store SOURCE imported from URL, then call AFTER-SUCCESS."
+  "Finish transient URL import for URL and SOURCE, then call AFTER-SUCCESS."
   (setq ytm-radio--add-url-process nil)
   (if (not (map-elt source :tracks))
       (message "No playable tracks found for %s" url)
-    (ytm-radio--put-source source)
-    (ytm-radio--save)
     (funcall after-success source)
-    (message "Added %s (%d tracks)"
+    (message "Loaded %s (%d tracks)"
              (ytm-radio--source-display-title source)
              (length (map-elt source :tracks)))))
 
@@ -1032,9 +1154,8 @@ build a watch URL when yt-dlp returns only a video id."
 
 (defun ytm-radio--account-auth-available-p ()
   "Return non-nil when account-backed helper requests can run now."
-  (or ytm-radio-helper-use-mock-data
-      (and ytm-radio-helper-auth-file
-           (file-readable-p ytm-radio-helper-auth-file))))
+  (and ytm-radio-helper-auth-file
+       (file-readable-p ytm-radio-helper-auth-file)))
 
 (defun ytm-radio--account-auth-diagnostic-p (diagnostic)
   "Return non-nil when DIAGNOSTIC means account auth should be refreshed."
@@ -1126,9 +1247,7 @@ MESSAGE is shown when login is required."
   (append (when ytm-radio-helper-auth-file
             (list "--auth" (expand-file-name ytm-radio-helper-auth-file)))
           (when-let* ((proxy (ytm-radio--proxy-url)))
-            (list "--proxy" proxy))
-          (when ytm-radio-helper-use-mock-data
-            (list "--mock"))))
+            (list "--proxy" proxy))))
 
 (defun ytm-radio--helper-browse-arguments (target &optional initial-only)
   "Return helper arguments for browsing TARGET.
@@ -1280,8 +1399,18 @@ string."
   "Return the data alist from helper ENVELOPE."
   (unless (map-elt envelope 'ok)
     (user-error "Account helper returned an error"))
-  (unless (equal (map-elt envelope 'schema) 1)
+  (unless (equal (map-elt envelope 'schema) ytm-radio--helper-schema-version)
     (user-error "Unsupported helper schema %S" (map-elt envelope 'schema)))
+  (unless (equal (map-elt envelope 'protocol) ytm-radio--helper-protocol-version)
+    (user-error
+     "Unsupported ytm-radio helper protocol %S; install helper %s"
+     (map-elt envelope 'protocol)
+     ytm-radio--helper-version))
+  (unless (equal (map-elt envelope 'helper-version) ytm-radio--helper-version)
+    (user-error
+     "Unsupported ytm-radio helper version %S; install helper %s"
+     (map-elt envelope 'helper-version)
+     ytm-radio--helper-version))
   (or (map-elt envelope 'data)
       (user-error "Account helper returned no data")))
 
@@ -1427,8 +1556,8 @@ When RESTORE-ENTRY is non-nil, restore that browser position after rendering."
       (ytm-radio--drop-helper-target-sources "home"))
     (dolist (source sources)
       (ytm-radio--put-source source))
-    (setq ytm-radio--home-continuation
-          (ytm-radio--helper-continuation data))
+    (ytm-radio--set-home-continuation
+     (ytm-radio--helper-continuation data))
     (ytm-radio--save)
     (if restore-entry
         (progn
@@ -1438,7 +1567,7 @@ When RESTORE-ENTRY is non-nil, restore that browser position after rendering."
     (message "Imported home recommendations: %d sources, %d tracks%s"
              (length sources)
              (ytm-radio--helper-track-count sources)
-             (if ytm-radio--home-continuation
+             (if (ytm-radio--home-continuation)
                  " (more available)"
                ""))))
 
@@ -1456,8 +1585,13 @@ When RESTORE-ENTRY is non-nil, restore that browser position after rendering."
 (defun ytm-radio--clear-browser-loading ()
   "Clear browser helper loading state."
   (setq ytm-radio--browser-load-process nil
+        ytm-radio--browser-load-token nil
         ytm-radio--browser-loading-message nil
         ytm-radio--browser-loading-view nil))
+
+(defun ytm-radio--new-request-token ()
+  "Return a fresh asynchronous request identity token."
+  (make-symbol "ytm-radio-request"))
 
 (defun ytm-radio--home-loading-message ()
   "Return a Home loading message, or nil."
@@ -1468,7 +1602,7 @@ When RESTORE-ENTRY is non-nil, restore that browser position after rendering."
 
 (defun ytm-radio--start-home-load (&optional append restore-entry)
   "Start asynchronous Home loading.
-When APPEND is non-nil, load `ytm-radio--home-continuation'.
+When APPEND is non-nil, load the current Home continuation.
 When RESTORE-ENTRY is non-nil, restore that browser position after loading."
   (ytm-radio--ensure-loaded)
   (when (process-live-p ytm-radio--home-process)
@@ -1476,32 +1610,38 @@ When RESTORE-ENTRY is non-nil, restore that browser position after loading."
   (ytm-radio--with-account-auth
    (lambda ()
      (let ((arguments (if append
-                          (if ytm-radio--home-continuation
+                          (if (ytm-radio--home-continuation)
                               (ytm-radio--helper-continuation-arguments
-                               ytm-radio--home-continuation)
+                               (ytm-radio--home-continuation))
                             (user-error "No more Home sections"))
-                        (ytm-radio--helper-browse-arguments "home" t))))
-       (setq ytm-radio--home-loading (if append 'more 'initial))
+                        (ytm-radio--helper-browse-arguments "home" t)))
+           (token (ytm-radio--new-request-token)))
+       (setq ytm-radio--home-loading (if append 'more 'initial)
+             ytm-radio--home-load-token token)
        (unless append
-         (setq ytm-radio--home-continuation nil))
+         (setf (map-elt ytm-radio--state :home-continuation) nil))
        (ytm-radio--render-browser (not append) restore-entry)
        (setq
         ytm-radio--home-process
         (ytm-radio--call-helper-async
          arguments
          (lambda (data)
-           (setq ytm-radio--home-process nil
-                 ytm-radio--home-loading nil
-                 ytm-radio--initial-home-refreshed t)
-           (ytm-radio--apply-home-helper-data data append restore-entry))
+           (when (eq token ytm-radio--home-load-token)
+             (setq ytm-radio--home-process nil
+                   ytm-radio--home-load-token nil
+                   ytm-radio--home-loading nil
+                   ytm-radio--initial-home-refreshed t)
+             (ytm-radio--apply-home-helper-data data append restore-entry)))
          (lambda (diagnostic)
-           (setq ytm-radio--home-process nil
-                 ytm-radio--home-loading nil)
-           (ytm-radio--render-browser nil restore-entry)
-           (ytm-radio--handle-account-helper-error
-            diagnostic
-            (lambda ()
-              (ytm-radio--start-home-load append restore-entry))))))))
+           (when (eq token ytm-radio--home-load-token)
+             (setq ytm-radio--home-process nil
+                   ytm-radio--home-load-token nil
+                   ytm-radio--home-loading nil)
+             (ytm-radio--render-browser nil restore-entry)
+             (ytm-radio--handle-account-helper-error
+              diagnostic
+              (lambda ()
+                (ytm-radio--start-home-load append restore-entry)))))))))
    "YouTube Music login required"))
 
 (defun ytm-radio--start-helper-target-load
@@ -1512,35 +1652,39 @@ When RESTORE-ENTRY is non-nil, restore that browser position after loading."
   (ytm-radio--ensure-browser-load-idle)
   (ytm-radio--with-account-auth
    (lambda ()
-     (ytm-radio--set-browser-loading
-      (format "Loading %s..." (ytm-radio--browser-title))
-      view)
-     (ytm-radio--render-browser t restore-entry)
-     (setq
-      ytm-radio--browser-load-process
-      (ytm-radio--call-helper-async
-       (ytm-radio--helper-browse-arguments target)
-       (lambda (data)
-         (let ((sources (ytm-radio--helper-sources data)))
-           (ytm-radio--clear-browser-loading)
-           (ytm-radio--drop-helper-target-sources target)
-           (dolist (source sources)
-             (ytm-radio--put-source source))
-           (ytm-radio--save)
-           (ytm-radio--render-browser t restore-entry)
-           (ytm-radio--render-now-playing)
-           (message "Imported %s: %d sources, %d tracks"
-                    label
-                    (length sources)
-                    (ytm-radio--helper-track-count sources))))
-       (lambda (diagnostic)
-        (ytm-radio--clear-browser-loading)
-        (ytm-radio--render-browser nil restore-entry)
-        (ytm-radio--handle-account-helper-error
-         diagnostic
-         (lambda ()
-           (ytm-radio--start-helper-target-load
-            target label view restore-entry)))))))
+     (let ((token (ytm-radio--new-request-token)))
+       (setq ytm-radio--browser-load-token token)
+       (ytm-radio--set-browser-loading
+        (format "Loading %s..." (ytm-radio--browser-title))
+        view)
+       (ytm-radio--render-browser t restore-entry)
+       (setq
+        ytm-radio--browser-load-process
+        (ytm-radio--call-helper-async
+         (ytm-radio--helper-browse-arguments target)
+         (lambda (data)
+           (when (eq token ytm-radio--browser-load-token)
+             (let ((sources (ytm-radio--helper-sources data)))
+               (ytm-radio--clear-browser-loading)
+               (ytm-radio--drop-helper-target-sources target)
+               (dolist (source sources)
+                 (ytm-radio--put-source source))
+               (ytm-radio--save)
+               (ytm-radio--render-browser t restore-entry)
+               (ytm-radio--render-now-playing)
+               (message "Imported %s: %d sources, %d tracks"
+                        label
+                        (length sources)
+                        (ytm-radio--helper-track-count sources)))))
+         (lambda (diagnostic)
+           (when (eq token ytm-radio--browser-load-token)
+             (ytm-radio--clear-browser-loading)
+             (ytm-radio--render-browser nil restore-entry)
+             (ytm-radio--handle-account-helper-error
+              diagnostic
+              (lambda ()
+                (ytm-radio--start-helper-target-load
+                 target label view restore-entry)))))))))
    "YouTube Music login required"))
 
 (defun ytm-radio--start-search-load (query &optional replace restore-entry)
@@ -1555,30 +1699,34 @@ When RESTORE-ENTRY is non-nil, restore that browser position after loading."
     (ytm-radio--set-browser-view view replace nil restore-entry)
     (ytm-radio--with-account-auth
      (lambda ()
-       (ytm-radio--drop-helper-target-sources "search")
-       (ytm-radio--set-browser-loading (format "Searching %s..." query) view)
-       (ytm-radio--render-browser t restore-entry)
-       (setq
-        ytm-radio--browser-load-process
-        (ytm-radio--call-helper-async
-         (ytm-radio--helper-search-arguments query)
-         (lambda (data)
-           (let ((sources (ytm-radio--helper-sources data)))
-             (ytm-radio--clear-browser-loading)
-             (dolist (source sources)
-               (ytm-radio--put-source source))
-             (ytm-radio--save)
-             (ytm-radio--render-browser t restore-entry)
-             (ytm-radio--render-now-playing)
-             (message "Imported search results for %s" query)))
-         (lambda (diagnostic)
-           (ytm-radio--clear-browser-loading)
-           (ytm-radio--render-browser nil restore-entry)
-           (ytm-radio--handle-account-helper-error
-            diagnostic
-            (lambda ()
-              (ytm-radio--start-search-load
-               query replace restore-entry)))))))
+       (let ((token (ytm-radio--new-request-token)))
+         (setq ytm-radio--browser-load-token token)
+         (ytm-radio--drop-helper-target-sources "search")
+         (ytm-radio--set-browser-loading (format "Searching %s..." query) view)
+         (ytm-radio--render-browser t restore-entry)
+         (setq
+          ytm-radio--browser-load-process
+          (ytm-radio--call-helper-async
+           (ytm-radio--helper-search-arguments query)
+           (lambda (data)
+             (when (eq token ytm-radio--browser-load-token)
+               (let ((sources (ytm-radio--helper-sources data)))
+                 (ytm-radio--clear-browser-loading)
+                 (dolist (source sources)
+                   (ytm-radio--put-source source))
+                 (ytm-radio--save)
+                 (ytm-radio--render-browser t restore-entry)
+                 (ytm-radio--render-now-playing)
+                 (message "Imported search results for %s" query))))
+           (lambda (diagnostic)
+             (when (eq token ytm-radio--browser-load-token)
+               (ytm-radio--clear-browser-loading)
+               (ytm-radio--render-browser nil restore-entry)
+               (ytm-radio--handle-account-helper-error
+                diagnostic
+                (lambda ()
+                  (ytm-radio--start-search-load
+                   query replace restore-entry)))))))))
      "YouTube Music login required")))
 
 (defun ytm-radio--item-detail-header-kind (item)
@@ -1623,21 +1771,54 @@ When ID is non-nil, use it as the header source id."
                   source context :in-library :in-library-known 'in-library)
      :subscribed (ytm-radio--source-or-context-account-state
                   source context :subscribed :subscribed-known 'subscribed)
-     :in-library-known (map-elt source :in-library-known)
-     :subscribed-known (map-elt source :subscribed-known)
+     :in-library-known (ytm-radio--source-or-context-account-state-known-p
+                        source context
+                        :in-library :in-library-known 'in-library)
+     :subscribed-known (ytm-radio--source-or-context-account-state-known-p
+                        source context
+                        :subscribed :subscribed-known 'subscribed)
      :playlist-id (or (map-elt context 'playlist-id)
                       (map-elt context :playlist-id)))))
 
 (defun ytm-radio--source-or-context-account-state
     (source context field known-field context-field)
-  "Return SOURCE account FIELD, falling back to CONTEXT.
+  "Return account FIELD from SOURCE or CONTEXT.
 KNOWN-FIELD marks explicit false states on SOURCE.  CONTEXT-FIELD is the raw
-helper item key used by CONTEXT."
-  (if (or (map-elt source field)
-          (map-elt source known-field))
-      (map-elt source field)
-    (or (map-elt context context-field)
-        (map-elt context field))))
+helper item key used by CONTEXT.  Positive state from either object wins so a
+saved or subscribed opener item does not render as unsaved in its detail
+header."
+  (let ((source-value (map-elt source field))
+        (context-value
+         (ytm-radio--account-state-value context field context-field)))
+    (cond
+     ((or source-value context-value) t)
+     ((or (map-elt source known-field)
+          (ytm-radio--account-state-present-p
+           context field context-field))
+      nil))))
+
+(defun ytm-radio--account-state-present-p (object keyword-field raw-field)
+  "Return non-nil when OBJECT carries KEYWORD-FIELD or RAW-FIELD."
+  (and object
+       (or (assq keyword-field object)
+           (assq raw-field object))))
+
+(defun ytm-radio--account-state-value (object keyword-field raw-field)
+  "Return OBJECT account state using KEYWORD-FIELD or RAW-FIELD."
+  (cond
+   ((and object (assq raw-field object))
+    (map-elt object raw-field))
+   ((and object (assq keyword-field object))
+    (map-elt object keyword-field))))
+
+(defun ytm-radio--source-or-context-account-state-known-p
+    (source context field known-field context-field)
+  "Return non-nil when SOURCE or CONTEXT knows FIELD.
+KNOWN-FIELD is SOURCE's explicit false marker.  CONTEXT-FIELD is the raw helper
+item key used by CONTEXT."
+  (or (map-elt source field)
+      (map-elt source known-field)
+      (ytm-radio--account-state-present-p context field context-field)))
 
 (defun ytm-radio--detail-header-source-p (source)
   "Return non-nil when SOURCE is a helper detail header source."
@@ -1669,6 +1850,146 @@ helper item key used by CONTEXT."
         (cons header sources)
       sources))))
 
+(defun ytm-radio--drop-source-ids (source-ids)
+  "Remove sources named by SOURCE-IDS from state."
+  (setf (map-elt ytm-radio--state :sources)
+        (seq-remove
+         (lambda (cell)
+           (member (car cell) source-ids))
+         (ytm-radio--sources))))
+
+(defun ytm-radio--source-browse-id (source)
+  "Return SOURCE's YouTube Music browse id, or nil."
+  (or (and-let* ((source-id (map-elt source :id))
+                 ((string-match "\\`ytm:browse:\\([^:]+\\)" source-id)))
+        (match-string 1 source-id))
+      (and-let* ((source-id (map-elt source :id))
+                 ((string-match "\\`ytm:channel:\\([^:]+\\)" source-id)))
+        (match-string 1 source-id))
+      (ytm-radio--music-url-detail-browse-id (map-elt source :url))))
+
+(defun ytm-radio--detail-target-ids (browse-id playlist-id)
+  "Return stable ids that can identify BROWSE-ID or PLAYLIST-ID."
+  (delq nil
+        (list browse-id
+              playlist-id
+              (ytm-radio--playlist-browse-id playlist-id))))
+
+(defun ytm-radio--same-detail-target-id-p
+    (candidate-ids browse-id playlist-id)
+  "Return non-nil when CANDIDATE-IDS identify BROWSE-ID or PLAYLIST-ID."
+  (let ((target-ids (ytm-radio--detail-target-ids browse-id playlist-id)))
+    (seq-some (lambda (candidate)
+                (member candidate target-ids))
+              candidate-ids)))
+
+(defun ytm-radio--source-detail-target-p (source browse-id playlist-id)
+  "Return non-nil when SOURCE identifies BROWSE-ID or PLAYLIST-ID."
+  (ytm-radio--same-detail-target-id-p
+   (delq nil
+         (list (ytm-radio--source-browse-id source)
+               (map-elt source :playlist-id)
+               (ytm-radio--playlist-browse-id
+                (map-elt source :playlist-id))))
+   browse-id
+   playlist-id))
+
+(defun ytm-radio--item-detail-target-p (item browse-id playlist-id)
+  "Return non-nil when ITEM identifies BROWSE-ID or PLAYLIST-ID."
+  (ytm-radio--same-detail-target-id-p
+   (delq nil
+         (list (ytm-radio--item-browse-id item)
+               (ytm-radio--item-playlist-id item)
+               (ytm-radio--playlist-browse-id
+                (ytm-radio--item-playlist-id item))
+               (ytm-radio--music-url-detail-browse-id
+                (ytm-radio--item-url item))
+               (ytm-radio--item-id item)
+               (ytm-radio--item-detail-browse-id item)))
+   browse-id
+   playlist-id))
+
+(defun ytm-radio--set-account-state-field
+    (object keyword-field raw-field known-field value)
+  "Set OBJECT account VALUE using KEYWORD-FIELD or RAW-FIELD.
+KNOWN-FIELD records explicit false values for normalized source objects."
+  (when object
+    (when (or (assq keyword-field object)
+              (assq :id object)
+              (assq :kind object)
+              (assq :url object)
+              (assq :source-id object))
+      (ytm-radio--set-alist-value object keyword-field value)
+      (ytm-radio--set-alist-value object known-field t))
+    (when (or (assq raw-field object)
+              (assq 'id object)
+              (assq 'url object)
+              (assq 'browse-id object)
+              (assq 'playlist-id object))
+      (ytm-radio--set-alist-value object raw-field value))))
+
+(defun ytm-radio--sync-detail-account-state
+    (browse-id playlist-id keyword-field raw-field known-field value)
+  "Propagate detail account VALUE for BROWSE-ID or PLAYLIST-ID.
+KEYWORD-FIELD and RAW-FIELD are the normalized and raw account keys.
+KNOWN-FIELD records explicit false values for normalized sources."
+  (when (or browse-id playlist-id)
+    (when-let* ((context (ytm-radio--view-value :context))
+                ((ytm-radio--item-detail-target-p
+                  context browse-id playlist-id)))
+      (ytm-radio--set-account-state-field
+       context keyword-field raw-field known-field value))
+    (dolist (source (map-values (ytm-radio--sources)))
+      (when (ytm-radio--source-detail-target-p source browse-id playlist-id)
+        (ytm-radio--set-account-state-field
+         source keyword-field raw-field known-field value))
+      (dolist (item (ytm-radio--source-items source))
+        (when (ytm-radio--item-detail-target-p item browse-id playlist-id)
+          (ytm-radio--set-account-state-field
+           item keyword-field raw-field known-field value))))))
+
+(defun ytm-radio--sync-detail-helper-account-state (data browse-id)
+  "Propagate account state returned by detail mutation DATA for BROWSE-ID."
+  (let ((playlist-id (or (map-elt data 'playlist-id)
+                         (map-elt data :playlist-id))))
+    (when (assq 'in-library data)
+      (ytm-radio--sync-detail-account-state
+       browse-id playlist-id
+       :in-library 'in-library :in-library-known
+       (map-elt data 'in-library)))
+    (when (assq 'subscribed data)
+      (ytm-radio--sync-detail-account-state
+       browse-id playlist-id
+       :subscribed 'subscribed :subscribed-known
+       (map-elt data 'subscribed)))))
+
+(defun ytm-radio--apply-detail-helper-data
+    (data browse-id params context &optional restore-entry)
+  "Apply refreshed detail DATA for BROWSE-ID, PARAMS, and CONTEXT.
+When RESTORE-ENTRY is non-nil, restore that browser position after rendering."
+  (ytm-radio--sync-detail-helper-account-state data browse-id)
+  (let* ((sources (ytm-radio--helper-sources data))
+         (detail-sources (ytm-radio--browse-detail-sources sources context)))
+    (unless detail-sources
+      (user-error "Helper returned no refreshed detail sources for %s" browse-id))
+    (ytm-radio--drop-source-ids (ytm-radio--view-value :source-ids))
+    (dolist (source detail-sources)
+      (ytm-radio--put-source source))
+    (setf (map-elt ytm-radio--browser-view :source-ids)
+          (mapcar (lambda (source)
+                    (map-elt source :id))
+                  detail-sources)
+          (map-elt ytm-radio--browser-view :browse-id) browse-id
+          (map-elt ytm-radio--browser-view :title)
+          (ytm-radio--source-display-title (car detail-sources)))
+    (if params
+        (setf (map-elt ytm-radio--browser-view :browse-params) params)
+      (setf (map-elt ytm-radio--browser-view :browse-params) nil))
+    (ytm-radio--save)
+    (ytm-radio--render-browser nil restore-entry)
+    (ytm-radio--render-now-playing)
+    detail-sources))
+
 (defun ytm-radio--start-browse-id-load
     (browse-id params &optional context history-entry replace restore-entry)
   "Start asynchronous detail loading for BROWSE-ID and PARAMS.
@@ -1683,55 +2004,59 @@ When RESTORE-ENTRY is non-nil, restore that browser position after loading."
                            (ytm-radio--browser-history-snapshot))))
     (ytm-radio--with-account-auth
      (lambda ()
-       (ytm-radio--set-browser-loading "Loading detail..." nil)
-       (ytm-radio--render-browser nil restore-entry)
-       (setq
-        ytm-radio--browser-load-process
-        (ytm-radio--call-helper-async
-         (ytm-radio--helper-browse-id-arguments browse-id params)
-         (lambda (data)
-           (let* ((sources (ytm-radio--helper-sources data))
-                  (detail-sources (ytm-radio--browse-detail-sources
-                                   sources context)))
-             (ytm-radio--clear-browser-loading)
-             (if (null sources)
-                 (progn
-                   (ytm-radio--render-browser)
-                   (message "No YouTube Music detail returned for %s" browse-id))
-               (dolist (source detail-sources)
-                 (ytm-radio--put-source source))
-               (ytm-radio--save)
-               (if (cdr detail-sources)
-                   (ytm-radio--set-browser-view
-                    (append
-                     (list (cons :kind 'detail)
-                           (cons :source-ids (mapcar (lambda (source)
-                                                        (map-elt source :id))
-                                                      detail-sources))
-                           (cons :browse-id browse-id)
-                           (cons :title
-                                 (ytm-radio--source-display-title
-                                  (car detail-sources))))
-                     (when params
-                       (list (cons :browse-params params)))
-                     (when context
-                       (list (cons :context context)))
-                     (when origin-view
-                       (list (cons :origin-view origin-view))))
-                    replace
-                    history-entry
-                    restore-entry)
-                 (ytm-radio--enter-source
-                  (car detail-sources) origin-view history-entry)))))
-         (lambda (diagnostic)
-           (ytm-radio--clear-browser-loading)
-           (ytm-radio--render-browser nil restore-entry)
-           (ytm-radio--handle-account-helper-error
-            diagnostic
-            (lambda ()
-              (ytm-radio--start-browse-id-load
-               browse-id params context history-entry
-               replace restore-entry)))))))
+       (let ((token (ytm-radio--new-request-token)))
+         (setq ytm-radio--browser-load-token token)
+         (ytm-radio--set-browser-loading "Loading detail..." nil)
+         (ytm-radio--render-browser nil restore-entry)
+         (setq
+          ytm-radio--browser-load-process
+          (ytm-radio--call-helper-async
+           (ytm-radio--helper-browse-id-arguments browse-id params)
+           (lambda (data)
+             (when (eq token ytm-radio--browser-load-token)
+               (let* ((sources (ytm-radio--helper-sources data))
+                      (detail-sources (ytm-radio--browse-detail-sources
+                                       sources context)))
+                 (ytm-radio--clear-browser-loading)
+                 (if (null sources)
+                     (progn
+                       (ytm-radio--render-browser)
+                       (message "No YouTube Music detail returned for %s" browse-id))
+                   (dolist (source detail-sources)
+                     (ytm-radio--put-source source))
+                   (ytm-radio--save)
+                   (if (cdr detail-sources)
+                       (ytm-radio--set-browser-view
+                        (append
+                         (list (cons :kind 'detail)
+                               (cons :source-ids (mapcar (lambda (source)
+                                                            (map-elt source :id))
+                                                          detail-sources))
+                               (cons :browse-id browse-id)
+                               (cons :title
+                                     (ytm-radio--source-display-title
+                                      (car detail-sources))))
+                         (when params
+                           (list (cons :browse-params params)))
+                         (when context
+                           (list (cons :context context)))
+                         (when origin-view
+                           (list (cons :origin-view origin-view))))
+                        replace
+                        history-entry
+                        restore-entry)
+                     (ytm-radio--enter-source
+                      (car detail-sources) origin-view history-entry))))))
+           (lambda (diagnostic)
+             (when (eq token ytm-radio--browser-load-token)
+               (ytm-radio--clear-browser-loading)
+               (ytm-radio--render-browser nil restore-entry)
+               (ytm-radio--handle-account-helper-error
+                diagnostic
+                (lambda ()
+                  (ytm-radio--start-browse-id-load
+                   browse-id params context history-entry
+                   replace restore-entry)))))))))
      "YouTube Music login required")))
 
 ;;; Playback
@@ -1918,7 +2243,8 @@ When RESTORE-ENTRY is non-nil, restore that browser position after loading."
   "Return mpv arguments for SOCKET and media URL."
   (append ytm-radio-mpv-network-cache-args
           (delq nil (list (ytm-radio--mpv-ytdl-format-argument)
-                          (ytm-radio--mpv-http-proxy-argument)))
+                          (ytm-radio--mpv-http-proxy-argument)
+                          "--pause=no"))
           ytm-radio-mpv-extra-args
           (delq nil (list (ytm-radio--mpv-raw-options-argument)
                           "--no-video"
@@ -1973,6 +2299,10 @@ When RESTORE-ENTRY is non-nil, restore that browser position after loading."
        (or (not (processp ipc))
            (memq (process-status ipc) '(open run)))))
 
+(defun ytm-radio--current-mpv-ipc-p (process)
+  "Return non-nil when PROCESS is the active mpv IPC connection."
+  (eq process (map-elt ytm-radio--player :ipc-process)))
+
 (defun ytm-radio--set-current-track-state
     (track status position playback-url using-stream-cache)
   "Set TRACK, STATUS, POSITION, PLAYBACK-URL, and USING-STREAM-CACHE."
@@ -2026,7 +2356,9 @@ When RESTORE-ENTRY is non-nil, restore that browser position after loading."
       (ytm-radio--set-current-track-state
        track 'loading nil playback-url using-stream-cache)
       (ytm-radio--save)
-      (if (ytm-radio--mpv-send (list "loadfile" playback-url "replace"))
+      (if (and (ytm-radio--mpv-send (list "loadfile" playback-url "replace"))
+               (ytm-radio--mpv-send
+                (list "set_property" "pause" :json-false)))
           (progn
             (ytm-radio--render)
             (ytm-radio--show-now-playing nil)
@@ -2234,18 +2566,20 @@ When RESTORE-ENTRY is non-nil, restore that browser position after loading."
 
 (defun ytm-radio--mpv-filter (process output)
   "Parse newline-delimited JSON OUTPUT from mpv PROCESS."
-  (let ((pending (concat (process-get process 'pending) output)))
-    (while (string-match "\n" pending)
-      (let ((line-end (match-beginning 0))
-            (next-start (match-end 0)))
-        (ytm-radio--mpv-dispatch process
-                                 (substring pending 0 line-end))
-        (setq pending (substring pending next-start))))
-    (process-put process 'pending pending)))
+  (when (ytm-radio--current-mpv-ipc-p process)
+    (let ((pending (concat (process-get process 'pending) output)))
+      (while (string-match "\n" pending)
+        (let ((line-end (match-beginning 0))
+              (next-start (match-end 0)))
+          (ytm-radio--mpv-dispatch process
+                                   (substring pending 0 line-end))
+          (setq pending (substring pending next-start))))
+      (process-put process 'pending pending))))
 
-(defun ytm-radio--mpv-dispatch (_process line)
-  "Dispatch one mpv JSON message LINE."
-  (when-let* ((msg (ignore-errors
+(defun ytm-radio--mpv-dispatch (process line)
+  "Dispatch one mpv JSON message LINE from PROCESS."
+  (when-let* (((ytm-radio--current-mpv-ipc-p process))
+              (msg (ignore-errors
                      (json-parse-string line
                                         :object-type 'alist
                                         :null-object nil
@@ -2493,7 +2827,6 @@ When AUTOMATIC is non-nil, honor single-track repeat."
     (define-key map (kbd "p") #'ytm-radio-previous)
     (define-key map (kbd "r") #'ytm-radio-cycle-repeat)
     (define-key map (kbd "s") #'ytm-radio-toggle-shuffle)
-    (define-key map (kbd "A") #'ytm-radio-current-actions)
     (define-key map (kbd "l") #'ytm-radio-like-current-track)
     (define-key map (kbd "d") #'ytm-radio-dislike-current-track)
     (define-key map (kbd "R") #'ytm-radio-start-current-track-mix)
@@ -3014,6 +3347,10 @@ When RESTORE-ENTRY is non-nil, restore that position after rendering VIEW."
   "Return non-nil when SOURCE belongs to the Library view."
   (ytm-radio--source-target-p source 'library))
 
+(defun ytm-radio--liked-source-p (source)
+  "Return non-nil when SOURCE is the Liked Music view."
+  (ytm-radio--source-target-p source 'liked))
+
 (defun ytm-radio--explore-source-p (source)
   "Return non-nil when SOURCE belongs to the Explore view."
   (ytm-radio--source-target-p source 'explore))
@@ -3161,6 +3498,12 @@ When RESTORE-ENTRY is non-nil, restore that position after rendering VIEW."
       (and (> (point) (point-min))
            (get-text-property (1- (point)) property))))
 
+(defun ytm-radio--button-at-point ()
+  "Return a text button at point or the previous character."
+  (or (button-at (point))
+      (and (> (point) (point-min))
+           (button-at (1- (point))))))
+
 (defun ytm-radio--source-at-point ()
   "Return source stored at point, or nil."
   (ytm-radio--point-property 'ytm-radio-source))
@@ -3286,8 +3629,8 @@ HISTORY-ENTRY is the browser location to return to from the section."
   (car-safe (ytm-radio--item-detail-browse item)))
 
 (defun ytm-radio--open-url-as-source (url)
-  "Fetch URL as a source asynchronously and show it."
-  (ytm-radio--start-url-import url #'ytm-radio--enter-source))
+  "Fetch URL asynchronously and play it as a transient source."
+  (ytm-radio--start-url-import url #'ytm-radio--play-source-object))
 
 (defun ytm-radio--open-browse-id-as-source
     (browse-id &optional params context history-entry)
@@ -3490,13 +3833,14 @@ When HISTORY-ENTRY is non-nil, restore its stored browser position."
   (when (and (eq (ytm-radio--view-kind) 'home)
              (not ytm-radio--initial-home-refreshed)
              (not ytm-radio--home-loading)
-             (not (ytm-radio--target-cached-p "home")))
+             (or (not (ytm-radio--target-cached-p "home"))
+                 (not (ytm-radio--home-continuation-known-p))))
     (ytm-radio--start-home-load)))
 
 (defun ytm-radio--home-can-lazy-load-p ()
   "Return non-nil when Home can load its next continuation page."
   (and (eq (ytm-radio--view-kind) 'home)
-       ytm-radio--home-continuation
+       (ytm-radio--home-continuation)
        (not ytm-radio--home-loading)
        (not (process-live-p ytm-radio--home-process))))
 
@@ -4089,7 +4433,7 @@ slices so covers do not appear split in the middle."
 
 (defun ytm-radio--track-rating-indicator (track)
   "Return a display marker for TRACK's like status, or nil."
-  (pcase (map-elt track :like-status)
+  (pcase (ytm-radio--track-like-status track)
     ('like
      (concat " " (ytm-radio--mdicon "nf-md-thumb_up" "▲")))
     ('dislike
@@ -4162,10 +4506,10 @@ When COMPACT is non-nil, render only the title row."
          (two-line-p (or thumbnail metadata (not (string-empty-p detail))))
          (gapless-thumbnail-p (and thumbnail two-line-p))
          (track (ytm-radio--item-track item source))
-         (rating-indicator (unless (ytm-radio--library-source-p source)
+         (rating-indicator (unless (ytm-radio--liked-source-p source)
                              (ytm-radio--track-rating-indicator track)))
-         (status-indicator (or rating-indicator
-                               (ytm-radio--item-status-indicator source item)))
+         (item-status-indicator (ytm-radio--item-status-indicator source item))
+         (status-indicator (or rating-indicator item-status-indicator))
          (title (ytm-radio--truncate
                  (ytm-radio--item-title item)
                  (ytm-radio--track-title-width 56 status-indicator)))
@@ -4178,13 +4522,16 @@ When COMPACT is non-nil, render only the title row."
                                         nil))
     (ytm-radio--insert-item-prefix prefix detail-prefix)
     (if actionable
-        (ytm-radio--insert-action-button
-         title
-         (lambda () (ytm-radio--open-item source item))
-         'ytm-radio-item-title)
-      (insert title))
-    (when status-indicator
-      (insert status-indicator))
+      (ytm-radio--insert-action-button
+       title
+       (lambda () (ytm-radio--open-item source item))
+       'ytm-radio-item-title)
+    (insert title))
+    (cond
+     (rating-indicator
+      (insert rating-indicator))
+     (item-status-indicator
+      (insert item-status-indicator)))
     (ytm-radio--insert-item-row-newline (and gapless-thumbnail-p
                                              (not compact)))
     (when (and two-line-p (not compact))
@@ -5311,12 +5658,17 @@ When FOCUS is non-nil, focus the now-playing child frame."
   "Open the ytm-radio source or item at point."
   (interactive)
   (ytm-radio--ensure-loaded)
-  (if-let* ((item (ytm-radio--item-at-point))
-            (source (ytm-radio--line-source-at-point)))
-      (ytm-radio--open-item source item)
-    (if-let* ((source (ytm-radio--source-at-point)))
-        (ytm-radio--enter-source source)
-      (user-error "No ytm-radio item at point"))))
+  (if-let* ((button (ytm-radio--button-at-point)))
+      (push-button button)
+    (if-let* ((item (ytm-radio--item-at-point))
+              (source (ytm-radio--line-source-at-point)))
+        (ytm-radio--open-item source item)
+      (if-let* ((source (ytm-radio--source-at-point)))
+          (if (and (eq (ytm-radio--view-kind) 'detail)
+                   (ytm-radio--source-header-p source))
+              (user-error "Detail header has no section")
+            (ytm-radio--enter-source source))
+        (user-error "No ytm-radio item at point")))))
 
 ;;;###autoload
 (defun ytm-radio-back ()
@@ -5462,8 +5814,8 @@ When AFTER-SUCCESS is non-nil, call it after importing auth."
     (lambda (_data)
      (setq ytm-radio--login-process nil
             ytm-radio-helper-auth-file (expand-file-name output)
-            ytm-radio--initial-home-refreshed nil
-            ytm-radio--home-continuation nil)
+            ytm-radio--initial-home-refreshed nil)
+      (ytm-radio--set-home-continuation nil)
       (ytm-radio--set-login-status nil)
       (ytm-radio--clear-helper-bootstrap-cache)
       (ytm-radio--drop-account-helper-sources)
@@ -5537,7 +5889,7 @@ When AFTER-SUCCESS is non-nil, call it after importing auth."
 
 ;;;###autoload
 (defun ytm-radio-add-url (url)
-  "Add URL as a source and play its first track."
+  "Play URL as a transient source."
   (interactive (list (read-string "YouTube or YouTube Music URL: ")))
   (ytm-radio--ensure-loaded)
   (ytm-radio--start-url-import url #'ytm-radio--play-source-object))
@@ -5687,6 +6039,33 @@ When AFTER-SUCCESS is non-nil, call it after importing auth."
         (and item-id track-id (equal item-id track-id))
         (and item-url track-url (equal item-url track-url)))))
 
+(defun ytm-radio--item-like-status (item)
+  "Return ITEM's normalized like status, or nil."
+  (when item
+    (ytm-radio--normalized-like-status
+     (or (map-elt item :like-status)
+         (map-elt item 'like-status)))))
+
+(defun ytm-radio--cached-track-like-status (track)
+  "Return cached like status for TRACK from matching source entries."
+  (when track
+    (catch 'status
+      (dolist (source (map-values (ytm-radio--sources)))
+        (dolist (candidate (map-elt source :tracks))
+          (when (ytm-radio--item-same-track-p candidate track)
+            (when-let* ((status (ytm-radio--item-like-status candidate)))
+              (throw 'status status))))
+        (dolist (item (map-elt source :items))
+          (when (and (ytm-radio--helper-track-item-p item)
+                     (ytm-radio--item-same-track-p item track))
+            (when-let* ((status (ytm-radio--item-like-status item)))
+              (throw 'status status))))))))
+
+(defun ytm-radio--track-like-status (track)
+  "Return TRACK's like status, falling back to cached matching entries."
+  (or (ytm-radio--item-like-status track)
+      (ytm-radio--cached-track-like-status track)))
+
 (defun ytm-radio--set-alist-value (alist key value)
   "Set KEY to VALUE in ALIST, adding KEY when VALUE is non-nil."
   (if-let* ((cell (assq key alist)))
@@ -5705,57 +6084,6 @@ When AFTER-SUCCESS is non-nil, call it after importing auth."
             (map-elt item 'url))
     (ytm-radio--set-alist-value
      item 'like-status (ytm-radio--like-status-json-value status))))
-
-(defun ytm-radio--source-browse-id (source)
-  "Return SOURCE's YouTube Music browse id, or nil."
-  (or (and-let* ((source-id (map-elt source :id))
-                 ((string-match "\\`ytm:browse:\\([^:]+\\)" source-id)))
-        (match-string 1 source-id))
-      (and-let* ((source-id (map-elt source :id))
-                 ((string-match "\\`ytm:channel:\\([^:]+\\)" source-id)))
-        (match-string 1 source-id))
-      (ytm-radio--music-url-detail-browse-id (map-elt source :url))))
-
-(defun ytm-radio--item-same-browse-id-p (item browse-id)
-  "Return non-nil when ITEM identifies BROWSE-ID."
-  (let ((item-browse-id (ytm-radio--item-browse-id item))
-        (playlist-browse-id
-         (ytm-radio--playlist-browse-id (ytm-radio--item-playlist-id item)))
-        (url-browse-id
-         (ytm-radio--music-url-detail-browse-id (ytm-radio--item-url item)))
-        (item-id (ytm-radio--item-id item)))
-    (member browse-id
-            (delq nil (list item-browse-id playlist-browse-id
-                            url-browse-id item-id)))))
-
-(defun ytm-radio--set-account-state-field (object keyword-key symbol-key value)
-  "Set OBJECT account state under KEYWORD-KEY or SYMBOL-KEY to VALUE."
-  (when (or (assq keyword-key object)
-            (map-elt object :id)
-            (map-elt object :url)
-            (map-elt object :source-id))
-    (ytm-radio--set-alist-value object keyword-key value)
-    (pcase keyword-key
-      (:in-library
-       (ytm-radio--set-alist-value object :in-library-known t))
-      (:subscribed
-       (ytm-radio--set-alist-value object :subscribed-known t))))
-  (when (or (assq symbol-key object)
-            (map-elt object 'id)
-            (map-elt object 'url))
-    (ytm-radio--set-alist-value object symbol-key value)))
-
-(defun ytm-radio--sync-browse-account-state
-    (browse-id keyword-key symbol-key value)
-  "Propagate account state VALUE for BROWSE-ID.
-KEYWORD-KEY and SYMBOL-KEY are the storage keys used by cached sources and raw
-helper items."
-  (dolist (source (map-values (ytm-radio--sources)))
-    (when (equal (ytm-radio--source-browse-id source) browse-id)
-      (ytm-radio--set-account-state-field source keyword-key symbol-key value))
-    (dolist (item (map-elt source :items))
-      (when (ytm-radio--item-same-browse-id-p item browse-id)
-        (ytm-radio--set-account-state-field item keyword-key symbol-key value)))))
 
 (defun ytm-radio--sync-source-like-status (track status)
   "Propagate TRACK like STATUS to cached source tracks and items."
@@ -5789,9 +6117,10 @@ helper items."
 
 (defun ytm-radio--apply-track-status (track data)
   "Apply account status DATA to TRACK and refresh visible UI."
-  (ytm-radio--set-track-like-status
-   track
-   (ytm-radio--normalized-like-status (map-elt data 'like-status)))
+  (when (assq 'like-status data)
+    (ytm-radio--set-track-like-status
+     track
+     (ytm-radio--normalized-like-status (map-elt data 'like-status))))
   (when (assq 'in-library data)
     (ytm-radio--set-track-library-status track (map-elt data 'in-library))))
 
@@ -5860,7 +6189,7 @@ helper items."
   (ytm-radio--ensure-loaded)
   (let* ((track (or (ytm-radio--current-track)
                     (user-error "Nothing is playing")))
-         (rating (if (eq (map-elt track :like-status) 'like)
+         (rating (if (eq (ytm-radio--track-like-status track) 'like)
                      'indifferent
                    'like)))
     (ytm-radio--rate-current-track rating)))
@@ -5872,14 +6201,14 @@ helper items."
   (ytm-radio--ensure-loaded)
   (let* ((track (or (ytm-radio--current-track)
                     (user-error "Nothing is playing")))
-         (rating (if (eq (map-elt track :like-status) 'dislike)
+         (rating (if (eq (ytm-radio--track-like-status track) 'dislike)
                      'indifferent
                    'dislike)))
     (ytm-radio--rate-current-track rating)))
 
 (defun ytm-radio--current-track-like-status ()
   "Return the current track like status, or nil."
-  (map-elt (ytm-radio--current-track) :like-status))
+  (ytm-radio--track-like-status (ytm-radio--current-track)))
 
 (defun ytm-radio--current-like-action-label ()
   "Return the current-track like action label."
@@ -5997,9 +6326,8 @@ DESCRIPTION is used in the user error."
           (lambda (data)
             (let ((in-library (map-elt data 'in-library)))
               (ytm-radio--clear-helper-response-cache)
-              (ytm-radio--sync-browse-account-state
-               browse-id :in-library 'in-library in-library)
-              (ytm-radio--render-browser)
+              (ytm-radio--apply-detail-helper-data
+               data browse-id params (ytm-radio--view-value :context))
               (message "%s library"
                        (if in-library "Saved to" "Removed from"))))
           (lambda (diagnostic)
@@ -6027,9 +6355,8 @@ DESCRIPTION is used in the user error."
           (lambda (data)
             (let ((subscribed (map-elt data 'subscribed)))
               (ytm-radio--clear-helper-response-cache)
-              (ytm-radio--sync-browse-account-state
-               browse-id :subscribed 'subscribed subscribed)
-              (ytm-radio--render-browser)
+              (ytm-radio--apply-detail-helper-data
+               data browse-id params (ytm-radio--view-value :context))
               (message "%s" (if subscribed "Subscribed" "Unsubscribed"))))
           (lambda (diagnostic)
             (ytm-radio--handle-account-helper-error diagnostic action)))))
@@ -6187,8 +6514,8 @@ DESCRIPTION is used in the user error."
     ("SPC" "Pause/resume" ytm-radio-toggle-pause)
     ("n" "Next" ytm-radio-next)
     ("p" "Previous" ytm-radio-previous)
-   ("r" "Repeat" ytm-radio-cycle-repeat)
-   ("s" "Shuffle" ytm-radio-toggle-shuffle)]
+    ("r" "Repeat" ytm-radio-cycle-repeat)
+    ("s" "Shuffle" ytm-radio-toggle-shuffle)]
    ["Track"
     ("l" ytm-radio-like-current-track
      :description ytm-radio--current-like-action-label)

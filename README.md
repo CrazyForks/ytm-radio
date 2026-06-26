@@ -2,9 +2,9 @@
 
 An experimental Emacs audio player for YouTube and YouTube Music.
 
-`yt-dlp` discovers URL metadata for URL imports, and `mpv` plays audio with
-video disabled. Emacs owns the catalog, playback state, selection commands,
-and UI.
+`yt-dlp` discovers URL metadata for transient URL playback, and `mpv` plays
+audio with video disabled. Emacs owns playback state, selection commands, and
+the YouTube Music browser UI.
 
 YouTube Music account access is a separate Rust CLI. It is not an Emacs
 dynamic module and does not run as a resident service. Emacs starts one
@@ -14,7 +14,7 @@ process for a request, reads a versioned JSON response, and the process exits.
 
 Implemented:
 
-- add YouTube and YouTube Music URLs through `yt-dlp`;
+- play YouTube and YouTube Music URLs transiently through `yt-dlp`;
 - normalize playlists, channels, and tracks into a local catalog;
 - play through `mpv --no-video`;
 - pause, next, previous, stop, and seek through mpv IPC;
@@ -38,8 +38,7 @@ Implemented:
 - save/remove library tracks, add tracks to playlists, start mixes, save/remove
   detail albums and playlists, subscribe/unsubscribe detail artists and channels,
   and manage the runtime queue from current-track actions;
-- import deterministic mock account data;
-- reject unsupported helper JSON schema versions.
+- reject unsupported helper schema, protocol, and binary versions.
 
 Not implemented yet:
 
@@ -94,7 +93,8 @@ Music modules such as listen-again, mixed-for-you, albums, playlists, artists,
 and liked music when the web response includes them.
 Home, Explore, and Library use cached sections first and only load asynchronously
 when a view has no cached data or when explicitly refreshed. Home continuation
-pages load lazily when the visible Home buffer reaches the rendered end.
+pages load lazily when the visible Home buffer reaches the rendered end, and the
+next Home continuation token is stored with the durable browser state.
 
 The child frame is a compact now-playing surface. It fits itself to the current
 cover image, shows title, artist, time, and progress, and exposes the core
@@ -152,7 +152,7 @@ directory, and the auth file are visible from Emacs.
 - `M-x ytm-radio-home` switches to Home.
 - `M-x ytm-radio-explore` switches to Explore.
 - `M-x ytm-radio-library` switches to Library.
-- `M-x ytm-radio-add-url` adds a YouTube or YouTube Music URL asynchronously.
+- `M-x ytm-radio-add-url` plays a YouTube or YouTube Music URL asynchronously.
 - `M-x ytm-radio-import-ytmusic-library` imports library sources.
 - `M-x ytm-radio-import-ytmusic-home` imports home recommendations.
 - `M-x ytm-radio-more` opens hidden items in the current section.
@@ -259,32 +259,20 @@ The CLI surface is:
 ```text
 ytm-radio-helper auth check --auth FILE
 ytm-radio-helper auth login-window --output FILE [--browser BROWSER] [--profile-dir DIR] [--port N] [--timeout-secs N] [--restart-running]
+ytm-radio-helper version
 ytm-radio-helper browse home --auth FILE [--limit N] [--initial-only]
-ytm-radio-helper browse home --mock [--limit N] [--initial-only]
 ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N]
-ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --mock [--limit N]
 ytm-radio-helper browse-id BROWSE_ID --auth FILE [--params PARAMS] [--limit N]
-ytm-radio-helper browse-id BROWSE_ID --mock [--params PARAMS] [--limit N]
 ytm-radio-helper continuation TOKEN --auth FILE [--limit N]
-ytm-radio-helper continuation TOKEN --mock [--limit N]
 ytm-radio-helper search QUERY --auth FILE [--limit N]
-ytm-radio-helper search QUERY --mock [--limit N]
 ytm-radio-helper rate VIDEO_ID like|dislike|indifferent --auth FILE
-ytm-radio-helper rate VIDEO_ID like|dislike|indifferent --mock
 ytm-radio-helper radio VIDEO_ID --auth FILE [--limit N]
-ytm-radio-helper radio VIDEO_ID --mock [--limit N]
 ytm-radio-helper playlist-options VIDEO_ID --auth FILE
-ytm-radio-helper playlist-options VIDEO_ID --mock
 ytm-radio-helper add-to-playlist VIDEO_ID PLAYLIST_ID --auth FILE
-ytm-radio-helper add-to-playlist VIDEO_ID PLAYLIST_ID --mock
 ytm-radio-helper library VIDEO_ID toggle|save|remove --auth FILE
-ytm-radio-helper library VIDEO_ID toggle|save|remove --mock
 ytm-radio-helper item-library BROWSE_ID toggle|save|remove --auth FILE [--params PARAMS]
-ytm-radio-helper item-library BROWSE_ID toggle|save|remove --mock [--params PARAMS]
 ytm-radio-helper subscription BROWSE_ID toggle|subscribe|unsubscribe --auth FILE [--params PARAMS]
-ytm-radio-helper subscription BROWSE_ID toggle|subscribe|unsubscribe --mock [--params PARAMS]
 ytm-radio-helper track-status VIDEO_ID --auth FILE
-ytm-radio-helper track-status VIDEO_ID --mock
 ```
 
 For `home`, `explore`, and `library`, the helper preserves YouTube Music
@@ -308,15 +296,19 @@ like, dislike, and remove-rating endpoints.
 feedback tokens fetched by the helper. `item-library` does the same for album
 and playlist detail pages, using a feedback token when one is present and the
 playlist/album rating endpoint otherwise. `subscription` toggles artist/channel
-subscriptions from a detail browse id. `track-status` reads the current account
+subscriptions from a detail browse id. Detail library and subscription mutations
+return the requested target state as soon as YouTube Music accepts the mutation;
+they do not wait for a second detail fetch to verify eventual consistency.
+`track-status` reads the current account
 like/dislike and library state without mutating the song; the Emacs UI uses it
-to refresh the current track after playback starts.
+to refresh the current track after playback starts. When rating state is not
+available, `track-status` omits `like-status`; a present JSON null means the
+track is known to be unrated.
 
-URL imports remain a general `yt-dlp` compatibility path. They do not store
-YouTube Music menu tokens, but actions that only need a video id, such as
-like, dislike, radio, and add-to-playlist, can still work when the imported
-track URL or id contains a YouTube video id. Library save/remove fetches the
-needed token at action time through the helper.
+URL playback remains a general `yt-dlp` compatibility path. It is transient and
+does not store YouTube Music menu tokens. Actions that need YouTube Music
+account state are intended for YouTube Music helper-backed tracks and detail
+pages.
 
 Responses use a stable envelope:
 
@@ -324,6 +316,8 @@ Responses use a stable envelope:
 {
   "ok": true,
   "schema": 1,
+  "protocol": 1,
+  "helper-version": "0.1.1",
   "data": {
     "sources": []
   },
@@ -422,15 +416,6 @@ The default login timeout is 180 seconds:
 ```elisp
 (setq ytm-radio-helper-login-timeout 180)
 ```
-
-For deterministic local testing without account access:
-
-```elisp
-(setq ytm-radio-helper-use-mock-data t)
-```
-
-Then open Home, Explore, Library, Search, or a detail page. Mock mode does not
-require an auth file.
 
 The default file is reused automatically in future Emacs sessions. For a
 custom location:

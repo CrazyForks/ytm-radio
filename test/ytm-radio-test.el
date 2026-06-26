@@ -10,6 +10,42 @@
 (require 'map)
 (require 'ytm-radio)
 
+(defvar ytm-radio-test--data-directory
+  (file-name-as-directory (make-temp-file "ytm-radio-test-data-" t))
+  "Directory used for ytm-radio test runtime files.")
+
+(setq ytm-radio-data-directory ytm-radio-test--data-directory
+      ytm-radio-state-file
+      (expand-file-name "state.eld" ytm-radio-test--data-directory)
+      ytm-radio-helper-auth-file
+      (expand-file-name "auth.json" ytm-radio-test--data-directory)
+      ytm-radio-helper-install-directory
+      (expand-file-name "bin/" ytm-radio-test--data-directory)
+      ytm-radio-cover-cache-directory
+      (expand-file-name "covers/" ytm-radio-test--data-directory))
+
+(defun ytm-radio-test--detail-helper-source
+    (browse-id kind title &rest fields)
+  "Return a raw helper detail source for BROWSE-ID, KIND, and TITLE.
+FIELDS are appended as extra raw helper fields."
+  (append `((id . ,(format "ytm:browse:%s:header" browse-id))
+            (kind . ,kind)
+            (title . ,title)
+            (url . ,(format "https://music.youtube.com/browse/%s" browse-id))
+            (items . nil))
+          fields))
+
+(defun ytm-radio-test--detail-helper-data
+    (browse-id kind title &rest fields)
+  "Return raw helper detail mutation data for BROWSE-ID, KIND, and TITLE.
+FIELDS are included on both the top-level mutation output and source."
+  (let ((source (apply #'ytm-radio-test--detail-helper-source
+                       browse-id kind title fields)))
+    (append `((browse-id . ,browse-id)
+              (changed . t)
+              (sources . (,source)))
+            fields)))
+
 (ert-deftest ytm-radio-source-from-json-normalizes-music-playlist ()
   "Normalize YouTube Music playlist JSON into source and tracks."
   (let* ((json (json-parse-string
@@ -67,8 +103,95 @@
     (should (eq (map-elt source :kind) 'youtube-channel))
     (should (equal (map-elt source :id) "UC1"))))
 
+(ert-deftest ytm-radio-state-file-requires-current-version ()
+  "Reject durable state files that do not match the current state version."
+  (let ((ytm-radio-state-file (make-temp-file "ytm-radio-state-")))
+    (unwind-protect
+        (progn
+          (with-temp-file ytm-radio-state-file
+            (prin1 (list (cons :version 0)
+                         (cons :sources nil)
+                         (cons :last-track-id nil))
+                   (current-buffer)))
+          (should-error (ytm-radio--read-state-file) :type 'user-error))
+      (when (file-exists-p ytm-radio-state-file)
+        (delete-file ytm-radio-state-file)))))
+
+(ert-deftest ytm-radio-state-file-disables-read-eval ()
+  "Read durable state with `read-eval' disabled and restored afterward."
+  (let ((ytm-radio-state-file (make-temp-file "ytm-radio-state-"))
+        (read-eval t))
+    (unwind-protect
+        (progn
+          (with-temp-file ytm-radio-state-file
+            (insert "#.(error \"read-eval executed\")"))
+          (should-error (ytm-radio--read-state-file))
+          (should read-eval))
+      (when (file-exists-p ytm-radio-state-file)
+        (delete-file ytm-radio-state-file)))))
+
+(ert-deftest ytm-radio-state-file-handles-unbound-read-eval ()
+  "Read durable state without requiring `read-eval' to be globally bound."
+  (let* ((ytm-radio-state-file (make-temp-file "ytm-radio-state-"))
+         (read-eval-symbol (intern "read-eval"))
+         (read-eval-bound (boundp read-eval-symbol))
+         (old-read-eval (and read-eval-bound
+                             (symbol-value read-eval-symbol))))
+    (unwind-protect
+        (progn
+          (makunbound read-eval-symbol)
+          (with-temp-file ytm-radio-state-file
+            (prin1 (list (cons :version ytm-radio--state-version)
+                         (cons :sources nil)
+                         (cons :last-track-id nil))
+                   (current-buffer)))
+          (should (ytm-radio--read-state-file))
+          (should-not (boundp read-eval-symbol)))
+      (if read-eval-bound
+          (set read-eval-symbol old-read-eval)
+        (when (boundp read-eval-symbol)
+          (makunbound read-eval-symbol)))
+      (when (file-exists-p ytm-radio-state-file)
+        (delete-file ytm-radio-state-file)))))
+
+(ert-deftest ytm-radio-state-file-persists-home-continuation ()
+  "Persist Home continuation tokens across sessions."
+  (let ((ytm-radio-state-file (make-temp-file "ytm-radio-state-"))
+        (ytm-radio--state
+         (ytm-radio--make-state
+          :home-continuation "next-page"
+          :home-continuation-known t)))
+    (unwind-protect
+        (progn
+          (ytm-radio--save)
+          (setq ytm-radio--state (ytm-radio--make-state))
+          (ytm-radio--load)
+          (should (equal (ytm-radio--home-continuation) "next-page"))
+          (should (equal (map-elt ytm-radio--state :home-continuation)
+                         "next-page"))
+          (should (map-elt ytm-radio--state :home-continuation-known)))
+      (when (file-exists-p ytm-radio-state-file)
+        (delete-file ytm-radio-state-file)))))
+
+(ert-deftest ytm-radio-state-file-treats-missing-home-continuation-as-unknown ()
+  "Treat old state files without Home continuation as needing refresh."
+  (let ((ytm-radio-state-file (make-temp-file "ytm-radio-state-"))
+        (ytm-radio--state (ytm-radio--make-state)))
+    (unwind-protect
+        (progn
+          (with-temp-file ytm-radio-state-file
+            (prin1 (list (cons :version ytm-radio--state-version)
+                         (cons :sources nil)
+                         (cons :last-track-id nil))
+                   (current-buffer)))
+          (ytm-radio--load)
+          (should-not (ytm-radio--home-continuation))
+          (should-not (map-elt ytm-radio--state :home-continuation-known)))
+      (when (file-exists-p ytm-radio-state-file)
+        (delete-file ytm-radio-state-file)))))
+
 (ert-deftest ytm-radio-add-url-imports-asynchronously ()
-  "Add URLs through async yt-dlp import without blocking."
+  "Play URLs through async yt-dlp import without storing them."
   (let* ((ytm-radio--loaded t)
          (ytm-radio--state (ytm-radio--make-state))
          (ytm-radio--player (ytm-radio--make-player))
@@ -84,13 +207,15 @@
                                  :url "https://youtu.be/v1"))))
          imported-url
          import-success
-         played-source)
+         played-source
+         saved)
     (cl-letf (((symbol-function 'ytm-radio--fetch-source-async)
                (lambda (url success _error-callback)
                  (setq imported-url url)
                  (setq import-success success)
                  'process))
-              ((symbol-function 'ytm-radio--save) #'ignore)
+              ((symbol-function 'ytm-radio--save)
+               (lambda () (setq saved t)))
               ((symbol-function 'ytm-radio--play-source-object)
                (lambda (played)
                  (setq played-source played)))
@@ -101,8 +226,8 @@
       (should (eq ytm-radio--add-url-process 'process))
       (funcall import-success source)
       (should (eq played-source source))
-      (should (equal (map-elt (cdr (assoc "src" (ytm-radio--sources))) :title)
-                     "Source"))
+      (should-not (ytm-radio--source "src"))
+      (should-not saved)
       (should-not ytm-radio--add-url-process))))
 
 (ert-deftest ytm-radio-yt-dlp-arguments-include-proxy ()
@@ -146,6 +271,7 @@
                      "--demuxer-readahead-secs=60"
                      "--demuxer-max-bytes=256MiB"
                      "--ytdl-format=bestaudio/best"
+                     "--pause=no"
                      "--really-quiet"
                      "--ytdl-raw-options=cookies-from-browser=chrome,proxy=http://127.0.0.1:8888"
                      "--no-video"
@@ -162,6 +288,7 @@
     (should (equal (ytm-radio--mpv-arguments "sock" "url")
                    '("--ytdl-format=bestaudio/best"
                      "--http-proxy=http://127.0.0.1:8888"
+                     "--pause=no"
                      "--really-quiet"
                      "--ytdl-raw-options=cookies-from-browser=chrome,proxy=http://127.0.0.1:8888"
                      "--no-video"
@@ -177,10 +304,11 @@
                                     "--ytdl-format=worstaudio/best"))
         (ytm-radio-proxy-url nil)
         (ytm-radio-ytdl-raw-options nil))
-    (should (equal (seq-take (ytm-radio--mpv-arguments "sock" "url") 5)
+    (should (equal (seq-take (ytm-radio--mpv-arguments "sock" "url") 6)
                    '("--cache=yes"
                      "--demuxer-readahead-secs=60"
                      "--ytdl-format=bestaudio/best"
+                     "--pause=no"
                      "--demuxer-readahead-secs=5"
                      "--ytdl-format=worstaudio/best")))))
 
@@ -382,6 +510,7 @@
                         "https://music.youtube.com/watch?v=b"
                         "replace")
                       commands))
+      (should (member '("set_property" "pause" :json-false) commands))
       (should (equal (map-elt ytm-radio--player :current-track) track-b))
       (should (eq (map-elt ytm-radio--player :status) 'loading))
       (should (= (map-elt ytm-radio--player :duration) 200))
@@ -659,12 +788,13 @@
                       :title "Stale Home"))
          (ytm-radio--state
           (ytm-radio--make-state
-           :sources (list (cons (map-elt stale-home :id) stale-home))))
+           :sources (list (cons (map-elt stale-home :id) stale-home))
+           :home-continuation nil
+           :home-continuation-known t))
         (ytm-radio--player (ytm-radio--make-player))
         (ytm-radio--loaded t)
         (ytm-radio--browser-view 'home)
         (ytm-radio--initial-home-refreshed nil)
-        (ytm-radio-helper-use-mock-data nil)
         (ytm-radio-helper-auth-file "/tmp/ytm-radio-auth.json")
         started)
     (cl-letf (((symbol-function 'file-readable-p)
@@ -677,6 +807,31 @@
       (ytm-radio)
       (should-not started))))
 
+(ert-deftest ytm-radio-open-refreshes-cached-home-with-unknown-continuation ()
+  "Refresh old cached Home state when continuation was never persisted."
+  (let* ((stale-home (ytm-radio--make-source
+                      :id "ytm:home:stale"
+                      :kind 'youtube-music-home-section
+                      :title "Stale Home"))
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons (map-elt stale-home :id) stale-home))))
+        (ytm-radio--player (ytm-radio--make-player))
+        (ytm-radio--loaded t)
+        (ytm-radio--browser-view 'home)
+        (ytm-radio--initial-home-refreshed nil)
+        (ytm-radio-helper-auth-file "/tmp/ytm-radio-auth.json")
+        started)
+    (cl-letf (((symbol-function 'file-readable-p)
+               (lambda (file) (equal file "/tmp/ytm-radio-auth.json")))
+              ((symbol-function 'ytm-radio--show-buffer)
+               (lambda (_buffer) nil))
+              ((symbol-function 'ytm-radio--start-home-load)
+               (lambda (&optional append)
+                 (setq started (if append 'append 'initial)))))
+      (ytm-radio)
+      (should (eq started 'initial)))))
+
 (ert-deftest ytm-radio-opens-with-home-import-when-auth-exists-and-no-cache ()
   "Refresh Home on first browser open when account auth is available and uncached."
   (let ((ytm-radio--state (ytm-radio--make-state))
@@ -684,7 +839,6 @@
         (ytm-radio--loaded t)
         (ytm-radio--browser-view 'home)
         (ytm-radio--initial-home-refreshed nil)
-        (ytm-radio-helper-use-mock-data nil)
         (ytm-radio-helper-auth-file "/tmp/ytm-radio-auth.json")
         started)
     (cl-letf (((symbol-function 'file-readable-p)
@@ -707,7 +861,6 @@
          (ytm-radio--browser-view 'home)
          (ytm-radio--initial-home-refreshed nil)
          (ytm-radio--login-process nil)
-         (ytm-radio-helper-use-mock-data nil)
          (ytm-radio-helper-auth-file auth-file)
          captured-output
          captured-continuation)
@@ -741,7 +894,9 @@
          (ytm-radio--browser-view 'home)
          (ytm-radio--state
           (ytm-radio--make-state
-           :sources (list (cons (map-elt source :id) source))))
+           :sources (list (cons (map-elt source :id) source))
+           :home-continuation "next-page"
+           :home-continuation-known t))
          (ytm-radio--player (ytm-radio--make-player)))
     (with-current-buffer (ytm-radio--buffer)
       (let ((inhibit-read-only t))
@@ -759,7 +914,7 @@
                   'ytm-radio-item-title)))))
 
 (ert-deftest ytm-radio-render-track-rating-indicators ()
-  "Render liked and disliked markers after track titles."
+  "Render liked and disliked markers directly after track titles."
   (let* ((source (ytm-radio--make-source
                   :id "ytm:home"
                   :kind 'youtube-music-home
@@ -787,9 +942,85 @@
                (lambda (_name fallback) fallback)))
       (ytm-radio--render))
     (with-current-buffer "*ytm-radio*"
-      (should (string-match-p (regexp-quote "Liked Song ▲")
-                              (buffer-string)))
-      (should (string-match-p (regexp-quote "Disliked Song ▼")
+      (let ((case-fold-search nil))
+        (should (string-match-p (regexp-quote "Liked Song ▲")
+                                (buffer-string)))
+        (should (string-match-p (regexp-quote "Disliked Song ▼")
+                                (buffer-string)))
+        (should-not (string-match-p "Liked Song[[:space:]]\\{2,\\}▲"
+                                    (buffer-string)))
+        (should-not (string-match-p "Disliked Song[[:space:]]\\{2,\\}▼"
+                                    (buffer-string)))
+        (goto-char (point-min))
+        (search-forward " ▲")
+        (should-not (get-text-property (1+ (match-beginning 0)) 'button))
+        (should-not (get-text-property (1+ (match-beginning 0)) 'action))
+        (should-not (get-text-property (1+ (match-beginning 0)) 'follow-link))
+        (search-forward " ▼")
+        (should-not (get-text-property (1+ (match-beginning 0)) 'button))))))
+
+(ert-deftest ytm-radio-render-explore-track-rating-indicators ()
+  "Render Explore track rating markers directly after track titles."
+  (let* ((source (ytm-radio--make-source
+                  :id "ytm:explore:new"
+                  :kind 'youtube-music-explore-section
+                  :title "New releases"
+                  :url "https://music.youtube.com/explore"
+                  :items '(((type . "track")
+                            (id . "liked")
+                            (title . "Explore Song")
+                            (url . "https://music.youtube.com/watch?v=liked")
+                            (like-status . "like")))))
+         (ytm-radio--browser-view 'explore)
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons (map-elt source :id) source))))
+         (ytm-radio--player (ytm-radio--make-player)))
+    (with-current-buffer (ytm-radio--buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (cl-letf (((symbol-function 'ytm-radio--mdicon)
+               (lambda (_name fallback) fallback)))
+      (ytm-radio--render))
+    (with-current-buffer "*ytm-radio*"
+      (should (string-match-p (regexp-quote "Explore Song ▲")
+                              (buffer-string))))))
+
+(ert-deftest ytm-radio-render-home-rating-from-cached-library-state ()
+  "Render Home track ratings known from another cached source."
+  (let* ((home-source (ytm-radio--make-source
+                       :id "ytm:home:listen-again"
+                       :kind 'youtube-music-home-section
+                       :title "Listen again"
+                       :url "https://music.youtube.com/"
+                       :items '(((type . "track")
+                                 (id . "2KoWN3sAFms")
+                                 (title . "bonus funk")
+                                 (url . "https://music.youtube.com/watch?v=2KoWN3sAFms")))))
+         (library-source (ytm-radio--make-source
+                          :id "ytm:library:songs"
+                          :kind 'youtube-music-library-section
+                          :title "Library Songs"
+                          :url "https://music.youtube.com/library/songs"
+                          :items '(((type . "track")
+                                    (id . "2KoWN3sAFms")
+                                    (title . "bonus funk")
+                                    (url . "https://music.youtube.com/watch?v=2KoWN3sAFms")
+                                    (like-status . "like")))))
+         (ytm-radio--browser-view 'home)
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons (map-elt home-source :id) home-source)
+                          (cons (map-elt library-source :id) library-source))))
+         (ytm-radio--player (ytm-radio--make-player)))
+    (with-current-buffer (ytm-radio--buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (cl-letf (((symbol-function 'ytm-radio--mdicon)
+               (lambda (_name fallback) fallback)))
+      (ytm-radio--render))
+    (with-current-buffer "*ytm-radio*"
+      (should (string-match-p (regexp-quote "bonus funk ▲")
                               (buffer-string))))))
 
 (ert-deftest ytm-radio-render-item-account-status-indicators ()
@@ -842,7 +1073,7 @@
                     'nerd-icons-test-face))))))
 
 (ert-deftest ytm-radio-render-library-items-are-compact ()
-  "Render Library items without secondary detail lines or redundant markers."
+  "Render Library song items compactly while preserving ratings."
   (let* ((source (ytm-radio--make-source
                   :id "ytm:library:songs"
                   :kind 'youtube-music-library-section
@@ -865,7 +1096,9 @@
     (with-current-buffer (ytm-radio--buffer)
       (let ((inhibit-read-only t))
         (erase-buffer)))
-    (ytm-radio--render)
+    (cl-letf (((symbol-function 'ytm-radio--mdicon)
+               (lambda (_name fallback) fallback)))
+      (ytm-radio--render))
     (with-current-buffer "*ytm-radio*"
       (should (string-match-p "01[[:space:]]+Let Her Go"
                               (buffer-string)))
@@ -874,7 +1107,37 @@
                    (buffer-string)))
       (should-not (string-match-p "Passenger - All The Little Lights"
                                   (buffer-string)))
-      (should-not (string-match-p (regexp-quote "Let Her Go ▲")
+      (should (string-match-p (regexp-quote "Let Her Go ▲")
+                              (buffer-string))))))
+
+(ert-deftest ytm-radio-render-liked-music-hides-rating-indicators ()
+  "Render Liked Music without redundant liked markers."
+  (let* ((source (ytm-radio--make-source
+                  :id "ytm:library:liked"
+                  :kind 'youtube-music-liked
+                  :title "Liked Music"
+                  :url "https://music.youtube.com/playlist?list=LM"
+                  :tracks nil
+                  :items '(((type . "track")
+                            (id . "v1")
+                            (title . "Liked Track")
+                            (like-status . "like")
+                            (url . "https://music.youtube.com/watch?v=v1")))))
+         (ytm-radio--browser-view 'library)
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons (map-elt source :id) source))))
+         (ytm-radio--player (ytm-radio--make-player)))
+    (with-current-buffer (ytm-radio--buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (cl-letf (((symbol-function 'ytm-radio--mdicon)
+               (lambda (_name fallback) fallback)))
+      (ytm-radio--render))
+    (with-current-buffer "*ytm-radio*"
+      (should (string-match-p "01[[:space:]]+Liked Track"
+                              (buffer-string)))
+      (should-not (string-match-p (regexp-quote "Liked Track ▲")
                                   (buffer-string))))))
 
 (ert-deftest ytm-radio-render-library-items-hide-library-status-marker ()
@@ -941,11 +1204,12 @@
                   :kind 'youtube-music-home-section
                   :title "Listen again"
                   :items nil))
-         (ytm-radio--home-continuation "next-page")
          (ytm-radio--browser-view 'home)
          (ytm-radio--state
           (ytm-radio--make-state
-           :sources (list (cons (map-elt source :id) source))))
+           :sources (list (cons (map-elt source :id) source))
+           :home-continuation "next-page"
+           :home-continuation-known t))
          (ytm-radio--player (ytm-radio--make-player)))
     (with-current-buffer (ytm-radio--buffer)
       (let ((inhibit-read-only t))
@@ -958,7 +1222,10 @@
 (ert-deftest ytm-radio-home-lazy-load-starts-near-buffer-end ()
   "Start Home continuation loading when the visible window reaches the end."
   (let ((ytm-radio--browser-view 'home)
-        (ytm-radio--home-continuation "next-page")
+        (ytm-radio--state
+         (ytm-radio--make-state
+          :home-continuation "next-page"
+          :home-continuation-known t))
         (ytm-radio--home-loading nil)
         (ytm-radio--home-process nil)
         (ytm-radio-home-lazy-load-margin 1)
@@ -985,7 +1252,6 @@
   "Replace Home on first page and append continuation pages."
   (let ((ytm-radio--state (ytm-radio--make-state))
         (ytm-radio--player (ytm-radio--make-player))
-        (ytm-radio--home-continuation nil)
         (first '((sources
                   ((id . "ytm:home:listen")
                    (kind . "youtube-music-home-section")
@@ -1002,11 +1268,15 @@
               ((symbol-function 'ytm-radio--render) #'ignore))
       (ytm-radio--apply-home-helper-data first nil)
       (should (assoc "ytm:home:listen" (ytm-radio--sources)))
-      (should (equal ytm-radio--home-continuation "next-page"))
+      (should (equal (ytm-radio--home-continuation) "next-page"))
+      (should (equal (map-elt ytm-radio--state :home-continuation)
+                     "next-page"))
+      (should (map-elt ytm-radio--state :home-continuation-known))
       (ytm-radio--apply-home-helper-data next t)
       (should (assoc "ytm:home:listen" (ytm-radio--sources)))
       (should (assoc "ytm:home:mixed" (ytm-radio--sources)))
-      (should-not ytm-radio--home-continuation))))
+      (should-not (ytm-radio--home-continuation))
+      (should (map-elt ytm-radio--state :home-continuation-known)))))
 
 (ert-deftest ytm-radio-imenu-indexes-sectioned-views ()
   "Expose Home, Explore, and Library sections through imenu."
@@ -1161,7 +1431,6 @@
                   :url "https://music.youtube.com/search?q=30"
                   :items nil
                   :tracks nil))
-         (ytm-radio-helper-use-mock-data t)
          (ytm-radio-helper-auth-file nil)
          (ytm-radio-helper-library-limit 12)
          (ytm-radio--state (ytm-radio--make-state))
@@ -1173,7 +1442,10 @@
     (with-current-buffer (ytm-radio--buffer)
       (let ((inhibit-read-only t))
         (erase-buffer)))
-    (cl-letf (((symbol-function 'ytm-radio--call-helper-async)
+    (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
+               (lambda (action &optional _message)
+                 (funcall action)))
+              ((symbol-function 'ytm-radio--call-helper-async)
                (lambda (arguments success _error-callback)
                  (setq captured-arguments arguments)
                  (funcall success 'data)
@@ -1184,11 +1456,48 @@
               ((symbol-function 'message) #'ignore))
       (ytm-radio-search "30")
       (should (equal captured-arguments
-                     '("search" "30" "--mock" "--limit" "12")))
+                     '("search" "30" "--limit" "12")))
       (should (eq (ytm-radio--view-kind) 'search))
       (should (ytm-radio--source "ytm:search:30:1:songs"))
       (should-not ytm-radio--browser-load-process)
       (should-not ytm-radio--browser-loading-message))))
+
+(ert-deftest ytm-radio-search-ignores-stale-helper-callback ()
+  "Ignore search callbacks that no longer match the active request token."
+  (let* ((source (ytm-radio--make-source
+                  :id "ytm:search:late:songs"
+                  :kind 'youtube-music-search-section
+                  :title "Late"
+                  :url "https://music.youtube.com/search?q=late"))
+         (ytm-radio-helper-auth-file nil)
+         (ytm-radio--state (ytm-radio--make-state))
+         (ytm-radio--player (ytm-radio--make-player))
+         (ytm-radio--loaded t)
+         (ytm-radio--browser-view 'home)
+         (ytm-radio--browser-load-process nil)
+         success-callback
+         saved)
+    (with-current-buffer (ytm-radio--buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
+               (lambda (action &optional _message)
+                 (funcall action)))
+              ((symbol-function 'ytm-radio--call-helper-async)
+               (lambda (_arguments success _error-callback)
+                 (setq success-callback success)
+                 'old-process))
+              ((symbol-function 'ytm-radio--helper-sources)
+               (lambda (_data) (list source)))
+              ((symbol-function 'ytm-radio--save)
+               (lambda () (setq saved t)))
+              ((symbol-function 'message) #'ignore))
+      (ytm-radio-search "late")
+      (setq ytm-radio--browser-load-token (ytm-radio--new-request-token))
+      (funcall success-callback 'data)
+      (should-not (ytm-radio--source "ytm:search:late:songs"))
+      (should-not saved)
+      (should (eq ytm-radio--browser-load-process 'old-process)))))
 
 (ert-deftest ytm-radio-liked-import-uses-async-target-loader ()
   "Import liked songs through the shared async target loader."
@@ -1334,6 +1643,38 @@
       (should (string-match-p "Subscribe" (buffer-string)))
       (should-not (string-match-p "Toggle subscription" (buffer-string)))
       (should-not (string-match-p "Toggle library" (buffer-string))))))
+
+(ert-deftest ytm-radio-open-at-point-does-not-enter-detail-header ()
+  "Do not treat a rendered detail header body as an enterable section."
+  (let* ((source (ytm-radio--make-source
+                  :id "ytm:browse:UC1:header"
+                  :kind 'youtube-music-artist
+                  :title "Chill Artist"
+                  :url "https://music.youtube.com/browse/UC1"
+                  :items nil
+                  :tracks nil
+                  :subscribed nil))
+         (ytm-radio--loaded t)
+         (ytm-radio--browser-view
+          (list (cons :kind 'detail)
+                (cons :source-ids (list (map-elt source :id)))
+                (cons :browse-id "UC1")
+                (cons :title "Chill Artist")))
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons (map-elt source :id) source))))
+         (ytm-radio--player (ytm-radio--make-player)))
+    (with-current-buffer (ytm-radio--buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (cl-letf (((symbol-function 'ytm-radio--source-header-cover-image)
+               (lambda (_source) nil)))
+      (ytm-radio--render-browser))
+    (with-current-buffer "*ytm-radio*"
+      (goto-char (point-min))
+      (search-forward "Chill Artist")
+      (should-error (ytm-radio-open-at-point) :type 'user-error)
+      (should (eq (ytm-radio--view-kind) 'detail)))))
 
 (ert-deftest ytm-radio-detail-subscription-button-label-changes-icon ()
   "Use distinct subscription button icons for subscribed and unsubscribed states."
@@ -1613,8 +1954,8 @@
     (should (map-elt header :subscribed))
     (should (eq (cadr sources) source))))
 
-(ert-deftest ytm-radio-browse-detail-header-prefers-source-subscription-state ()
-  "Do not let stale opener context override helper subscription state."
+(ert-deftest ytm-radio-browse-detail-header-keeps-positive-account-state ()
+  "Keep saved/subscribed detail markers when source or opener knows them."
   (let* ((subscribed-source
           (ytm-radio--make-source
            :id "ytm:browse:UC1"
@@ -1633,28 +1974,28 @@
           (car (ytm-radio--browse-detail-sources
                 (list subscribed-source)
                 stale-unsubscribed-item)))
-         (unsubscribed-source
+         (saved-item
+          '((type . "album")
+            (title . "Album")
+            (browse-id . "MPRE1")
+            (in-library . t)))
+         (unsaved-source
           (ytm-radio--make-source
-           :id "ytm:browse:UC2"
-           :kind 'youtube-music-artist
-           :title "Artist"
-           :url "https://music.youtube.com/browse/UC2"
+           :id "ytm:browse:MPRE1"
+           :kind 'youtube-music-album
+           :title "Album"
+           :url "https://music.youtube.com/browse/MPRE1"
            :items nil
            :tracks nil
-           :subscribed nil
-           :subscribed-known t))
-         (stale-subscribed-item
-          '((type . "artist")
-            (title . "Artist")
-            (browse-id . "UC2")
-            (subscribed . t)))
-         (unsubscribed-header
+           :in-library nil
+           :in-library-known t))
+         (saved-header
           (car (ytm-radio--browse-detail-sources
-                (list unsubscribed-source)
-                stale-subscribed-item))))
+                (list unsaved-source)
+                saved-item))))
     (should (map-elt subscribed-header :subscribed))
-    (should-not (map-elt unsubscribed-header :subscribed))
-    (should (map-elt unsubscribed-header :subscribed-known))))
+    (should (map-elt saved-header :in-library))
+    (should (map-elt saved-header :in-library-known))))
 
 (ert-deftest ytm-radio-browse-detail-header-preserves-helper-header-state ()
   "Keep helper header account state when enriching it with opener context."
@@ -2325,12 +2666,13 @@
 
 (ert-deftest ytm-radio-mpv-filter-handles-multiple-json-lines ()
   "Parse multiple mpv JSON lines from one process filter chunk."
-  (let ((ytm-radio--player (ytm-radio--make-player :status 'idle))
-        (process (make-process
-                  :name "ytm-radio-test-filter"
-                  :buffer nil
-                  :command '("true")
-                  :noquery t)))
+  (let* ((process (make-process
+                   :name "ytm-radio-test-filter"
+                   :buffer nil
+                   :command '("true")
+                   :noquery t))
+         (ytm-radio--player
+          (ytm-radio--make-player :status 'idle :ipc-process process)))
     (unwind-protect
         (cl-letf (((symbol-function 'ytm-radio--render-now-playing-without-fit)
                    #'ignore))
@@ -2345,6 +2687,21 @@
           (should (equal (process-get process 'pending) "")))
       (when (process-live-p process)
         (delete-process process)))))
+
+(ert-deftest ytm-radio-mpv-dispatch-ignores-stale-ipc-process ()
+  "Ignore mpv events delivered by an older IPC process."
+  (let ((ytm-radio--player
+         (ytm-radio--make-player :status 'idle :ipc-process 'current)))
+    (ytm-radio--mpv-dispatch
+     'stale
+     "{\"event\":\"property-change\",\"name\":\"core-idle\",\"data\":false}")
+    (should (eq (map-elt ytm-radio--player :status) 'idle))
+    (cl-letf (((symbol-function 'ytm-radio--render-now-playing-without-fit)
+               #'ignore))
+      (ytm-radio--mpv-dispatch
+       'current
+       "{\"event\":\"property-change\",\"name\":\"core-idle\",\"data\":false}"))
+    (should (eq (map-elt ytm-radio--player :status) 'playing))))
 
 (ert-deftest ytm-radio-now-playing-controls-include-playback-modes ()
   "Render repeat and shuffle in the compact now-playing controls."
@@ -2490,7 +2847,7 @@
                  120)))))
 
 (ert-deftest ytm-radio-key-bindings-include-current-actions ()
-  "Expose current-track actions from browser and now-playing buffers."
+  "Expose transient actions only from the browser buffer."
   (should (eq (lookup-key ytm-radio--mode-map (kbd "q"))
               #'ytm-radio-hide-browser))
   (should (eq (lookup-key ytm-radio--mode-map (kbd "A"))
@@ -2509,8 +2866,7 @@
               #'ytm-radio-queue))
   (should (eq (lookup-key ytm-radio--now-playing-mode-map (kbd "q"))
               #'ytm-radio-hide-now-playing))
-  (should (eq (lookup-key ytm-radio--now-playing-mode-map (kbd "A"))
-              #'ytm-radio-current-actions))
+  (should-not (lookup-key ytm-radio--now-playing-mode-map (kbd "A")))
   (should (eq (lookup-key ytm-radio--now-playing-mode-map (kbd "l"))
               #'ytm-radio-like-current-track))
   (should (eq (lookup-key ytm-radio--now-playing-mode-map (kbd "d"))
@@ -2570,7 +2926,6 @@
                  :url "https://music.youtube.com/watch?v=abc123_DEF4"))
          (ytm-radio--player (ytm-radio--make-player :current-track track))
          (ytm-radio-helper-auth-file nil)
-         (ytm-radio-helper-use-mock-data nil)
          called-arguments
          (clear-count 0))
     (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
@@ -2594,6 +2949,50 @@
       (should (equal called-arguments '("rate" "abc123_DEF4" "indifferent")))
       (should-not (map-elt track :like-status))
       (should (= clear-count 2)))))
+
+(ert-deftest ytm-radio-like-current-track-uses-cached-like-status ()
+  "Unlike a current track whose rating is known from cached sources."
+  (let* ((track (ytm-radio--make-track
+                 :id "local-id"
+                 :title "bonus funk"
+                 :url "https://music.youtube.com/watch?v=2KoWN3sAFms"))
+         (library-track (ytm-radio--make-track
+                         :id "2KoWN3sAFms"
+                         :title "bonus funk"
+                         :url "https://music.youtube.com/watch?v=2KoWN3sAFms"
+                         :like-status 'like))
+         (source (ytm-radio--make-source
+                  :id "ytm:library:songs"
+                  :kind 'youtube-music-library-section
+                  :title "Library Songs"
+                  :tracks (list library-track)
+                  :items nil))
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons (map-elt source :id) source))))
+         (ytm-radio--player (ytm-radio--make-player :current-track track))
+         (ytm-radio-helper-auth-file nil)
+         called-arguments)
+    (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
+               (lambda (action &optional _message)
+                 (funcall action)))
+              ((symbol-function 'ytm-radio--ensure-loaded) #'ignore)
+              ((symbol-function 'ytm-radio--call-helper-async)
+               (lambda (arguments success _error-callback)
+                 (setq called-arguments arguments)
+                 (funcall success
+                          '((video-id . "2KoWN3sAFms")
+                            (rating . "indifferent")))))
+              ((symbol-function 'ytm-radio--clear-helper-response-cache)
+               #'ignore)
+              ((symbol-function 'ytm-radio--render-now-playing) #'ignore)
+              ((symbol-function 'ytm-radio--render-browser) #'ignore)
+              ((symbol-function 'message) #'ignore))
+      (ytm-radio-like-current-track)
+      (should (equal called-arguments
+                     '("rate" "2KoWN3sAFms" "indifferent")))
+      (should-not (map-elt track :like-status))
+      (should-not (map-elt library-track :like-status)))))
 
 (ert-deftest ytm-radio-current-actions-labels-follow-track-state ()
   "Use action labels for current-track transient suffixes."
@@ -2666,7 +3065,6 @@
          (ytm-radio--track-status-refreshes (make-hash-table :test #'equal))
          (ytm-radio--player (ytm-radio--make-player :current-track track))
          (ytm-radio-helper-auth-file nil)
-         (ytm-radio-helper-use-mock-data nil)
          called-arguments
          now-playing-rendered)
     (cl-letf (((symbol-function 'ytm-radio--track-status-refresh-available-p)
@@ -2688,6 +3086,47 @@
       (should (eq (gethash "abc123_DEF4" ytm-radio--track-status-refreshes)
                   'done)))))
 
+(ert-deftest ytm-radio-apply-track-status-preserves-unknown-like-status ()
+  "Preserve cached ratings when helper track status omits like-status."
+  (let* ((track (ytm-radio--make-track
+                 :id "home-row"
+                 :title "Song"
+                 :url "https://music.youtube.com/watch?v=abc123_DEF4"))
+         (library-track (ytm-radio--make-track
+                         :id "library-row"
+                         :title "Song"
+                         :url "https://music.youtube.com/watch?v=abc123_DEF4"
+                         :like-status 'like))
+         (source (ytm-radio--make-source
+                  :id "ytm:library:songs"
+                  :kind 'youtube-music-library-songs
+                  :title "Songs"
+                  :tracks (list library-track)))
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons (map-elt source :id) source))))
+         (ytm-radio--player
+          (ytm-radio--make-player :current-track track))
+         now-playing-rendered)
+    (cl-letf (((symbol-function 'ytm-radio--render-now-playing)
+               (lambda () (setq now-playing-rendered t)))
+              ((symbol-function 'ytm-radio--render-browser) #'ignore))
+      (should (eq (ytm-radio--track-like-status track) 'like))
+      (ytm-radio--apply-track-status
+       track
+       '((video-id . "abc123_DEF4")
+         (in-library . t)))
+      (should (eq (ytm-radio--track-like-status track) 'like))
+      (should (eq (map-elt library-track :like-status) 'like))
+      (should (map-elt track :in-library))
+      (should now-playing-rendered)
+      (ytm-radio--apply-track-status
+       track
+       '((video-id . "abc123_DEF4")
+         (like-status . nil)))
+      (should-not (ytm-radio--track-like-status track))
+      (should-not (map-elt library-track :like-status)))))
+
 (ert-deftest ytm-radio-toggle-current-track-library-calls-helper ()
   "Toggle library status for the current track through the helper."
   (let* ((track (ytm-radio--make-track
@@ -2696,7 +3135,6 @@
                  :url "https://music.youtube.com/watch?v=abc123_DEF4"))
          (ytm-radio--player (ytm-radio--make-player :current-track track))
          (ytm-radio-helper-auth-file nil)
-         (ytm-radio-helper-use-mock-data nil)
          called-arguments
          (clear-count 0))
     (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
@@ -2721,8 +3159,8 @@
       (should (eq (map-elt track :like-status) 'like))
       (should (= clear-count 1)))))
 
-(ert-deftest ytm-radio-toggle-detail-library-syncs-source-items ()
-  "Toggle detail library status and update matching cached items."
+(ert-deftest ytm-radio-toggle-detail-library-applies-refreshed-source ()
+  "Toggle detail library status and replace the current detail from helper data."
   (let* ((item '((type . "playlist")
                  (id . "PL1")
                  (title . "Playlist")
@@ -2748,7 +3186,6 @@
            :sources (list (cons (map-elt detail-source :id) detail-source)
                           (cons (map-elt home-source :id) home-source))))
          (ytm-radio-helper-auth-file nil)
-         (ytm-radio-helper-use-mock-data nil)
          called-arguments
          (clear-count 0)
          rendered)
@@ -2759,9 +3196,10 @@
               ((symbol-function 'ytm-radio--call-helper-async)
                (lambda (arguments success _error-callback)
                  (setq called-arguments arguments)
-                 (funcall success '((browse-id . "VLPL1")
-                                    (in-library . t)
-                                    (changed . t)))))
+                 (funcall success
+                          (ytm-radio-test--detail-helper-data
+                           "VLPL1" "youtube-music-playlist" "Focus Mix"
+                           '(in-library . t)))))
               ((symbol-function 'ytm-radio--clear-helper-response-cache)
                (lambda () (cl-incf clear-count)))
               ((symbol-function 'ytm-radio--render-browser)
@@ -2771,7 +3209,8 @@
       (should (equal called-arguments
                      '("item-library" "VLPL1" "save"
                        "--params" "ggMCCAI%3D")))
-      (should (map-elt detail-source :in-library))
+      (should (map-elt (ytm-radio--source "ytm:browse:VLPL1:header")
+                       :in-library))
       (should (map-elt item 'in-library))
       (should (= clear-count 1))
       (should rendered))))
@@ -2803,7 +3242,6 @@
            :sources (list (cons (map-elt detail-source :id) detail-source)
                           (cons (map-elt home-source :id) home-source))))
          (ytm-radio-helper-auth-file nil)
-         (ytm-radio-helper-use-mock-data nil)
          called-arguments)
     (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
                (lambda (action &optional _message)
@@ -2812,20 +3250,24 @@
               ((symbol-function 'ytm-radio--call-helper-async)
                (lambda (arguments success _error-callback)
                  (setq called-arguments arguments)
-                 (funcall success '((browse-id . "MPRE1")
-                                    (in-library . nil)
-                                    (changed . t)))))
+                 (funcall success
+                          (ytm-radio-test--detail-helper-data
+                           "MPRE1" "youtube-music-album" "Album"
+                           '(in-library . nil)))))
               ((symbol-function 'ytm-radio--clear-helper-response-cache) #'ignore)
               ((symbol-function 'ytm-radio--render-browser) #'ignore)
               ((symbol-function 'message) #'ignore))
       (ytm-radio-toggle-detail-library)
       (should (equal called-arguments
                      '("item-library" "MPRE1" "remove")))
-      (should-not (map-elt detail-source :in-library))
+      (let ((refreshed (ytm-radio--source "ytm:browse:MPRE1:header")))
+        (should refreshed)
+        (should-not (map-elt refreshed :in-library))
+        (should (map-elt refreshed :in-library-known)))
       (should-not (map-elt item 'in-library)))))
 
-(ert-deftest ytm-radio-toggle-detail-subscription-syncs-source-items ()
-  "Toggle detail subscription status and update matching cached items."
+(ert-deftest ytm-radio-toggle-detail-subscription-applies-refreshed-source ()
+  "Toggle subscription status and replace the current detail from helper data."
   (let* ((item '((type . "artist")
                  (id . "UC1")
                  (title . "Artist")
@@ -2849,7 +3291,6 @@
            :sources (list (cons (map-elt detail-source :id) detail-source)
                           (cons (map-elt home-source :id) home-source))))
          (ytm-radio-helper-auth-file nil)
-         (ytm-radio-helper-use-mock-data nil)
          called-arguments)
     (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
                (lambda (action &optional _message)
@@ -2858,16 +3299,18 @@
               ((symbol-function 'ytm-radio--call-helper-async)
                (lambda (arguments success _error-callback)
                  (setq called-arguments arguments)
-                 (funcall success '((browse-id . "UC1")
-                                    (subscribed . t)
-                                    (changed . t)))))
+                 (funcall success
+                          (ytm-radio-test--detail-helper-data
+                           "UC1" "youtube-music-artist" "Artist Name"
+                           '(subscribed . t)))))
               ((symbol-function 'ytm-radio--clear-helper-response-cache) #'ignore)
               ((symbol-function 'ytm-radio--render-browser) #'ignore)
               ((symbol-function 'message) #'ignore))
       (ytm-radio-toggle-detail-subscription)
       (should (equal called-arguments
                      '("subscription" "UC1" "subscribe")))
-      (should (map-elt detail-source :subscribed))
+      (should (map-elt (ytm-radio--source "ytm:browse:UC1:header")
+                       :subscribed))
       (should (map-elt item 'subscribed)))))
 
 (ert-deftest ytm-radio-toggle-detail-subscription-unsubscribes-subscribed-source ()
@@ -2886,7 +3329,6 @@
           (ytm-radio--make-state
            :sources (list (cons (map-elt detail-source :id) detail-source))))
          (ytm-radio-helper-auth-file nil)
-         (ytm-radio-helper-use-mock-data nil)
          called-arguments)
     (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
                (lambda (action &optional _message)
@@ -2895,30 +3337,20 @@
               ((symbol-function 'ytm-radio--call-helper-async)
                (lambda (arguments success _error-callback)
                  (setq called-arguments arguments)
-                 (funcall success '((browse-id . "UC1")
-                                    (subscribed . nil)
-                                    (changed . t)))))
+                 (funcall success
+                          (ytm-radio-test--detail-helper-data
+                           "UC1" "youtube-music-artist" "Artist Name"
+                           '(subscribed . nil)))))
               ((symbol-function 'ytm-radio--clear-helper-response-cache) #'ignore)
               ((symbol-function 'ytm-radio--render-browser) #'ignore)
               ((symbol-function 'message) #'ignore))
       (ytm-radio-toggle-detail-subscription)
       (should (equal called-arguments
                      '("subscription" "UC1" "unsubscribe")))
-      (should-not (map-elt detail-source :subscribed))
-      (should (map-elt detail-source :subscribed-known)))))
-
-(ert-deftest ytm-radio-sync-browse-account-state-updates-channel-sources ()
-  "Update cached channel detail sources after subscription changes."
-  (let* ((channel-source (ytm-radio--make-source
-                          :id "ytm:channel:UC1:header"
-                          :kind 'youtube-channel
-                          :title "Channel"
-                          :url "https://music.youtube.com/browse/UC1"))
-         (ytm-radio--state
-          (ytm-radio--make-state
-           :sources (list (cons (map-elt channel-source :id) channel-source)))))
-    (ytm-radio--sync-browse-account-state "UC1" :subscribed 'subscribed t)
-    (should (map-elt channel-source :subscribed))))
+      (let ((refreshed (ytm-radio--source "ytm:browse:UC1:header")))
+        (should refreshed)
+        (should-not (map-elt refreshed :subscribed))
+        (should (map-elt refreshed :subscribed-known))))))
 
 (ert-deftest ytm-radio-start-current-track-mix-sets-runtime-queue ()
   "Start mix by loading helper tracks into the runtime queue."
@@ -2928,7 +3360,6 @@
                  :url "https://music.youtube.com/watch?v=abc123_DEF4"))
          (ytm-radio--player (ytm-radio--make-player :current-track track))
          (ytm-radio-helper-auth-file nil)
-         (ytm-radio-helper-use-mock-data nil)
          (ytm-radio-helper-library-limit 2)
          called-arguments
          played-track)
@@ -2988,7 +3419,6 @@
                  :url "https://music.youtube.com/watch?v=abc123_DEF4"))
          (ytm-radio--player (ytm-radio--make-player :current-track track))
          (ytm-radio-helper-auth-file nil)
-         (ytm-radio-helper-use-mock-data nil)
          calls)
     (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
                (lambda (action &optional _message)
@@ -3231,17 +3661,22 @@
          (ytm-radio-mpv-program program)
          (ytm-radio-yt-dlp-program program)
          (ytm-radio-data-directory directory)
-         (ytm-radio-helper-auth-file auth-file)
-         (ytm-radio-helper-use-mock-data nil))
+         (ytm-radio-helper-auth-file auth-file))
     (unwind-protect
         (progn
           (with-temp-file program
-            (insert "#!/bin/sh\n"))
+            (insert "#!/bin/sh\n")
+            (insert "printf '%s\\n' '{\"ok\":true,\"schema\":1,\"protocol\":1,\"helper-version\":\"")
+            (insert ytm-radio--helper-version)
+            (insert "\",\"data\":{\"schema\":1,\"protocol\":1,\"helper-version\":\"")
+            (insert ytm-radio--helper-version)
+            (insert "\"},\"warnings\":[]}'\n"))
           (set-file-modes program #o700)
           (with-temp-file auth-file
             (insert "{}"))
           (let ((report (ytm-radio--doctor-report)))
             (should (string-match-p "^helper[[:space:]]+OK" report))
+            (should (string-match-p "^protocol[[:space:]]+OK" report))
             (should (string-match-p "^mpv[[:space:]]+OK" report))
             (should (string-match-p "^yt-dlp[[:space:]]+OK" report))
             (should (string-match-p "^data-dir[[:space:]]+OK" report))
@@ -3637,10 +4072,9 @@
                  :title "VLPL0xLD9YNV927g2-XOMbe9AXto5UDYR-Ff")))
     (should (equal (ytm-radio--source-display-title source) "Playlist"))))
 
-(ert-deftest ytm-radio-helper-browse-arguments-include-limit-and-mock ()
+(ert-deftest ytm-radio-helper-browse-arguments-include-limit ()
   "Build Rust helper arguments for library imports."
   (let ((ytm-radio-helper-auth-file "/tmp/auth.json")
-        (ytm-radio-helper-use-mock-data t)
         (ytm-radio-helper-library-limit 25)
         (ytm-radio-proxy-url nil))
     (should (equal (ytm-radio--helper-browse-arguments "library")
@@ -3648,14 +4082,12 @@
                      "library"
                      "--auth"
                      "/tmp/auth.json"
-                     "--mock"
                      "--limit"
                      "25")))))
 
 (ert-deftest ytm-radio-helper-home-initial-arguments-include-initial-only ()
   "Build Rust helper arguments for non-blocking Home imports."
   (let ((ytm-radio-helper-auth-file "/tmp/auth.json")
-        (ytm-radio-helper-use-mock-data t)
         (ytm-radio-helper-home-limit 12)
         (ytm-radio-proxy-url nil))
     (should (equal (ytm-radio--helper-browse-arguments "home" t)
@@ -3663,15 +4095,13 @@
                      "home"
                      "--auth"
                      "/tmp/auth.json"
-                     "--mock"
                      "--initial-only"
                      "--limit"
                      "12")))))
 
-(ert-deftest ytm-radio-helper-continuation-arguments-include-limit-and-mock ()
+(ert-deftest ytm-radio-helper-continuation-arguments-include-limit ()
   "Build Rust helper arguments for Home continuation imports."
   (let ((ytm-radio-helper-auth-file "/tmp/auth.json")
-        (ytm-radio-helper-use-mock-data t)
         (ytm-radio-helper-home-limit 12)
         (ytm-radio-proxy-url nil))
     (should (equal (ytm-radio--helper-continuation-arguments "next-page")
@@ -3679,14 +4109,12 @@
                      "next-page"
                      "--auth"
                      "/tmp/auth.json"
-                     "--mock"
                      "--limit"
                      "12")))))
 
-(ert-deftest ytm-radio-helper-search-arguments-include-limit-and-mock ()
+(ert-deftest ytm-radio-helper-search-arguments-include-limit ()
   "Build Rust helper arguments for search imports."
   (let ((ytm-radio-helper-auth-file "/tmp/auth.json")
-        (ytm-radio-helper-use-mock-data t)
         (ytm-radio-helper-library-limit 25)
         (ytm-radio-proxy-url nil))
     (should (equal (ytm-radio--helper-search-arguments "tokyo")
@@ -3694,39 +4122,33 @@
                      "tokyo"
                      "--auth"
                      "/tmp/auth.json"
-                     "--mock"
                      "--limit"
                      "25")))))
 
-(ert-deftest ytm-radio-helper-rate-arguments-include-auth-and-mock ()
+(ert-deftest ytm-radio-helper-rate-arguments-include-auth ()
   "Build Rust helper arguments for rating tracks."
   (let ((ytm-radio-helper-auth-file "/tmp/auth.json")
-        (ytm-radio-helper-use-mock-data t)
         (ytm-radio-proxy-url nil))
     (should (equal (ytm-radio--helper-rate-arguments "v1" "like")
                    '("rate"
                      "v1"
                      "like"
                      "--auth"
-                     "/tmp/auth.json"
-                     "--mock")))))
+                     "/tmp/auth.json")))))
 
-(ert-deftest ytm-radio-helper-track-status-arguments-include-auth-and-mock ()
+(ert-deftest ytm-radio-helper-track-status-arguments-include-auth ()
   "Build Rust helper arguments for track account status."
   (let ((ytm-radio-helper-auth-file "/tmp/auth.json")
-        (ytm-radio-helper-use-mock-data t)
         (ytm-radio-proxy-url nil))
     (should (equal (ytm-radio--helper-track-status-arguments "v1")
                    '("track-status"
                      "v1"
                      "--auth"
-                     "/tmp/auth.json"
-                     "--mock")))))
+                     "/tmp/auth.json")))))
 
-(ert-deftest ytm-radio-helper-current-action-arguments-include-auth-and-mock ()
+(ert-deftest ytm-radio-helper-current-action-arguments-include-auth ()
   "Build Rust helper arguments for current-track actions."
   (let ((ytm-radio-helper-auth-file "/tmp/auth.json")
-        (ytm-radio-helper-use-mock-data t)
         (ytm-radio-helper-library-limit 25)
         (ytm-radio-proxy-url nil))
     (should (equal (ytm-radio--helper-radio-arguments "v1")
@@ -3734,29 +4156,25 @@
                      "v1"
                      "--auth"
                      "/tmp/auth.json"
-                     "--mock"
                      "--limit"
                      "25")))
     (should (equal (ytm-radio--helper-playlist-options-arguments "v1")
                    '("playlist-options"
                      "v1"
                      "--auth"
-                     "/tmp/auth.json"
-                     "--mock")))
+                     "/tmp/auth.json")))
     (should (equal (ytm-radio--helper-add-to-playlist-arguments "v1" "pl1")
                    '("add-to-playlist"
                      "v1"
                      "pl1"
                      "--auth"
-                     "/tmp/auth.json"
-                     "--mock")))
+                     "/tmp/auth.json")))
     (should (equal (ytm-radio--helper-library-arguments "v1" "toggle")
                    '("library"
                      "v1"
                      "toggle"
                      "--auth"
-                     "/tmp/auth.json"
-                     "--mock")))
+                     "/tmp/auth.json")))
     (should (equal (ytm-radio--helper-item-library-arguments
                     "VLPL1" "toggle" "ggMCCAI%3D")
                    '("item-library"
@@ -3765,21 +4183,18 @@
                      "--params"
                      "ggMCCAI%3D"
                      "--auth"
-                     "/tmp/auth.json"
-                     "--mock")))
+                     "/tmp/auth.json")))
     (should (equal (ytm-radio--helper-subscription-arguments
                     "UC1" "toggle" nil)
                    '("subscription"
                      "UC1"
                      "toggle"
                      "--auth"
-                     "/tmp/auth.json"
-                     "--mock")))))
+                     "/tmp/auth.json")))))
 
-(ert-deftest ytm-radio-helper-browse-id-arguments-include-limit-and-mock ()
+(ert-deftest ytm-radio-helper-browse-id-arguments-include-limit ()
   "Build Rust helper arguments for detail browse imports."
   (let ((ytm-radio-helper-auth-file "/tmp/auth.json")
-        (ytm-radio-helper-use-mock-data t)
         (ytm-radio-helper-library-limit 25)
         (ytm-radio-proxy-url nil))
     (should (equal (ytm-radio--helper-browse-id-arguments "VLPL1")
@@ -3787,14 +4202,12 @@
                      "VLPL1"
                      "--auth"
                      "/tmp/auth.json"
-                     "--mock"
                      "--limit"
                      "25")))))
 
 (ert-deftest ytm-radio-helper-browse-id-arguments-include-params ()
   "Pass YouTube Music browse endpoint params to the helper."
   (let ((ytm-radio-helper-auth-file nil)
-        (ytm-radio-helper-use-mock-data nil)
         (ytm-radio-helper-library-limit 25)
         (ytm-radio-proxy-url nil))
     (should (equal (ytm-radio--helper-browse-id-arguments "VLPL1" "ggMCCAI%3D")
@@ -3808,7 +4221,6 @@
 (ert-deftest ytm-radio-helper-arguments-include-proxy ()
   "Build Rust helper arguments with the first-class proxy setting."
   (let ((ytm-radio-helper-auth-file "/tmp/auth.json")
-        (ytm-radio-helper-use-mock-data nil)
         (ytm-radio-helper-library-limit 25)
         (ytm-radio-proxy-url "socks5h://127.0.0.1:7890"))
     (should (equal (ytm-radio--helper-search-arguments "tokyo")
@@ -3909,7 +4321,6 @@
                  :url "https://music.youtube.com/browse/UC1"
                  :items nil
                  :tracks nil))
-         (ytm-radio-helper-use-mock-data t)
          (ytm-radio--state (ytm-radio--make-state))
          (ytm-radio--player (ytm-radio--make-player))
          (ytm-radio--loaded t)
@@ -3919,7 +4330,10 @@
     (with-current-buffer (ytm-radio--buffer)
       (let ((inhibit-read-only t))
         (erase-buffer)))
-    (cl-letf (((symbol-function 'ytm-radio--call-helper-async)
+    (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
+               (lambda (action &optional _message)
+                 (funcall action)))
+              ((symbol-function 'ytm-radio--call-helper-async)
                (lambda (_arguments success _error-callback)
                  (funcall success 'data)
                  nil))
@@ -3954,7 +4368,6 @@
                  (title . "Adele Mix")
                  (subtitle . "Playlist - YouTube Music")
                  (thumbnail-url . "https://example.com/adele-mix.jpg")))
-         (ytm-radio-helper-use-mock-data t)
          (ytm-radio--state (ytm-radio--make-state))
          (ytm-radio--player (ytm-radio--make-player))
          (ytm-radio--loaded t)
@@ -3964,7 +4377,10 @@
     (with-current-buffer (ytm-radio--buffer)
       (let ((inhibit-read-only t))
         (erase-buffer)))
-    (cl-letf (((symbol-function 'ytm-radio--call-helper-async)
+    (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
+               (lambda (action &optional _message)
+                 (funcall action)))
+              ((symbol-function 'ytm-radio--call-helper-async)
                (lambda (_arguments success _error-callback)
                  (funcall success 'data)
                  nil))
@@ -4012,7 +4428,6 @@
                   :title "Adele Mix"
                   :items nil
                   :tracks nil))
-         (ytm-radio-helper-use-mock-data t)
          (ytm-radio--loaded t)
          (ytm-radio--browser-view 'home)
          (ytm-radio--browser-history nil)
@@ -4029,7 +4444,10 @@
     (with-current-buffer "*ytm-radio*"
       (goto-char (point-min))
       (search-forward "Adele Mix")
-      (cl-letf (((symbol-function 'ytm-radio--call-helper-async)
+      (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
+                 (lambda (action &optional _message)
+                   (funcall action)))
+                ((symbol-function 'ytm-radio--call-helper-async)
                  (lambda (_arguments success _error-callback)
                    (funcall success 'data)
                    nil))
@@ -4062,7 +4480,6 @@
                  :url "https://music.youtube.com/browse/UC1"
                  :items nil
                  :tracks nil))
-         (ytm-radio-helper-use-mock-data t)
          (ytm-radio--state (ytm-radio--make-state))
          (ytm-radio--player (ytm-radio--make-player))
          (ytm-radio--loaded t)
@@ -4072,7 +4489,10 @@
     (with-current-buffer (ytm-radio--buffer)
       (let ((inhibit-read-only t))
         (erase-buffer)))
-    (cl-letf (((symbol-function 'ytm-radio--call-helper-async)
+    (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
+               (lambda (action &optional _message)
+                 (funcall action)))
+              ((symbol-function 'ytm-radio--call-helper-async)
                (lambda (_arguments success _error-callback)
                  (funcall success 'data)
                  nil))
@@ -4245,7 +4665,6 @@
 (ert-deftest ytm-radio-account-auth-failure-starts-login ()
   "Treat 401 helper diagnostics as a prompt to refresh account auth."
   (let* ((auth-file (make-temp-file "ytm-radio-auth-"))
-         (ytm-radio-helper-use-mock-data nil)
          (ytm-radio-helper-auth-file auth-file)
          (ytm-radio--login-process nil)
          captured-continuation)
@@ -4283,18 +4702,38 @@
       (delete-directory directory t))))
 
 (ert-deftest ytm-radio-helper-envelope-validates-schema ()
-  "Return helper data only for successful schema version one envelopes."
+  "Return helper data only for the supported helper contract."
   (should
    (equal
     (ytm-radio--helper-envelope-data
-     '((ok . t)
-       (schema . 1)
+     `((ok . t)
+       (schema . ,ytm-radio--helper-schema-version)
+       (protocol . ,ytm-radio--helper-protocol-version)
+       (helper-version . ,ytm-radio--helper-version)
        (data . ((sources . nil)))))
     '((sources . nil))))
   (should-error
    (ytm-radio--helper-envelope-data
-    '((ok . t)
+    `((ok . t)
       (schema . 2)
+      (protocol . ,ytm-radio--helper-protocol-version)
+      (helper-version . ,ytm-radio--helper-version)
+      (data . ((sources . nil)))))
+   :type 'user-error)
+  (should-error
+   (ytm-radio--helper-envelope-data
+    `((ok . t)
+      (schema . ,ytm-radio--helper-schema-version)
+      (protocol . 0)
+      (helper-version . ,ytm-radio--helper-version)
+      (data . ((sources . nil)))))
+   :type 'user-error)
+  (should-error
+   (ytm-radio--helper-envelope-data
+    `((ok . t)
+      (schema . ,ytm-radio--helper-schema-version)
+      (protocol . ,ytm-radio--helper-protocol-version)
+      (helper-version . "0.0.0")
       (data . ((sources . nil)))))
    :type 'user-error))
 

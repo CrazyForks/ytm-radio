@@ -9,6 +9,7 @@ use serde_json::{json, Map, Value};
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
 use std::env;
+use std::error::Error;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,10 +23,10 @@ const BOOTSTRAP_CACHE_SCHEMA_VERSION: u32 = 1;
 const BOOTSTRAP_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const RESPONSE_CACHE_SCHEMA_VERSION: u32 = 1;
 const RESPONSE_CACHE_TTL_SECS: u64 = 5 * 60;
-const RESPONSE_CACHE_SEARCH_TTL_SECS: u64 = 2 * 60;
-const RESPONSE_CACHE_DETAIL_TTL_SECS: u64 = 30 * 60;
 const RESPONSE_CACHE_MAX_ENTRIES: usize = 80;
+const MUTATION_DETAIL_LIMIT: usize = 100;
 const TIMINGS_ENV: &str = "YTM_RADIO_TIMINGS";
+const YOUTUBEI_SEND_RETRY_DELAYS_MS: [u64; 2] = [250, 750];
 
 fn youtube_client(proxy: Option<&str>) -> Result<Client, String> {
     let proxy = proxy.map(str::trim).filter(|value| !value.is_empty());
@@ -141,14 +142,7 @@ pub fn browse_id(
 ) -> Result<Value, String> {
     let client = youtube_client(proxy)?;
     let bootstrap = bootstrap_with_cache(&client, auth, bootstrap_cache)?;
-    let response = request_browse_id(
-        &client,
-        auth,
-        &bootstrap,
-        browse_id,
-        params,
-        bootstrap_cache.map(response_cache_dir).as_deref(),
-    )?;
+    let response = request_browse_id(&client, auth, &bootstrap, browse_id, params, None)?;
     Ok(normalize_browse_id_response(browse_id, limit, &response))
 }
 
@@ -161,13 +155,7 @@ pub fn search(
 ) -> Result<Value, String> {
     let client = youtube_client(proxy)?;
     let bootstrap = bootstrap_with_cache(&client, auth, bootstrap_cache)?;
-    let response = request_search(
-        &client,
-        auth,
-        &bootstrap,
-        query,
-        bootstrap_cache.map(response_cache_dir).as_deref(),
-    )?;
+    let response = request_search(&client, auth, &bootstrap, query, None)?;
     Ok(normalize_search_response(query, limit, &response))
 }
 
@@ -218,13 +206,7 @@ pub fn playlist_options(
 ) -> Result<Value, String> {
     let client = youtube_client(proxy)?;
     let bootstrap = bootstrap_with_cache(&client, auth, bootstrap_cache)?;
-    let response = request_add_to_playlist_options(
-        &client,
-        auth,
-        &bootstrap,
-        video_id,
-        bootstrap_cache.map(response_cache_dir).as_deref(),
-    )?;
+    let response = request_add_to_playlist_options(&client, auth, &bootstrap, video_id, None)?;
     Ok(normalize_add_to_playlist_options(&response))
 }
 
@@ -283,21 +265,21 @@ pub fn library(
     };
     if let Some(token) = token {
         apply_feedback_token(&client, auth, &bootstrap, token)?;
-        Ok(json!({
-            "video-id": video_id,
-            "in-library": target_in_library,
-            "like-status": state.like_status,
-            "action": normalized_action,
-            "changed": true
-        }))
+        Ok(track_account_output(
+            video_id,
+            target_in_library,
+            &state,
+            Some(normalized_action),
+            Some(true),
+        ))
     } else if state.in_library == target_in_library {
-        Ok(json!({
-            "video-id": video_id,
-            "in-library": target_in_library,
-            "like-status": state.like_status,
-            "action": normalized_action,
-            "changed": false
-        }))
+        Ok(track_account_output(
+            video_id,
+            target_in_library,
+            &state,
+            Some(normalized_action),
+            Some(false),
+        ))
     } else {
         Err(format!(
             "YouTube Music did not return a {normalized_action} library token for `{video_id}`"
@@ -327,37 +309,27 @@ pub fn item_library(
         "remove" => (state.remove_token.as_deref(), false, "remove"),
         other => return Err(format!("unknown library action `{other}`")),
     };
-    if let Some(token) = token {
+    let changed = if let Some(token) = token {
         apply_feedback_token(&client, auth, &bootstrap, token)?;
-        Ok(json!({
-            "browse-id": browse_id,
-            "playlist-id": playlist_id,
-            "in-library": target_in_library,
-            "action": normalized_action,
-            "changed": true
-        }))
+        true
     } else if state.library_known && state.in_library == target_in_library {
-        Ok(json!({
-            "browse-id": browse_id,
-            "playlist-id": playlist_id,
-            "in-library": target_in_library,
-            "action": normalized_action,
-            "changed": false
-        }))
+        false
     } else if let Some(playlist_id) = playlist_id.as_deref() {
         apply_playlist_library_rating(&client, auth, &bootstrap, playlist_id, target_in_library)?;
-        Ok(json!({
-            "browse-id": browse_id,
-            "playlist-id": playlist_id,
-            "in-library": target_in_library,
-            "action": normalized_action,
-            "changed": true
-        }))
+        true
     } else {
-        Err(format!(
+        return Err(format!(
             "YouTube Music did not return a {normalized_action} library token or playlist id for `{browse_id}`"
-        ))
-    }
+        ));
+    };
+    Ok(detail_mutation_output(
+        browse_id,
+        &response,
+        normalized_action,
+        changed,
+        Some(target_in_library),
+        None,
+    ))
 }
 
 pub fn subscription(
@@ -391,12 +363,14 @@ pub fn subscription(
         other => return Err(format!("unknown subscription action `{other}`")),
     };
     if state.subscribed == Some(target_subscribed) {
-        return Ok(json!({
-            "browse-id": browse_id,
-            "subscribed": target_subscribed,
-            "action": normalized_action,
-            "changed": false
-        }));
+        return Ok(detail_mutation_output(
+            browse_id,
+            &response,
+            normalized_action,
+            false,
+            None,
+            Some(target_subscribed),
+        ));
     }
     let fallback_endpoint;
     let endpoint = if let Some(endpoint) = endpoint {
@@ -408,28 +382,14 @@ pub fn subscription(
         &fallback_endpoint
     };
     request_subscription_endpoint(&client, auth, &bootstrap, normalized_action, endpoint)?;
-    let verified_subscribed = verify_subscription_state(
-        &client,
-        auth,
-        &bootstrap,
+    Ok(detail_mutation_output(
         browse_id,
-        params,
-        target_subscribed,
-    )?;
-    if verified_subscribed != Some(target_subscribed) {
-        let current = verified_subscribed
-            .map(|subscribed| subscribed.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        return Err(format!(
-            "YouTube Music did not {normalized_action} `{browse_id}`; current subscription state is {current}"
-        ));
-    }
-    Ok(json!({
-        "browse-id": browse_id,
-        "subscribed": target_subscribed,
-        "action": normalized_action,
-        "changed": true
-    }))
+        &response,
+        normalized_action,
+        true,
+        None,
+        Some(target_subscribed),
+    ))
 }
 
 fn apply_feedback_token(
@@ -476,11 +436,34 @@ pub fn track_status(
     let bootstrap = bootstrap_with_cache(&client, auth, bootstrap_cache)?;
     let response = request_song_next(&client, auth, &bootstrap, video_id)?;
     let state = song_library_state(&response, video_id)?;
-    Ok(json!({
-        "video-id": video_id,
-        "in-library": state.in_library,
-        "like-status": state.like_status
-    }))
+    Ok(track_account_output(
+        video_id,
+        state.in_library,
+        &state,
+        None,
+        None,
+    ))
+}
+
+fn track_account_output(
+    video_id: &str,
+    in_library: bool,
+    state: &MenuState,
+    action: Option<&str>,
+    changed: Option<bool>,
+) -> Value {
+    let mut object = Map::from_iter([
+        ("video-id".to_string(), Value::String(video_id.to_string())),
+        ("in-library".to_string(), Value::Bool(in_library)),
+    ]);
+    insert_like_status(&mut object, state);
+    if let Some(action) = action {
+        object.insert("action".to_string(), Value::String(action.to_string()));
+    }
+    if let Some(changed) = changed {
+        object.insert("changed".to_string(), Value::Bool(changed));
+    }
+    Value::Object(object)
 }
 
 #[derive(Clone, Debug)]
@@ -767,7 +750,7 @@ fn request_browse_id(
         browse_id,
         params,
         cache_dir,
-        RESPONSE_CACHE_DETAIL_TTL_SECS,
+        RESPONSE_CACHE_TTL_SECS,
     )
 }
 
@@ -941,7 +924,7 @@ fn request_search(
         "search",
         &body,
         cache_dir,
-        RESPONSE_CACHE_SEARCH_TTL_SECS,
+        RESPONSE_CACHE_TTL_SECS,
     )
 }
 
@@ -1072,14 +1055,11 @@ fn request_youtubei_path(
         insert_header(&mut headers, "x-goog-visitor-id", visitor_data)?;
     }
     let started = Instant::now();
-    let response = client
-        .post(format!(
-            "{YTM_ORIGIN}/youtubei/v1/{path}?alt=json&key={}",
-            bootstrap.api_key
-        ))
-        .headers(headers)
-        .json(body)
-        .send()
+    let url = format!(
+        "{YTM_ORIGIN}/youtubei/v1/{path}?alt=json&key={}",
+        bootstrap.api_key
+    );
+    let response = send_youtubei_request(client, &url, headers, body, path)
         .map_err(|error| format!("YouTube Music {path} request failed: {error}"))?;
     let status = response.status();
     let response_body = response
@@ -1108,6 +1088,65 @@ fn request_youtubei_path(
         }
     }
     Ok(value)
+}
+
+fn send_youtubei_request(
+    client: &Client,
+    url: &str,
+    headers: HeaderMap,
+    body: &Value,
+    path: &str,
+) -> Result<reqwest::blocking::Response, String> {
+    retry_send_operation(
+        || client.post(url).headers(headers.clone()).json(body).send(),
+        |attempt, delay, error| {
+            log_diagnostic(&format!(
+                "youtubei-send-retry path={path} attempt={attempt} delay_ms={} error={error}",
+                delay.as_millis()
+            ));
+            thread::sleep(delay);
+        },
+    )
+}
+
+fn retry_send_operation<T, E, F, R>(mut operation: F, mut retry: R) -> Result<T, String>
+where
+    E: Error + 'static,
+    F: FnMut() -> Result<T, E>,
+    R: FnMut(usize, Duration, &str),
+{
+    let mut attempt = 1;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let message = error_chain_message(&error);
+                if attempt > YOUTUBEI_SEND_RETRY_DELAYS_MS.len() {
+                    return Err(if attempt == 1 {
+                        message
+                    } else {
+                        format!("{message} after {attempt} attempts")
+                    });
+                }
+                let delay = Duration::from_millis(YOUTUBEI_SEND_RETRY_DELAYS_MS[attempt - 1]);
+                retry(attempt, delay, &message);
+                attempt += 1;
+            }
+        }
+    }
+}
+
+fn error_chain_message(error: &(dyn Error + 'static)) -> String {
+    let mut messages = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(error) = source {
+        let message = error.to_string();
+        if !messages.iter().any(|existing| existing == &message) {
+            messages.push(message);
+        }
+        source = error.source();
+    }
+    messages.join(": ")
 }
 
 fn request_home_continuations(
@@ -1636,7 +1675,7 @@ fn normalize_single_source_response(
 ) -> Value {
     let mut items = Vec::new();
     let mut seen = HashSet::new();
-    collect_items(response, &mut items, &mut seen, limit);
+    collect_items_for_target(target, response, &mut items, &mut seen, limit);
     let (id, kind, title, url) = match target {
         BrowseTarget::Home => (
             "ytm:home",
@@ -1891,12 +1930,9 @@ fn parse_playlist_panel_track(renderer: &Value) -> Option<Value> {
             "thumbnail-url".to_string(),
             thumbnail_url.map(Value::String).unwrap_or(Value::Null),
         ),
-        (
-            "like-status".to_string(),
-            menu.like_status.map(Value::String).unwrap_or(Value::Null),
-        ),
         ("in-library".to_string(), Value::Bool(menu.in_library)),
     ]);
+    insert_like_status(&mut item, &menu);
     Some(Value::Object(std::mem::take(&mut item)))
 }
 
@@ -1941,6 +1977,7 @@ struct MenuState {
     add_token: Option<String>,
     remove_token: Option<String>,
     like_status: Option<String>,
+    like_status_known: bool,
     subscribed: Option<bool>,
     subscribe_endpoint: Option<SubscriptionEndpoint>,
     unsubscribe_endpoint: Option<SubscriptionEndpoint>,
@@ -1974,7 +2011,9 @@ fn find_playlist_panel_video_renderer<'a>(value: &'a Value, video_id: &str) -> O
 fn panel_menu_state(renderer: &Value) -> MenuState {
     let mut state = MenuState::default();
     collect_menu_state(renderer, &mut state);
-    state.like_status = parse_like_status(renderer);
+    let like_status = parse_like_status_state(renderer);
+    state.like_status = like_status.status;
+    state.like_status_known = like_status.known;
     state
 }
 
@@ -2283,77 +2322,172 @@ fn request_subscription_endpoint(
     Ok(())
 }
 
-fn verify_subscription_state(
-    client: &Client,
-    auth: &AuthConfig,
-    bootstrap: &Bootstrap,
+fn detail_mutation_output(
     browse_id: &str,
-    params: Option<&str>,
-    target_subscribed: bool,
-) -> Result<Option<bool>, String> {
-    for delay in [0, 300] {
-        if delay > 0 {
-            thread::sleep(Duration::from_millis(delay));
+    response: &Value,
+    action: &str,
+    changed: bool,
+    in_library: Option<bool>,
+    subscribed: Option<bool>,
+) -> Value {
+    let mut output = normalize_browse_id_response(browse_id, MUTATION_DETAIL_LIMIT, response);
+    apply_detail_account_state(&mut output, in_library, subscribed);
+    if let Some(object) = output.as_object_mut() {
+        object.insert(
+            "browse-id".to_string(),
+            Value::String(browse_id.to_string()),
+        );
+        object.insert("action".to_string(), Value::String(action.to_string()));
+        object.insert("changed".to_string(), Value::Bool(changed));
+        if let Some(in_library) = in_library {
+            object.insert("in-library".to_string(), Value::Bool(in_library));
         }
-        let response = request_browse_id(client, auth, bootstrap, browse_id, params, None)?;
-        let subscribed = browse_header_state(&response).subscribed;
-        if subscribed == Some(target_subscribed) {
-            return Ok(subscribed);
+        if let Some(subscribed) = subscribed {
+            object.insert("subscribed".to_string(), Value::Bool(subscribed));
+        }
+        if let Some(playlist_id) = item_library_playlist_id(browse_id, response) {
+            object.insert("playlist-id".to_string(), Value::String(playlist_id));
         }
     }
-    let response = request_browse_id(client, auth, bootstrap, browse_id, params, None)?;
-    Ok(browse_header_state(&response).subscribed)
+    output
 }
 
-fn parse_like_status(value: &Value) -> Option<String> {
-    match value {
-        Value::Object(object) => {
-            if let Some(status) = object
-                .get("likeStatus")
-                .and_then(Value::as_str)
-                .and_then(normalize_like_status)
-            {
-                return Some(status);
-            }
-            if let Some(status) = object
-                .get("toggleButtonRenderer")
-                .and_then(parse_toggle_like_status)
-            {
-                return Some(status);
-            }
-            object.values().find_map(parse_like_status)
-        }
-        Value::Array(array) => array.iter().find_map(parse_like_status),
-        _ => None,
-    }
-}
-
-fn normalize_like_status(status: &str) -> Option<String> {
-    match status {
-        "LIKE" => Some("like".to_string()),
-        "DISLIKE" => Some("dislike".to_string()),
-        _ => None,
-    }
-}
-
-fn parse_toggle_like_status(renderer: &Value) -> Option<String> {
-    if renderer
-        .get("isToggled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        let icon_type = renderer
-            .pointer("/defaultIcon/iconType")
-            .or_else(|| renderer.pointer("/toggledIcon/iconType"))
+fn apply_detail_account_state(
+    output: &mut Value,
+    in_library: Option<bool>,
+    subscribed: Option<bool>,
+) {
+    let Some(sources) = output.get_mut("sources").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for source in sources {
+        let Some(object) = source.as_object_mut() else {
+            continue;
+        };
+        let kind = object
+            .get("kind")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        match icon_type {
-            "LIKE" | "THUMB_UP" | "THUMB_UP_OUTLINE" => Some("like".to_string()),
-            "DISLIKE" | "THUMB_DOWN" | "THUMB_DOWN_OUTLINE" => Some("dislike".to_string()),
-            _ => None,
+        let supports_library = detail_source_supports_library(kind);
+        let supports_subscription = detail_source_supports_subscription(kind);
+        if let Some(in_library) = in_library {
+            if supports_library {
+                object.insert("in-library".to_string(), Value::Bool(in_library));
+            }
         }
-    } else {
-        None
+        if let Some(subscribed) = subscribed {
+            if supports_subscription {
+                object.insert("subscribed".to_string(), Value::Bool(subscribed));
+            }
+        }
+    }
+}
+
+fn detail_source_supports_library(kind: &str) -> bool {
+    matches!(kind, "youtube-music-album" | "youtube-music-playlist")
+}
+
+fn detail_source_supports_subscription(kind: &str) -> bool {
+    matches!(kind, "youtube-music-artist" | "youtube-channel")
+}
+
+fn insert_like_status(object: &mut Map<String, Value>, state: &MenuState) {
+    if state.like_status_known {
+        object.insert(
+            "like-status".to_string(),
+            state
+                .like_status
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct LikeStatusState {
+    known: bool,
+    status: Option<String>,
+}
+
+impl LikeStatusState {
+    fn known(status: Option<String>) -> Self {
+        Self {
+            known: true,
+            status,
+        }
+    }
+}
+
+fn parse_like_status_state(value: &Value) -> LikeStatusState {
+    match value {
+        Value::Object(object) => {
+            let mut result = LikeStatusState::default();
+            if let Some(status) = object.get("likeStatus").and_then(Value::as_str) {
+                let state = normalize_like_status(status);
+                if state.status.is_some() {
+                    return state;
+                }
+                result.known |= state.known;
+            }
+            if let Some(renderer) = object.get("toggleButtonRenderer") {
+                let state = parse_toggle_like_status(renderer);
+                if state.status.is_some() {
+                    return state;
+                }
+                result.known |= state.known;
+            }
+            for nested in object.values() {
+                let state = parse_like_status_state(nested);
+                if state.status.is_some() {
+                    return state;
+                }
+                result.known |= state.known;
+            }
+            result
+        }
+        Value::Array(array) => {
+            let mut result = LikeStatusState::default();
+            for nested in array {
+                let state = parse_like_status_state(nested);
+                if state.status.is_some() {
+                    return state;
+                }
+                result.known |= state.known;
+            }
+            result
+        }
+        _ => LikeStatusState::default(),
+    }
+}
+
+fn normalize_like_status(status: &str) -> LikeStatusState {
+    match status.trim().to_ascii_uppercase().as_str() {
+        "LIKE" => LikeStatusState::known(Some("like".to_string())),
+        "DISLIKE" => LikeStatusState::known(Some("dislike".to_string())),
+        "INDIFFERENT" => LikeStatusState::known(None),
+        _ => LikeStatusState::default(),
+    }
+}
+
+fn parse_toggle_like_status(renderer: &Value) -> LikeStatusState {
+    let Some(is_toggled) = renderer.get("isToggled").and_then(Value::as_bool) else {
+        return LikeStatusState::default();
+    };
+    let icon_type = renderer
+        .pointer("/defaultIcon/iconType")
+        .or_else(|| renderer.pointer("/toggledIcon/iconType"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let status = match icon_type {
+        "LIKE" | "THUMB_UP" | "THUMB_UP_OUTLINE" => Some("like"),
+        "DISLIKE" | "THUMB_DOWN" | "THUMB_DOWN_OUTLINE" => Some("dislike"),
+        _ => None,
+    };
+    match (is_toggled, status) {
+        (true, Some(status)) => LikeStatusState::known(Some(status.to_string())),
+        (false, Some(_)) => LikeStatusState::known(None),
+        _ => LikeStatusState::default(),
     }
 }
 
@@ -2669,6 +2803,7 @@ fn collect_sections(value: &Value, sections: &mut Vec<MusicSection>, limit: usiz
                 "musicCarouselShelfRenderer",
                 "musicShelfRenderer",
                 "gridRenderer",
+                "richShelfRenderer",
             ] {
                 if let Some(renderer) = object.get(renderer_name) {
                     if let Some(section) =
@@ -2777,7 +2912,9 @@ fn section_title(renderer: &Value) -> Option<String> {
         "/header/musicCarouselShelfBasicHeaderRenderer/title/runs/0/text",
         "/header/musicHeaderRenderer/title/runs/0/text",
         "/header/title/runs/0/text",
+        "/header/title/simpleText",
         "/title/runs/0/text",
+        "/title/simpleText",
     ]
     .iter()
     .find_map(|pointer| {
@@ -2853,15 +2990,45 @@ fn short_hash(input: &str) -> String {
 }
 
 fn collect_items(value: &Value, items: &mut Vec<Value>, seen: &mut HashSet<String>, limit: usize) {
+    collect_items_matching(value, items, seen, limit, &|_| true);
+}
+
+fn collect_items_for_target(
+    target: &BrowseTarget,
+    value: &Value,
+    items: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+    limit: usize,
+) {
+    collect_items_matching(value, items, seen, limit, &|item| {
+        !is_target_action_item(target, item)
+    });
+}
+
+fn collect_items_matching<F>(
+    value: &Value,
+    items: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+    limit: usize,
+    include_item: &F,
+) where
+    F: Fn(&Value) -> bool,
+{
     if items.len() >= limit {
         return;
     }
     match value {
         Value::Object(object) => {
-            for renderer_name in ["musicResponsiveListItemRenderer", "musicTwoRowItemRenderer"] {
+            for renderer_name in [
+                "musicResponsiveListItemRenderer",
+                "musicTwoRowItemRenderer",
+                "compactVideoRenderer",
+                "gridVideoRenderer",
+                "videoRenderer",
+            ] {
                 if let Some(renderer) = object.get(renderer_name) {
                     if let Some(item) = parse_item(renderer) {
-                        if seen.insert(item_dedupe_key(&item)) {
+                        if include_item(&item) && seen.insert(item_dedupe_key(&item)) {
                             items.push(item);
                         }
                         return;
@@ -2869,7 +3036,7 @@ fn collect_items(value: &Value, items: &mut Vec<Value>, seen: &mut HashSet<Strin
                 }
             }
             for nested in object.values() {
-                collect_items(nested, items, seen, limit);
+                collect_items_matching(nested, items, seen, limit, include_item);
                 if items.len() >= limit {
                     break;
                 }
@@ -2877,7 +3044,7 @@ fn collect_items(value: &Value, items: &mut Vec<Value>, seen: &mut HashSet<Strin
         }
         Value::Array(array) => {
             for nested in array {
-                collect_items(nested, items, seen, limit);
+                collect_items_matching(nested, items, seen, limit, include_item);
                 if items.len() >= limit {
                     break;
                 }
@@ -2887,12 +3054,35 @@ fn collect_items(value: &Value, items: &mut Vec<Value>, seen: &mut HashSet<Strin
     }
 }
 
-fn parse_card_shelf_header(renderer: &Value) -> Option<Value> {
-    let title = renderer
-        .pointer("/title/runs/0/text")
+fn is_target_action_item(target: &BrowseTarget, item: &Value) -> bool {
+    match target {
+        BrowseTarget::LibrarySongs => is_library_songs_shuffle_action(item),
+        BrowseTarget::LibraryPlaylists => is_library_playlists_new_playlist_action(item),
+        _ => false,
+    }
+}
+
+fn is_library_songs_shuffle_action(item: &Value) -> bool {
+    // YouTube Music emits Library Songs' "Shuffle all" button as a playlist item.
+    item.get("type").and_then(Value::as_str) == Some("playlist")
+        && item.get("playlist-id").and_then(Value::as_str) == Some("MLCT")
+}
+
+fn is_library_playlists_new_playlist_action(item: &Value) -> bool {
+    // YouTube Music emits Library Playlists' "New playlist" button as an item.
+    let thumbnail_url = item
+        .get("thumbnail-url")
         .and_then(Value::as_str)
-        .filter(|text| !text.trim().is_empty())
-        .map(str::to_string)?;
+        .unwrap_or_default();
+    item.get("type").and_then(Value::as_str) == Some("item")
+        && item.get("browse-id").and_then(Value::as_str).is_none()
+        && item.get("playlist-id").and_then(Value::as_str).is_none()
+        && item.get("url").and_then(Value::as_str).is_none()
+        && thumbnail_url.contains("/pbg/create-playlist-")
+}
+
+fn parse_card_shelf_header(renderer: &Value) -> Option<Value> {
+    let title = renderer_title(renderer)?;
     let runs = item_metadata_runs(renderer);
     let browse_endpoint = find_direct_browse_endpoint(renderer);
     let browse_id = browse_endpoint
@@ -2996,18 +3186,7 @@ fn parse_item(renderer: &Value) -> Option<Value> {
 
 fn parse_track(renderer: &Value) -> Option<Value> {
     let video_id = find_primary_watch_endpoint(renderer)?.video_id;
-    let title = renderer
-        .pointer("/title/runs/0/text")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            renderer
-                .pointer(
-                    "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text",
-                )
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })?;
+    let title = renderer_title(renderer)?;
     let runs = collect_text_runs(renderer);
     let kind = playable_item_kind(&runs);
     let artist = runs
@@ -3058,34 +3237,19 @@ fn parse_track(renderer: &Value) -> Option<Value> {
             "thumbnail-url".to_string(),
             thumbnail_url.map(Value::String).unwrap_or(Value::Null),
         ),
-        (
-            "like-status".to_string(),
-            menu.like_status.map(Value::String).unwrap_or(Value::Null),
-        ),
         ("in-library".to_string(), Value::Bool(menu.in_library)),
     ]);
+    insert_like_status(&mut item, &menu);
     Some(Value::Object(std::mem::take(&mut item)))
 }
 
 fn parse_card(renderer: &Value) -> Option<Value> {
-    let title = renderer
-        .pointer("/title/runs/0/text")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            renderer
-                .pointer(
-                    "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text",
-                )
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            collect_text_runs(renderer)
-                .into_iter()
-                .find(|run| !is_separator(&run.text))
-                .map(|run| run.text)
-        })?;
+    let title = renderer_title(renderer).or_else(|| {
+        collect_text_runs(renderer)
+            .into_iter()
+            .find(|run| !is_separator(&run.text))
+            .map(|run| run.text)
+    })?;
     let runs = collect_text_runs(renderer);
     let metadata_runs = item_metadata_runs(renderer);
     let browse_endpoint = find_primary_browse_endpoint(renderer);
@@ -3153,6 +3317,23 @@ fn parse_card(renderer: &Value) -> Option<Value> {
         ),
     ]);
     Some(Value::Object(std::mem::take(&mut item)))
+}
+
+fn renderer_title(renderer: &Value) -> Option<String> {
+    [
+        "/title/runs/0/text",
+        "/title/simpleText",
+        "/headline/runs/0/text",
+        "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text",
+    ]
+    .iter()
+    .find_map(|pointer| {
+        renderer
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string)
+    })
 }
 
 fn playable_item_kind(runs: &[TextRun]) -> String {
@@ -3538,10 +3719,119 @@ mod tests {
     use super::*;
     use crate::auth::AuthSource;
     use std::collections::BTreeMap;
+    use std::fmt;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    struct TestSourceError;
+
+    impl fmt::Display for TestSourceError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "inner cause")
+        }
+    }
+
+    impl Error for TestSourceError {}
+
+    #[derive(Debug)]
+    struct TestOuterError {
+        source: TestSourceError,
+    }
+
+    impl fmt::Display for TestOuterError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "outer error")
+        }
+    }
+
+    impl Error for TestOuterError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&self.source)
+        }
+    }
+
+    fn detail_response(header: Value, sections: Vec<Value>) -> Value {
+        json!({
+            "header": header,
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "secondaryContents": {
+                        "sectionListRenderer": {
+                            "contents": sections
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn song_shelf(
+        shelf_title: &str,
+        song_title: &str,
+        video_id: &str,
+        playlist_id: Option<&str>,
+    ) -> Value {
+        let mut watch_endpoint =
+            Map::from_iter([("videoId".to_string(), Value::String(video_id.to_string()))]);
+        if let Some(playlist_id) = playlist_id {
+            watch_endpoint.insert(
+                "playlistId".to_string(),
+                Value::String(playlist_id.to_string()),
+            );
+        }
+        json!({
+            "musicShelfRenderer": {
+                "title": {"runs": [{"text": shelf_title}]},
+                "contents": [{
+                    "musicResponsiveListItemRenderer": {
+                        "flexColumns": [{
+                            "musicResponsiveListItemFlexColumnRenderer": {
+                                "text": {"runs": [{
+                                    "text": song_title,
+                                    "navigationEndpoint": {
+                                        "watchEndpoint": watch_endpoint
+                                    }
+                                }]}
+                            }
+                        }]
+                    }
+                }]
+            }
+        })
+    }
+
+    fn album_detail_response_without_library_state() -> Value {
+        detail_response(
+            json!({
+                "musicVisualHeaderRenderer": {
+                    "title": {"runs": [{"text": "Album Title"}]}
+                }
+            }),
+            vec![song_shelf("Songs", "Song", "song1", Some("OLAK5uy_album"))],
+        )
+    }
+
+    fn artist_detail_response_with_subscription_state() -> Value {
+        detail_response(
+            json!({
+                "musicImmersiveHeaderRenderer": {
+                    "title": {"runs": [{"text": "Chill girl Vibes"}]},
+                    "buttons": [{
+                        "buttonRenderer": {
+                            "text": {"runs": [{"text": "Subscribed"}]},
+                            "serviceEndpoint": {
+                                "unsubscribeEndpoint": {"channelIds": ["UCartist"]}
+                            }
+                        }
+                    }]
+                }
+            }),
+            vec![song_shelf("Songs", "Popular Song", "song1", None)],
+        )
+    }
 
     #[test]
     fn rejects_invalid_proxy_url() {
@@ -3549,6 +3839,56 @@ mod tests {
             youtube_client(Some("not a url")).unwrap_err(),
             "invalid proxy URL"
         );
+    }
+
+    #[test]
+    fn retries_youtubei_send_failures_before_succeeding() {
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let result: Result<&str, String> = retry_send_operation(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "temporary timeout",
+                    ))
+                } else {
+                    Ok("ok")
+                }
+            },
+            |_attempt, delay, _error| delays.push(delay),
+        );
+
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            delays,
+            vec![Duration::from_millis(250), Duration::from_millis(750)]
+        );
+    }
+
+    #[test]
+    fn retry_send_error_reports_error_chain_and_attempt_count() {
+        let mut attempts = 0;
+        let mut retry_attempts = Vec::new();
+        let error = retry_send_operation(
+            || -> Result<(), TestOuterError> {
+                attempts += 1;
+                Err(TestOuterError {
+                    source: TestSourceError,
+                })
+            },
+            |attempt, _delay, error| {
+                retry_attempts.push(attempt);
+                assert_eq!(error, "outer error: inner cause");
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts, 3);
+        assert_eq!(retry_attempts, vec![1, 2]);
+        assert_eq!(error, "outer error: inner cause after 3 attempts");
     }
 
     #[test]
@@ -3887,7 +4227,65 @@ mod tests {
                 }
             }
         });
-        assert_eq!(parse_like_status(&renderer).as_deref(), Some("dislike"));
+        assert_eq!(
+            parse_like_status_state(&renderer).status.as_deref(),
+            Some("dislike")
+        );
+    }
+
+    #[test]
+    fn parses_indifferent_like_status_as_known() {
+        let renderer = json!({
+            "likeButtonRenderer": {"likeStatus": "INDIFFERENT"}
+        });
+        let state = parse_like_status_state(&renderer);
+        assert!(state.known);
+        assert_eq!(state.status, None);
+    }
+
+    #[test]
+    fn omits_unknown_like_status_from_track_output() {
+        let renderer = json!({
+            "title": {"runs": [{"text": "Song"}]},
+            "navigationEndpoint": {
+                "watchEndpoint": {"videoId": "v1"}
+            }
+        });
+        let item = parse_track(&renderer).unwrap();
+        assert!(item.get("like-status").is_none());
+    }
+
+    #[test]
+    fn keeps_explicit_indifferent_like_status_in_track_output() {
+        let renderer = json!({
+            "title": {"runs": [{"text": "Song"}]},
+            "navigationEndpoint": {
+                "watchEndpoint": {"videoId": "v1"}
+            },
+            "menu": {
+                "menuRenderer": {
+                    "topLevelButtons": [{
+                        "likeButtonRenderer": {"likeStatus": "INDIFFERENT"}
+                    }]
+                }
+            }
+        });
+        let item = parse_track(&renderer).unwrap();
+        assert!(item.get("like-status").is_some_and(Value::is_null));
+    }
+
+    #[test]
+    fn track_account_output_omits_unknown_like_status() {
+        let unknown = MenuState::default();
+        let output = track_account_output("v1", false, &unknown, None, None);
+        assert!(output.get("like-status").is_none());
+
+        let known = MenuState {
+            like_status_known: true,
+            ..Default::default()
+        };
+        let output = track_account_output("v1", false, &known, None, None);
+        assert!(output.get("like-status").is_some_and(Value::is_null));
     }
 
     #[test]
@@ -4288,7 +4686,14 @@ mod tests {
                                                     "navigationEndpoint": {
                                                         "watchEndpoint": {"videoId": "a1"}
                                                     },
-                                                    "subtitle": {"runs": [{"text": "Artist A"}]}
+                                                    "subtitle": {"runs": [{"text": "Artist A"}]},
+                                                    "menu": {
+                                                        "menuRenderer": {
+                                                            "topLevelButtons": [{
+                                                                "likeButtonRenderer": {"likeStatus": "LIKE"}
+                                                            }]
+                                                        }
+                                                    }
                                                 }
                                             }]
                                         }
@@ -4335,8 +4740,109 @@ mod tests {
             Some("track")
         );
         assert_eq!(
+            sources[0]
+                .pointer("/items/0/like-status")
+                .and_then(Value::as_str),
+            Some("like")
+        );
+        assert_eq!(
             sources[1].pointer("/items/0/type").and_then(Value::as_str),
             Some("playlist")
+        );
+    }
+
+    #[test]
+    fn normalizes_home_rich_shelf_music_videos_as_source() {
+        let response = json!({
+            "contents": {
+                "singleColumnBrowseResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "richSectionRenderer": {
+                                            "content": {
+                                                "richShelfRenderer": {
+                                                    "title": {
+                                                        "runs": [{"text": "Music videos for you"}]
+                                                    },
+                                                    "contents": [{
+                                                        "richItemRenderer": {
+                                                            "content": {
+                                                                "compactVideoRenderer": {
+                                                                    "title": {
+                                                                        "simpleText": "Video Song"
+                                                                    },
+                                                                    "navigationEndpoint": {
+                                                                        "watchEndpoint": {
+                                                                            "videoId": "abc123DEF45"
+                                                                        }
+                                                                    },
+                                                                    "longBylineText": {
+                                                                        "runs": [{
+                                                                            "text": "Video Artist",
+                                                                            "navigationEndpoint": {
+                                                                                "browseEndpoint": {
+                                                                                    "browseId": "UCVIDEO"
+                                                                                }
+                                                                            }
+                                                                        }]
+                                                                    },
+                                                                    "thumbnail": {
+                                                                        "thumbnails": [
+                                                                            {"url": "video-small"},
+                                                                            {"url": "video-large"}
+                                                                        ]
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }]
+                                                }
+                                            }
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+        let normalized = normalize_response(&BrowseTarget::Home, 12, &response);
+        let sources = normalized
+            .get("sources")
+            .and_then(Value::as_array)
+            .expect("sources");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0].get("title").and_then(Value::as_str),
+            Some("Music videos for you")
+        );
+        assert_eq!(
+            sources[0].pointer("/items/0/type").and_then(Value::as_str),
+            Some("track")
+        );
+        assert_eq!(
+            sources[0].pointer("/items/0/id").and_then(Value::as_str),
+            Some("abc123DEF45")
+        );
+        assert_eq!(
+            sources[0].pointer("/items/0/title").and_then(Value::as_str),
+            Some("Video Song")
+        );
+        assert_eq!(
+            sources[0]
+                .pointer("/items/0/artist")
+                .and_then(Value::as_str),
+            Some("Video Artist")
+        );
+        assert_eq!(
+            sources[0]
+                .pointer("/items/0/thumbnail-url")
+                .and_then(Value::as_str),
+            Some("video-large")
         );
     }
 
@@ -4467,6 +4973,88 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_library_songs_without_shuffle_all_action() {
+        let response = json!({
+            "contents": [{
+                "musicResponsiveListItemRenderer": {
+                    "title": {"runs": [{"text": "Shuffle all"}]},
+                    "navigationEndpoint": {
+                        "watchPlaylistEndpoint": {"playlistId": "MLCT"}
+                    }
+                }
+            }, {
+                "musicResponsiveListItemRenderer": {
+                    "flexColumns": [
+                        {"musicResponsiveListItemFlexColumnRenderer": {
+                            "text": {"runs": [{
+                                "text": "Song",
+                                "navigationEndpoint": {"watchEndpoint": {"videoId": "v1"}}
+                            }]}
+                        }},
+                        {"musicResponsiveListItemFlexColumnRenderer": {
+                            "text": {"runs": [{"text": "Artist"}]}
+                        }}
+                    ],
+                    "fixedColumns": [{"musicResponsiveListItemFixedColumnRenderer": {
+                        "text": {"runs": [{"text": "3:30"}]}
+                    }}]
+                }
+            }]
+        });
+        let normalized = normalize_response(&BrowseTarget::LibrarySongs, 10, &response);
+        let items = normalized
+            .pointer("/sources/0/items")
+            .and_then(Value::as_array)
+            .expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].get("title").and_then(Value::as_str), Some("Song"));
+        assert_eq!(items[0].get("type").and_then(Value::as_str), Some("track"));
+    }
+
+    #[test]
+    fn normalizes_library_playlists_without_new_playlist_action() {
+        let response = json!({
+            "contents": [{
+                "musicResponsiveListItemRenderer": {
+                    "title": {"runs": [{"text": "New playlist"}]},
+                    "thumbnail": {
+                        "musicThumbnailRenderer": {
+                            "thumbnail": {
+                                "thumbnails": [{
+                                    "url": "https://www.gstatic.com/youtube/media/ytm/images/pbg/create-playlist-@210.png"
+                                }]
+                            }
+                        }
+                    }
+                }
+            }, {
+                "musicTwoRowItemRenderer": {
+                    "title": {"runs": [{"text": "Fav"}]},
+                    "navigationEndpoint": {
+                        "browseEndpoint": {"browseId": "VLPL1"}
+                    },
+                    "thumbnailRenderer": {
+                        "musicThumbnailRenderer": {
+                            "thumbnail": {"thumbnails": [{"url": "cover"}]}
+                        }
+                    }
+                }
+            }]
+        });
+        let normalized = normalize_response(&BrowseTarget::LibraryPlaylists, 10, &response);
+        let items = normalized
+            .pointer("/sources/0/items")
+            .and_then(Value::as_array)
+            .expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].get("title").and_then(Value::as_str), Some("Fav"));
+        assert_eq!(
+            items[0].get("type").and_then(Value::as_str),
+            Some("playlist")
+        );
+    }
+
+    #[test]
     fn normalizes_explore_shelves_as_sources() {
         let response = json!({
             "contents": {
@@ -4483,6 +5071,20 @@ mod tests {
                                     "title": {"runs": [{"text": "Album A"}]},
                                     "navigationEndpoint": {
                                         "browseEndpoint": {"browseId": "MPRE1"}
+                                    }
+                                }
+                            }, {
+                                "musicTwoRowItemRenderer": {
+                                    "title": {"runs": [{"text": "Explore Song"}]},
+                                    "navigationEndpoint": {
+                                        "watchEndpoint": {"videoId": "v1"}
+                                    },
+                                    "menu": {
+                                        "menuRenderer": {
+                                            "topLevelButtons": [{
+                                                "likeButtonRenderer": {"likeStatus": "LIKE"}
+                                            }]
+                                        }
                                     }
                                 }
                             }]
@@ -4504,6 +5106,16 @@ mod tests {
         assert_eq!(
             source.pointer("/items/0/type").and_then(Value::as_str),
             Some("album")
+        );
+        assert_eq!(
+            source.pointer("/items/1/type").and_then(Value::as_str),
+            Some("track")
+        );
+        assert_eq!(
+            source
+                .pointer("/items/1/like-status")
+                .and_then(Value::as_str),
+            Some("like")
         );
     }
 
@@ -5304,6 +5916,51 @@ mod tests {
             sources[2].pointer("/items/0/type").and_then(Value::as_str),
             Some("album")
         );
+    }
+
+    #[test]
+    fn detail_mutation_output_overrides_subscription_source_state() {
+        let response = artist_detail_response_with_subscription_state();
+        let output = detail_mutation_output(
+            "UCartist",
+            &response,
+            "unsubscribe",
+            true,
+            None,
+            Some(false),
+        );
+        let sources = output
+            .get("sources")
+            .and_then(Value::as_array)
+            .expect("sources");
+        assert_eq!(
+            output.get("subscribed").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            sources[0].get("subscribed").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(sources[1].get("subscribed").and_then(Value::as_bool), None);
+    }
+
+    #[test]
+    fn detail_mutation_output_overrides_library_source_state() {
+        let response = album_detail_response_without_library_state();
+        let output = detail_mutation_output("MPRE1", &response, "save", true, Some(true), None);
+        let sources = output
+            .get("sources")
+            .and_then(Value::as_array)
+            .expect("sources");
+        assert_eq!(
+            output.get("in-library").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            sources[0].get("in-library").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(sources[1].get("in-library").and_then(Value::as_bool), None);
     }
 
     #[test]

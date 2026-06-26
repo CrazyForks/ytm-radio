@@ -5,7 +5,9 @@ mod ytmusic;
 
 use auth::{login_window, AuthConfig};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::json;
+#[cfg(test)]
+use serde_json::Value;
 use std::env;
 use std::path::PathBuf;
 use std::process;
@@ -17,11 +19,14 @@ use ytmusic::{
 };
 
 const SCHEMA_VERSION: u32 = 1;
+const HELPER_PROTOCOL_VERSION: u32 = 1;
+const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_LOGIN_CDP_PORT: u16 = 29317;
 const DEFAULT_LOGIN_TIMEOUT_SECS: u64 = 180;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
+    Version,
     AuthCheck,
     AuthLoginWindow {
         output: PathBuf,
@@ -89,6 +94,9 @@ struct Options {
 struct Envelope<T> {
     ok: bool,
     schema: u32,
+    protocol: u32,
+    #[serde(rename = "helper-version")]
+    helper_version: &'static str,
     data: T,
     warnings: Vec<String>,
 }
@@ -123,6 +131,13 @@ where
     let options = parse_args(args)?;
     let proxy = options.proxy.as_deref();
     let data = match &options.command {
+        Command::Version => {
+            json!({
+                "schema": SCHEMA_VERSION,
+                "protocol": HELPER_PROTOCOL_VERSION,
+                "helper-version": HELPER_VERSION
+            })
+        }
         Command::AuthCheck => {
             let path = required_auth_path(&options)?;
             let config = AuthConfig::load(path)?;
@@ -159,6 +174,7 @@ where
                 }
             })
         }
+        #[cfg(test)]
         Command::Browse(target) if options.mock_data => {
             mock_browse(target, options.limit, options.initial_only)
         }
@@ -173,6 +189,7 @@ where
                 proxy,
             )?
         }
+        #[cfg(test)]
         Command::BrowseId { browse_id, .. } if options.mock_data => {
             mock_browse_id(browse_id, options.limit)
         }
@@ -187,6 +204,7 @@ where
                 proxy,
             )?
         }
+        #[cfg(test)]
         Command::Continuation { token } if options.mock_data => {
             mock_continuation(token, options.limit)
         }
@@ -194,11 +212,13 @@ where
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             continuation(token, options.limit, &auth, Some(&cache_path), proxy)?
         }
+        #[cfg(test)]
         Command::Search { query } if options.mock_data => mock_search(query, options.limit),
         Command::Search { query } => {
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             search(query, options.limit, &auth, Some(&cache_path), proxy)?
         }
+        #[cfg(test)]
         Command::Rate { video_id, rating } if options.mock_data => {
             json!({ "video-id": video_id, "rating": rating })
         }
@@ -206,11 +226,13 @@ where
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             rate(video_id, rating, &auth, Some(&cache_path), proxy)?
         }
+        #[cfg(test)]
         Command::Radio { video_id } if options.mock_data => mock_radio(video_id, options.limit),
         Command::Radio { video_id } => {
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             radio(video_id, options.limit, &auth, Some(&cache_path), proxy)?
         }
+        #[cfg(test)]
         Command::PlaylistOptions { video_id } if options.mock_data => {
             mock_playlist_options(video_id)
         }
@@ -218,6 +240,7 @@ where
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             playlist_options(video_id, &auth, Some(&cache_path), proxy)?
         }
+        #[cfg(test)]
         Command::AddToPlaylist {
             video_id,
             playlist_id,
@@ -231,6 +254,7 @@ where
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             add_to_playlist(video_id, playlist_id, &auth, Some(&cache_path), proxy)?
         }
+        #[cfg(test)]
         Command::Library { video_id, action } if options.mock_data => {
             json!({
                 "video-id": video_id,
@@ -244,6 +268,7 @@ where
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             library(video_id, action, &auth, Some(&cache_path), proxy)?
         }
+        #[cfg(test)]
         Command::ItemLibrary {
             browse_id, action, ..
         } if options.mock_data => {
@@ -269,6 +294,7 @@ where
                 proxy,
             )?
         }
+        #[cfg(test)]
         Command::Subscription {
             browse_id, action, ..
         } if options.mock_data => {
@@ -294,6 +320,7 @@ where
                 proxy,
             )?
         }
+        #[cfg(test)]
         Command::TrackStatus { video_id } if options.mock_data => {
             json!({ "video-id": video_id, "in-library": true, "like-status": "like" })
         }
@@ -305,6 +332,8 @@ where
     serde_json::to_string(&Envelope {
         ok: true,
         schema: SCHEMA_VERSION,
+        protocol: HELPER_PROTOCOL_VERSION,
+        helper_version: HELPER_VERSION,
         data,
         warnings: Vec::new(),
     })
@@ -337,6 +366,7 @@ where
     }
 
     let command = match args.remove(0).as_str() {
+        "version" => Command::Version,
         "auth" => parse_auth_command(&mut args)?,
         "browse" => parse_browse_command(&mut args)?,
         "browse-id" => parse_browse_id_command(&mut args)?,
@@ -356,7 +386,10 @@ where
 
     let mut auth_file = None;
     let mut limit = 100;
+    #[cfg(test)]
     let mut mock_data = false;
+    #[cfg(not(test))]
+    let mock_data = false;
     let mut browser = None;
     let mut output = None;
     let mut port = None;
@@ -379,6 +412,7 @@ where
                     return Err("limit must be greater than zero".to_string());
                 }
             }
+            #[cfg(test)]
             "--mock" => mock_data = true,
             "--browser" => browser = Some(option_value(&args, &mut index)?.to_string()),
             "--output" => output = Some(PathBuf::from(option_value(&args, &mut index)?)),
@@ -437,6 +471,23 @@ where
                 timeout_secs: timeout_secs.unwrap_or(DEFAULT_LOGIN_TIMEOUT_SECS),
                 restart_running,
             }
+        }
+        Command::Version => {
+            if browser.is_some()
+                || output.is_some()
+                || port.is_some()
+                || profile_dir.is_some()
+                || timeout_secs.is_some()
+                || restart_running
+                || browse_params.is_some()
+                || initial_only
+                || mock_data
+                || auth_file.is_some()
+                || proxy.is_some()
+            {
+                return Err("version does not accept request options".to_string());
+            }
+            Command::Version
         }
         Command::BrowseId { browse_id, .. } => {
             if browser.is_some()
@@ -752,34 +803,22 @@ fn option_value<'a>(args: &'a [String], index: &mut usize) -> Result<&'a str, St
 fn usage() -> String {
     [
         "usage:",
+        "  ytm-radio-helper version",
         "  ytm-radio-helper auth check --auth FILE",
         "  ytm-radio-helper auth login-window --output FILE [--browser BROWSER] [--profile-dir DIR] [--port N] [--timeout-secs N] [--restart-running]",
         "  ytm-radio-helper browse home --auth FILE [--limit N] [--initial-only]",
-        "  ytm-radio-helper browse home --mock [--limit N] [--initial-only]",
         "  ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N]",
-        "  ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --mock [--limit N]",
         "  ytm-radio-helper browse-id BROWSE_ID --auth FILE [--params PARAMS] [--limit N]",
-        "  ytm-radio-helper browse-id BROWSE_ID --mock [--params PARAMS] [--limit N]",
         "  ytm-radio-helper continuation TOKEN --auth FILE [--limit N]",
-        "  ytm-radio-helper continuation TOKEN --mock [--limit N]",
         "  ytm-radio-helper search QUERY --auth FILE [--limit N]",
-        "  ytm-radio-helper search QUERY --mock [--limit N]",
         "  ytm-radio-helper rate VIDEO_ID like|dislike|indifferent --auth FILE",
-        "  ytm-radio-helper rate VIDEO_ID like|dislike|indifferent --mock",
         "  ytm-radio-helper radio VIDEO_ID --auth FILE [--limit N]",
-        "  ytm-radio-helper radio VIDEO_ID --mock [--limit N]",
         "  ytm-radio-helper playlist-options VIDEO_ID --auth FILE",
-        "  ytm-radio-helper playlist-options VIDEO_ID --mock",
         "  ytm-radio-helper add-to-playlist VIDEO_ID PLAYLIST_ID --auth FILE",
-        "  ytm-radio-helper add-to-playlist VIDEO_ID PLAYLIST_ID --mock",
         "  ytm-radio-helper library VIDEO_ID toggle|save|remove --auth FILE",
-        "  ytm-radio-helper library VIDEO_ID toggle|save|remove --mock",
         "  ytm-radio-helper item-library BROWSE_ID toggle|save|remove --auth FILE [--params PARAMS]",
-        "  ytm-radio-helper item-library BROWSE_ID toggle|save|remove --mock [--params PARAMS]",
         "  ytm-radio-helper subscription BROWSE_ID toggle|subscribe|unsubscribe --auth FILE [--params PARAMS]",
-        "  ytm-radio-helper subscription BROWSE_ID toggle|subscribe|unsubscribe --mock [--params PARAMS]",
         "  ytm-radio-helper track-status VIDEO_ID --auth FILE",
-        "  ytm-radio-helper track-status VIDEO_ID --mock",
         "",
         "options:",
         "  --proxy URL  proxy YouTube Music request commands",
@@ -787,6 +826,7 @@ fn usage() -> String {
     .join("\n")
 }
 
+#[cfg(test)]
 fn mock_browse(target: &BrowseTarget, limit: usize, initial_only: bool) -> Value {
     if matches!(target, BrowseTarget::Home) {
         return mock_home_browse(limit, initial_only);
@@ -883,6 +923,7 @@ fn mock_browse(target: &BrowseTarget, limit: usize, initial_only: bool) -> Value
     })
 }
 
+#[cfg(test)]
 fn mock_search(query: &str, limit: usize) -> Value {
     let items = vec![
         json!({
@@ -948,6 +989,7 @@ fn mock_search(query: &str, limit: usize) -> Value {
     })
 }
 
+#[cfg(test)]
 fn mock_radio(video_id: &str, limit: usize) -> Value {
     let items = (0..limit.min(3))
         .map(|index| {
@@ -982,6 +1024,7 @@ fn mock_radio(video_id: &str, limit: usize) -> Value {
     })
 }
 
+#[cfg(test)]
 fn mock_playlist_options(_video_id: &str) -> Value {
     json!({
         "title": "Add to playlist",
@@ -1007,6 +1050,7 @@ fn mock_playlist_options(_video_id: &str) -> Value {
     })
 }
 
+#[cfg(test)]
 fn mock_library_browse(limit: usize) -> Value {
     let songs = mock_browse(&BrowseTarget::LibrarySongs, limit, false)
         .pointer("/sources/0")
@@ -1049,6 +1093,7 @@ fn mock_library_browse(limit: usize) -> Value {
     json!({ "sources": [songs, albums, playlists] })
 }
 
+#[cfg(test)]
 fn mock_home_browse(limit: usize, initial_only: bool) -> Value {
     let item_limit = limit.clamp(1, 2);
     let mut listen_again = vec![json!({
@@ -1106,6 +1151,7 @@ fn mock_home_browse(limit: usize, initial_only: bool) -> Value {
     })
 }
 
+#[cfg(test)]
 fn mock_continuation(token: &str, _limit: usize) -> Value {
     if token == "mock-home-more" {
         json!({
@@ -1136,6 +1182,7 @@ fn mock_continuation(token: &str, _limit: usize) -> Value {
     }
 }
 
+#[cfg(test)]
 fn mock_explore_browse(limit: usize) -> Value {
     let item_limit = limit.clamp(1, 2);
     let mut new_releases = vec![json!({
@@ -1188,6 +1235,7 @@ fn mock_explore_browse(limit: usize) -> Value {
     })
 }
 
+#[cfg(test)]
 fn mock_browse_id(browse_id: &str, limit: usize) -> Value {
     let item_limit = limit.clamp(1, 2);
     let kind = if browse_id.starts_with("MPRE") {
@@ -1570,6 +1618,29 @@ mod tests {
             "browse".to_string(),
             "--help".to_string()
         ]));
+    }
+
+    #[test]
+    fn version_outputs_helper_contract() {
+        let output = run(["version"]).unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["schema"], SCHEMA_VERSION);
+        assert_eq!(parsed["protocol"], HELPER_PROTOCOL_VERSION);
+        assert_eq!(parsed["helper-version"], HELPER_VERSION);
+        assert_eq!(parsed["data"]["schema"], SCHEMA_VERSION);
+        assert_eq!(parsed["data"]["protocol"], HELPER_PROTOCOL_VERSION);
+        assert_eq!(parsed["data"]["helper-version"], HELPER_VERSION);
+    }
+
+    #[test]
+    fn version_rejects_request_options() {
+        let error = parse_args(["version", "--auth", "/tmp/auth.json"]).unwrap_err();
+        assert_eq!(error, "version does not accept request options".to_string());
+    }
+
+    #[test]
+    fn usage_hides_internal_mock_option() {
+        assert!(!usage().contains("--mock"));
     }
 
     #[test]
