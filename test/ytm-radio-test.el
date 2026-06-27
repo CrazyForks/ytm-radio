@@ -2914,6 +2914,138 @@ FIELDS are included on both the top-level mutation output and source."
       (should (string-suffix-p " U" (substring-no-properties text)))
       (should (<= (string-pixel-width text) 50)))))
 
+(ert-deftest ytm-radio-side-window-renders-current-track ()
+  "Render the current track in the side-window now-playing view."
+  (let ((track (ytm-radio--make-track
+                :id "v1"
+                :title "Song"
+                :url "https://music.youtube.com/watch?v=v1"
+                :artist "Artist"
+                :duration 185))
+        (ytm-radio--player
+         (ytm-radio--make-player :status 'playing
+                                 :position 42
+                                 :duration 185)))
+    (setf (map-elt ytm-radio--player :current-track) track)
+    (with-current-buffer (ytm-radio--now-playing-buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (cl-letf (((symbol-function 'display-graphic-p)
+               (lambda (&optional _frame) nil))
+              ((symbol-function 'ytm-radio--mdicon)
+               (lambda (_name fallback) fallback)))
+      (ytm-radio--render-side-window))
+    (with-current-buffer "*ytm-radio-now-playing*"
+      (should (string-match-p "Song" (buffer-string)))
+      (should (string-match-p "Artist" (buffer-string)))
+      (should (string-match-p "0:42" (buffer-string)))
+      (should (string-match-p (regexp-quote "<<") (buffer-string)))
+      (should (string-match-p (regexp-quote ">>") (buffer-string)))
+      (goto-char (point-min))
+      (should (button-at (point)))
+      (search-forward "Song")
+      (should (button-at (match-beginning 0)))
+      (search-forward "||")
+      (should (button-at (1- (point)))))))
+
+(ert-deftest ytm-radio-side-window-style-uses-top-dedicated-window ()
+  "Show the side-window display style in a top dedicated side window."
+  (let ((ytm-radio-display-style 'side-window)
+        (ytm-radio--side-window nil)
+        (ytm-radio--player (ytm-radio--make-player))
+        captured-action
+        deleted-frame
+        hidden-window
+        restored-window)
+    (cl-letf (((symbol-function 'ytm-radio--render-now-playing)
+               #'ignore)
+              ((symbol-function 'ytm-radio--render-side-window)
+               #'ignore)
+              ((symbol-function 'ytm-radio--delete-frame)
+               (lambda () (setq deleted-frame t)))
+              ((symbol-function 'ytm-radio--quit-buffer-window)
+               (lambda (buffer-name)
+                 (setq hidden-window buffer-name)))
+              ((symbol-function 'display-buffer)
+               (lambda (_buffer action)
+                 (setq captured-action action)
+                 'side-window))
+              ((symbol-function 'selected-window)
+               (lambda () 'normal-window))
+              ((symbol-function 'select-window)
+               (lambda (window &optional norecord)
+                 (setq restored-window (list window norecord))))
+              ((symbol-function 'set-window-dedicated-p)
+               #'ignore)
+              ((symbol-function 'delete-window)
+               #'ignore)
+              ((symbol-function 'set-window-fringes)
+               #'ignore)
+              ((symbol-function 'set-window-margins)
+               #'ignore)
+              ((symbol-function 'set-window-scroll-bars)
+               #'ignore)
+              ((symbol-function 'window-preserve-size)
+               #'ignore)
+              ((symbol-function 'window-live-p)
+               (lambda (window) (memq window '(side-window normal-window))))
+              ((symbol-function 'window-buffer)
+               (lambda (_window) (get-buffer ytm-radio--now-playing-buffer-name))))
+      (ytm-radio--show-now-playing)
+      (should deleted-frame)
+      (should (equal hidden-window ytm-radio--now-playing-buffer-name))
+      (should (eq ytm-radio--side-window 'side-window))
+      (should (equal (car captured-action) '(display-buffer-in-side-window)))
+      (should (eq (alist-get 'side (cdr captured-action)) 'top))
+      (should (= (alist-get 'slot (cdr captured-action)) -1))
+      (should (eq (alist-get 'dedicated (cdr captured-action)) 'side))
+      (should (eq (alist-get 'post-command-select-window
+                             (cdr captured-action))
+                  nil))
+      (should (equal restored-window '(normal-window norecord)))
+      (should (ytm-radio--now-playing-visible-p))
+      (ytm-radio--hide-side-window))))
+
+(ert-deftest ytm-radio-side-window-mouse-events-do-not-select-window ()
+  "Keep mouse clicks in the side-window now-playing buffer inert."
+  (dolist (event '([mouse-1] [down-mouse-1] [drag-mouse-1]
+                   [double-mouse-1] [triple-mouse-1]
+                   [mouse-2] [down-mouse-2] [drag-mouse-2]
+                   [double-mouse-2] [triple-mouse-2]
+                   [mouse-3] [down-mouse-3] [drag-mouse-3]
+                   [double-mouse-3] [triple-mouse-3]))
+    (should (eq (lookup-key ytm-radio--now-playing-mode-map event)
+                #'ignore))
+    (should (eq (lookup-key ytm-radio--now-playing-inert-button-map event)
+                #'ignore))))
+
+(ert-deftest ytm-radio-side-window-non-controls-are-inert-buttons ()
+  "Make the entire side-window surface clickable but inert."
+  (let ((track (ytm-radio--make-track
+                :id "v1"
+                :title "Song"
+                :url "https://music.youtube.com/watch?v=v1"
+                :artist "Artist"))
+        (ytm-radio-side-window-height 2)
+        (ytm-radio--player (ytm-radio--make-player :status 'playing)))
+    (setf (map-elt ytm-radio--player :current-track) track)
+    (with-current-buffer (ytm-radio--now-playing-buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (cl-letf (((symbol-function 'display-graphic-p)
+               (lambda (&optional _frame) nil))
+              ((symbol-function 'ytm-radio--mdicon)
+               (lambda (_name fallback) fallback)))
+      (ytm-radio--render-side-window))
+    (with-current-buffer "*ytm-radio-now-playing*"
+      (goto-char (point-min))
+      (should (eq (button-get (button-at (point)) 'action) #'ignore))
+      (search-forward "Song")
+      (should (eq (button-get (button-at (match-beginning 0)) 'action)
+                  #'ignore))
+      (forward-line 1)
+      (should (eq (button-get (button-at (point)) 'action) #'ignore)))))
+
 (ert-deftest ytm-radio-playback-status-does-not-rerender-browser ()
   "Keep browser content stable when mpv reports play/pause status changes."
   (let ((ytm-radio--player (ytm-radio--make-player :status 'playing))
@@ -4296,6 +4428,50 @@ FIELDS are included on both the top-level mutation output and source."
                 ((symbol-function 'window-buffer)
                  (lambda (_window) buffer)))
         (should (ytm-radio--now-playing-button-event-p 'event))))))
+
+(ert-deftest ytm-radio-now-playing-mouse-1-button-does-not-select-window ()
+  "Activate now-playing buttons with mouse-1 without selecting their window."
+  (let ((called nil)
+        (selected nil))
+    (with-temp-buffer
+      (ytm-radio--insert-now-playing-control ">"
+                                             (lambda ()
+                                               (interactive)
+                                               (setq called t))
+                                             "Play")
+      (let ((buffer (current-buffer))
+            (point (point-min)))
+        (cl-letf (((symbol-function 'event-start)
+                   (lambda (_event) 'position))
+                  ((symbol-function 'posn-window)
+                   (lambda (_position) 'window))
+                  ((symbol-function 'posn-point)
+                   (lambda (_position) point))
+                  ((symbol-function 'window-live-p)
+                   (lambda (window) (eq window 'window)))
+                  ((symbol-function 'window-buffer)
+                   (lambda (_window) buffer))
+                  ((symbol-function 'select-window)
+                   (lambda (&rest _args)
+                     (setq selected t))))
+          (ytm-radio--push-now-playing-button 'event)
+          (should called)
+          (should-not selected))))))
+
+(ert-deftest ytm-radio-now-playing-buttons-override-inert-mouse-events ()
+  "Keep now-playing control buttons clickable despite inert buffer clicks."
+  (should (eq (lookup-key ytm-radio--now-playing-button-map [mouse-1])
+              #'ytm-radio--push-now-playing-button))
+  (should (eq (lookup-key ytm-radio--now-playing-button-map [mouse-2])
+              #'ytm-radio--push-now-playing-button))
+  (dolist (event '([down-mouse-1] [drag-mouse-1]
+                   [double-mouse-1] [triple-mouse-1]
+                   [down-mouse-2] [drag-mouse-2]
+                   [double-mouse-2] [triple-mouse-2]
+                   [mouse-3] [down-mouse-3] [drag-mouse-3]
+                   [double-mouse-3] [triple-mouse-3]))
+    (should (eq (lookup-key ytm-radio--now-playing-button-map event)
+                #'ignore))))
 
 (ert-deftest ytm-radio-drag-now-playing-remembers-manual-position ()
   "Move the child frame and remember the dragged position."

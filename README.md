@@ -113,6 +113,14 @@ browser. In a graphical display, click the transport buttons to control playback
 or drag any non-button area of the child frame to move it for the current
 now-playing session.
 
+Set `ytm-radio-display-style` to `side-window` to show now-playing as a compact
+top side window instead. The side-window style appears once per frame, reserves
+real layout space, and avoids reusing Emacs's tab bar for non-tab content.
+
+```elisp
+(setq ytm-radio-display-style 'side-window)
+```
+
 `M-x ytm-radio-install-helper`, or the first-use confirmation prompt, downloads
 a platform-specific `ytm-radio-helper` binary to:
 
@@ -175,7 +183,7 @@ directory, and the auth file are visible from Emacs.
 - `M-x ytm-radio-import-ytmusic-liked` imports liked songs.
 - `M-x ytm-radio-refresh` refreshes the current browser view.
 - `M-x ytm-radio-search` searches YouTube Music.
-- `M-x ytm-radio-now-playing` shows the cover child frame.
+- `M-x ytm-radio-now-playing` shows the configured now-playing view.
 - `M-x ytm-radio-queue` shows the current runtime playback queue.
 - `M-x ytm-radio-play-track` selects a known track.
 - `M-x ytm-radio-play-source` selects a known source.
@@ -208,7 +216,7 @@ directory, and the auth file are visible from Emacs.
 - `M-x ytm-radio-seek-forward` seeks forward.
 - `M-x ytm-radio-seek-backward` seeks backward.
 - `M-x ytm-radio-hide-browser` hides the browser buffer.
-- `M-x ytm-radio-hide-now-playing` hides the now-playing child frame.
+- `M-x ytm-radio-hide-now-playing` hides the now-playing view.
 - `M-x ytm-radio-hide` hides ytm-radio UI.
 
 Inside the browser buffer:
@@ -216,7 +224,7 @@ Inside the browser buffer:
 | Key | Action |
 | --- | --- |
 | `a` | Add URL |
-| `c` | Show cover child frame |
+| `c` | Show the now-playing view |
 | `H` | Switch to Home |
 | `E` | Switch to Explore |
 | `L` | Switch to Library |
