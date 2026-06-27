@@ -82,6 +82,8 @@ and useful.
 - The now-playing child frame should keep cover art, metadata, progress, and
   playback controls compact, visually balanced, and independent from global tab
   UI.
+- Mouse users should be able to drag the now-playing child frame without
+  breaking keyboard-only operation or playback controls.
 - The child frame should resize deterministically from current track/player
   state and avoid speculative layout compensation.
 

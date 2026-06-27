@@ -106,9 +106,12 @@ jank while covers are still loading. Customize
 `ytm-radio-browser-thumbnail-downloads-per-render` to change the batch size, or
 set it to nil to disable the cap.
 
-The child frame is a compact now-playing surface. It fits itself to the current
-cover image, shows title, artist, time, and progress, and exposes the core
-playback controls without turning the child frame into the main browser.
+The default child frame is a compact, non-focusable now-playing surface. It fits
+itself to the current cover image, shows title, artist, time, and progress, and
+exposes the core playback controls without turning the child frame into the main
+browser. In a graphical display, click the transport buttons to control playback
+or drag any non-button area of the child frame to move it for the current
+now-playing session.
 
 `M-x ytm-radio-install-helper`, or the first-use confirmation prompt, downloads
 a platform-specific `ytm-radio-helper` binary to:
@@ -244,7 +247,9 @@ Inside the browser buffer:
 Use `M-x imenu` in Home, Explore, or Library to jump between rendered
 sections.
 
-Inside the now-playing child frame:
+The graphical child frame is non-focusable: use its mouse transport buttons or
+the browser buffer bindings above. When the now-playing buffer is selected in a
+regular Emacs window, these local keys are available:
 
 | Key | Action |
 | --- | --- |
@@ -261,7 +266,7 @@ Inside the now-playing child frame:
 | `t` | Save or remove current track from library |
 | `S` | Copy current track URL |
 | `Q` | Show the runtime queue |
-| `q` | Hide the child frame |
+| `q` | Hide the now-playing view |
 
 ## Helper Contract
 
