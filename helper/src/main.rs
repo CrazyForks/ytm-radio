@@ -164,6 +164,7 @@ where
                 *port,
                 Duration::from_secs(*timeout_secs),
                 *restart_running,
+                proxy,
             )?;
             json!({
                 "auth": {
@@ -456,9 +457,6 @@ where
 
     let command = match command {
         Command::AuthLoginWindow { .. } => {
-            if proxy.is_some() {
-                return Err("proxy options require a YouTube Music request action".to_string());
-            }
             if browse_params.is_some() || initial_only || mock_data || auth_file.is_some() {
                 return Err("browse options require a browse action".to_string());
             }
@@ -805,7 +803,7 @@ fn usage() -> String {
         "usage:",
         "  ytm-radio-helper version",
         "  ytm-radio-helper auth check --auth FILE",
-        "  ytm-radio-helper auth login-window --output FILE [--browser BROWSER] [--profile-dir DIR] [--port N] [--timeout-secs N] [--restart-running]",
+        "  ytm-radio-helper auth login-window --output FILE [--browser BROWSER] [--profile-dir DIR] [--port N] [--timeout-secs N] [--restart-running] [--proxy URL]",
         "  ytm-radio-helper browse home --auth FILE [--limit N] [--initial-only]",
         "  ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N]",
         "  ytm-radio-helper browse-id BROWSE_ID --auth FILE [--params PARAMS] [--limit N]",
@@ -821,7 +819,7 @@ fn usage() -> String {
         "  ytm-radio-helper track-status VIDEO_ID --auth FILE",
         "",
         "options:",
-        "  --proxy URL  proxy YouTube Music request commands",
+        "  --proxy URL  proxy YouTube Music requests and supported login browsers",
     ]
     .join("\n")
 }
@@ -1436,8 +1434,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_proxy_for_login_window() {
-        let error = parse_args([
+    fn parses_proxy_for_login_window() {
+        let options = parse_args([
             "auth",
             "login-window",
             "--output",
@@ -1445,11 +1443,8 @@ mod tests {
             "--proxy",
             "http://127.0.0.1:8888",
         ])
-        .unwrap_err();
-        assert_eq!(
-            error,
-            "proxy options require a YouTube Music request action".to_string()
-        );
+        .unwrap();
+        assert_eq!(options.proxy, Some("http://127.0.0.1:8888".to_string()));
     }
 
     #[test]

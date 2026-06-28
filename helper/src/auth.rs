@@ -117,6 +117,7 @@ pub fn login_window(
     port: u16,
     timeout: Duration,
     restart_running: bool,
+    proxy: Option<&str>,
 ) -> Result<AuthConfig, String> {
     let browser = resolve_login_browser(browser)?;
     let profile_dir = effective_login_profile_dir(output, &browser, profile_dir);
@@ -128,6 +129,7 @@ pub fn login_window(
             port,
             timeout,
             restart_running,
+            proxy,
         ),
         LoginProtocol::Bidi => login_window_bidi(
             output,
@@ -136,6 +138,7 @@ pub fn login_window(
             port,
             timeout,
             restart_running,
+            proxy,
         ),
     }
 }
@@ -165,6 +168,7 @@ fn login_window_cdp(
     port: u16,
     timeout: Duration,
     restart_running: bool,
+    proxy: Option<&str>,
 ) -> Result<AuthConfig, String> {
     let client = Client::builder()
         .timeout(Duration::from_millis(900))
@@ -185,7 +189,7 @@ fn login_window_cdp(
                     return Err(error);
                 }
             }
-            launched_child = Some(spawn_login_browser(browser, profile_dir, port)?);
+            launched_child = Some(spawn_login_browser(browser, profile_dir, port, proxy)?);
             close_browser_when_done = profile_dir.is_some();
             let Some(version) = wait_for_cdp_version(&client, &base_url, Duration::from_secs(8))
             else {
@@ -221,6 +225,7 @@ fn login_window_bidi(
     port: u16,
     timeout: Duration,
     restart_running: bool,
+    proxy: Option<&str>,
 ) -> Result<AuthConfig, String> {
     let client = Client::builder()
         .timeout(Duration::from_millis(900))
@@ -240,7 +245,7 @@ fn login_window_bidi(
                     return Err(error);
                 }
             }
-            launched_child = Some(spawn_login_browser(browser, profile_dir, port)?);
+            launched_child = Some(spawn_login_browser(browser, profile_dir, port, proxy)?);
             close_browser_when_done = profile_dir.is_some();
             let Some(connection) = wait_for_bidi_connection(&client, port, Duration::from_secs(8))
             else {
@@ -1115,22 +1120,41 @@ fn spawn_login_browser(
     browser: &LoginBrowser,
     profile_dir: Option<&Path>,
     port: u16,
+    proxy: Option<&str>,
 ) -> Result<Child, String> {
     match browser.protocol {
-        LoginProtocol::Cdp => spawn_cdp_login_browser(browser, profile_dir, port),
+        LoginProtocol::Cdp => spawn_cdp_login_browser(browser, profile_dir, port, proxy),
         LoginProtocol::Bidi => spawn_bidi_login_browser(browser, profile_dir, port),
     }
+}
+
+fn cdp_login_browser_arguments(
+    profile_dir: Option<&Path>,
+    port: u16,
+    proxy: Option<&str>,
+) -> Vec<String> {
+    let mut arguments = vec![
+        format!("--remote-debugging-port={port}"),
+        "--remote-debugging-address=127.0.0.1".to_string(),
+    ];
+    if let Some(proxy) = proxy {
+        arguments.push(format!("--proxy-server={proxy}"));
+    }
+    if let Some(profile_dir) = profile_dir {
+        arguments.push(format!("--user-data-dir={}", profile_dir.display()));
+    }
+    arguments.push("--no-first-run".to_string());
+    arguments.push("--new-window".to_string());
+    arguments
 }
 
 fn spawn_cdp_login_browser(
     browser: &LoginBrowser,
     profile_dir: Option<&Path>,
     port: u16,
+    proxy: Option<&str>,
 ) -> Result<Child, String> {
     let mut command = Command::new(&browser.executable);
-    command
-        .arg(format!("--remote-debugging-port={port}"))
-        .arg("--remote-debugging-address=127.0.0.1");
     if let Some(profile_dir) = profile_dir {
         fs::create_dir_all(profile_dir).map_err(|error| {
             format!(
@@ -1138,11 +1162,9 @@ fn spawn_cdp_login_browser(
                 profile_dir.display()
             )
         })?;
-        command.arg(format!("--user-data-dir={}", profile_dir.display()));
     }
+    command.args(cdp_login_browser_arguments(profile_dir, port, proxy));
     command
-        .arg("--no-first-run")
-        .arg("--new-window")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1963,6 +1985,25 @@ mod tests {
         assert_eq!(
             effective_login_profile_dir(output, &browser, Some(profile)),
             Some(profile.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn cdp_login_browser_arguments_include_proxy() {
+        assert_eq!(
+            cdp_login_browser_arguments(
+                Some(Path::new("/tmp/ytm-login-profile")),
+                29999,
+                Some("http://127.0.0.1:7890")
+            ),
+            vec![
+                "--remote-debugging-port=29999",
+                "--remote-debugging-address=127.0.0.1",
+                "--proxy-server=http://127.0.0.1:7890",
+                "--user-data-dir=/tmp/ytm-login-profile",
+                "--no-first-run",
+                "--new-window"
+            ]
         );
     }
 

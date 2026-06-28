@@ -453,12 +453,14 @@ Set one proxy URL when YouTube Music requests should go through a proxy:
 ```
 
 The proxy is passed to the Rust helper, `yt-dlp`, and mpv's ytdl hook. HTTP and
-HTTPS proxy URLs are also passed to mpv for direct media URL playback.
+HTTPS proxy URLs are also used for Emacs cover downloads and passed to mpv for
+direct media URL playback.
 
-The browser login window does not receive this setting. It uses the browser or
-system proxy configuration. When a SOCKS proxy is configured, ytm-radio avoids
-using cached direct media URLs because mpv's direct transport may not preserve
-SOCKS routing.
+When ytm-radio starts a Chromium-compatible login browser, the helper also
+launches it with that proxy. Already-running browser sessions and Firefox login
+windows still use the browser or system proxy configuration. When a SOCKS proxy
+is configured, ytm-radio avoids using cached direct media URLs because mpv's
+direct transport may not preserve SOCKS routing.
 
 ## URL Cookies
 

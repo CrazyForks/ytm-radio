@@ -158,8 +158,10 @@ example \"cookies-from-browser=chrome\"."
 (defcustom ytm-radio-proxy-url nil
   "Proxy URL used for YouTube Music network requests.
 When non-nil, this is passed to yt-dlp, mpv's ytdl hook, and the Rust helper.
-HTTP and HTTPS proxy URLs are also passed to mpv's direct media transport.
-The browser login window uses the browser or system proxy configuration."
+HTTP and HTTPS proxy URLs are also passed to cover downloads and mpv's direct
+media transport.
+When the helper starts a Chromium-compatible login browser, it also passes this
+proxy to that browser."
   :type '(choice (const :tag "No proxy" nil)
                  string)
   :group 'ytm-radio)
@@ -1237,6 +1239,30 @@ MESSAGE is shown when login is required."
        (let ((case-fold-search t))
          (string-match-p "\\`https?://" proxy))))
 
+(defun ytm-radio--http-proxy-authority (proxy)
+  "Return PROXY authority for `url-proxy-services', or nil."
+  (when (ytm-radio--http-proxy-url-p proxy)
+    (let* ((parsed (url-generic-parse-url proxy))
+           (host (url-host parsed))
+           (port (url-port parsed))
+           (user (url-user parsed))
+           (password (url-password parsed)))
+      (when host
+        (concat
+         (cond
+          ((and user password) (format "%s:%s@" user password))
+          (user (concat user "@")))
+         host
+         (when port
+           (format ":%d" port)))))))
+
+(defun ytm-radio--cover-url-proxy-services ()
+  "Return `url-proxy-services' entries for cover downloads, or nil."
+  (when-let* ((proxy (ytm-radio--proxy-url))
+              (authority (ytm-radio--http-proxy-authority proxy)))
+    `(("http" . ,authority)
+      ("https" . ,authority))))
+
 (defun ytm-radio--yt-dlp-proxy-arguments ()
   "Return yt-dlp proxy arguments, or nil."
   (when-let* ((proxy (ytm-radio--proxy-url)))
@@ -1344,6 +1370,8 @@ that does not expose DevTools."
          (number-to-string ytm-radio-helper-login-cdp-port)
          "--timeout-secs"
          (number-to-string ytm-radio-helper-login-timeout))
+   (when-let* ((proxy (ytm-radio--proxy-url)))
+     (list "--proxy" proxy))
    (when restart-running
      (list "--restart-running"))
    (when (and (stringp ytm-radio-helper-login-profile-directory)
@@ -2077,6 +2105,12 @@ When RESTORE-ENTRY is non-nil, restore that browser position after loading."
               ((ytm-radio--http-proxy-url-p proxy)))
     (concat "--http-proxy=" proxy)))
 
+(defun ytm-radio--mpv-stream-lavf-proxy-argument ()
+  "Return the mpv lavf HTTP proxy argument, or nil."
+  (when-let* ((proxy (ytm-radio--proxy-url))
+              ((ytm-radio--http-proxy-url-p proxy)))
+    (concat "--stream-lavf-o-append=http_proxy=" proxy)))
+
 (defun ytm-radio--direct-stream-cache-supported-p ()
   "Return non-nil when cached direct stream URLs preserve proxy routing."
   (let ((proxy (ytm-radio--proxy-url)))
@@ -2244,6 +2278,7 @@ When RESTORE-ENTRY is non-nil, restore that browser position after loading."
   (append ytm-radio-mpv-network-cache-args
           (delq nil (list (ytm-radio--mpv-ytdl-format-argument)
                           (ytm-radio--mpv-http-proxy-argument)
+                          (ytm-radio--mpv-stream-lavf-proxy-argument)
                           "--pause=no"))
           ytm-radio-mpv-extra-args
           (delq nil (list (ytm-radio--mpv-raw-options-argument)
@@ -5064,6 +5099,9 @@ When HISTORY-ENTRY is non-nil, restore its stored browser position."
           (progn
             (make-directory ytm-radio-cover-cache-directory t)
             (let* ((url-show-status nil)
+                   (url-proxy-services
+                    (or (ytm-radio--cover-url-proxy-services)
+                        url-proxy-services))
                    (process
                     (url-retrieve
                      url

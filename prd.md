@@ -98,9 +98,10 @@ and useful.
   explicit user command, but it must not silently download executable code while
   opening or browsing.
 - A single optional proxy URL may be applied to helper account requests,
-  `yt-dlp` discovery and prefetching, and mpv playback paths. The browser login
-  window continues to use browser or system proxy configuration unless a future
-  workflow explicitly manages browser proxy state.
+  `yt-dlp` discovery and prefetching, cover image downloads, and mpv playback
+  paths. When the helper starts a Chromium-compatible login browser, the proxy
+  is applied to that browser launch. Already-running browsers and Firefox login
+  windows continue to use browser or system proxy configuration.
 - Helper stdout must remain machine-readable JSON; diagnostics belong on
   stderr.
 - Helper schema versions are explicit, and unsupported schema versions must be

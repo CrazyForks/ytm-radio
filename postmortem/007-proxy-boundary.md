@@ -23,6 +23,11 @@ owned by the browser and system proxy configuration because the login workflow
 also talks to local DevTools endpoints, and ytm-radio should not manage browser
 network policy until there is a clear user workflow for that.
 
+Superseded note: postmortem 011 narrows this boundary by applying
+`ytm-radio-proxy-url` only to Chromium-compatible login browser processes that
+ytm-radio starts itself. Existing browser sessions and Firefox login remain
+browser/system-proxy owned.
+
 ## Consequences
 
 Users get one Emacs setting for the normal account and playback paths instead

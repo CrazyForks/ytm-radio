@@ -288,12 +288,31 @@ FIELDS are included on both the top-level mutation output and source."
     (should (equal (ytm-radio--mpv-arguments "sock" "url")
                    '("--ytdl-format=bestaudio/best"
                      "--http-proxy=http://127.0.0.1:8888"
+                     "--stream-lavf-o-append=http_proxy=http://127.0.0.1:8888"
                      "--pause=no"
                      "--really-quiet"
                      "--ytdl-raw-options=cookies-from-browser=chrome,proxy=http://127.0.0.1:8888"
                      "--no-video"
                      "--input-ipc-server=sock"
                      "url")))))
+
+(ert-deftest ytm-radio-cover-download-uses-first-class-http-proxy ()
+  "Download covers through the first-class HTTP proxy setting."
+  (let* ((directory (make-temp-file "ytm-radio-cover-proxy-" t))
+         (ytm-radio-cover-cache-directory directory)
+         (ytm-radio--cover-downloads (make-hash-table :test #'equal))
+         (ytm-radio-proxy-url "http://127.0.0.1:7890")
+         captured-proxy-services)
+    (unwind-protect
+        (cl-letf (((symbol-function 'url-retrieve)
+                   (lambda (_url _callback &rest _arguments)
+                     (setq captured-proxy-services url-proxy-services)
+                     'process)))
+          (ytm-radio--cache-cover "https://example.com/cover.jpg" #'ignore)
+          (should (equal captured-proxy-services
+                         '(("http" . "127.0.0.1:7890")
+                           ("https" . "127.0.0.1:7890")))))
+      (delete-directory directory t))))
 
 (ert-deftest ytm-radio-mpv-extra-args-can-override-cache-defaults ()
   "Place user mpv args after default mpv playback args."
@@ -4548,6 +4567,8 @@ FIELDS are included on both the top-level mutation output and source."
         "29999"
         "--timeout-secs"
         "60"
+        "--proxy"
+        "socks5h://127.0.0.1:7890"
         "--profile-dir"
         "/tmp/ytm-login-profile"
         "--browser"
