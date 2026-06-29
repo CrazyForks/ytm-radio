@@ -101,6 +101,10 @@ Home, Explore, and Library use cached sections first and only load asynchronousl
 when a view has no cached data or when explicitly refreshed. Home continuation
 pages load lazily when the visible Home buffer reaches the rendered end, and the
 next Home continuation token is stored with the durable browser state.
+Thumbnail downloads in large browser views are capped per render to reduce UI
+jank while covers are still loading. Customize
+`ytm-radio-browser-thumbnail-downloads-per-render` to change the batch size, or
+set it to nil to disable the cap.
 
 The child frame is a compact now-playing surface. It fits itself to the current
 cover image, shows title, artist, time, and progress, and exposes the core
@@ -113,8 +117,9 @@ a platform-specific `ytm-radio-helper` binary to:
 ~/.ytm-radio/bin/ytm-radio-helper
 ```
 
-Release downloads currently support macOS arm64, macOS x86_64, and Linux
-x86_64.
+Release downloads currently support macOS arm64, macOS x86_64, Linux x86_64,
+and Windows x86_64. On Windows, the installed helper file is
+`ytm-radio-helper.exe`.
 
 When developing from a checkout, you can also build the helper locally:
 
@@ -323,13 +328,17 @@ Responses use a stable envelope:
   "ok": true,
   "schema": 1,
   "protocol": 1,
-  "helper-version": "0.1.2",
+  "helper-version": "0.1.3",
   "data": {
     "sources": []
   },
   "warnings": []
 }
 ```
+
+Failed helper commands also write a versioned JSON envelope to stdout and exit
+non-zero. Its `error` object includes a stable `code`, human-readable `message`,
+and `retryable` and `auth-required` flags. Diagnostics remain on stderr.
 
 ## Login
 
@@ -347,19 +356,19 @@ ytm-radio opens the login browser at `https://music.youtube.com`. Sign in there
 if needed. The helper waits for the logged-in YouTube Music page to expose
 cookies and page context, then writes the auth JSON.
 
-The login browser must be started with a local DevTools endpoint. If you opt
-into the browser's normal profile and that browser is already running without
-the endpoint, ytm-radio asks before restarting it once. Chrome uses a
+The login browser must be started with a local remote-control endpoint. If you
+opt into the browser's normal profile and that browser is already running
+without the endpoint, ytm-radio asks before restarting it once. Chrome uses a
 helper-managed non-default profile when needed to satisfy Chrome's DevTools
 profile requirement.
 
 The login flow:
 
-1. opens the login browser with a local DevTools endpoint;
+1. opens the login browser with a local remote-control endpoint;
 2. waits for sign-in to finish;
-3. reads YouTube Music cookies and `ytcfg` page context through DevTools;
+3. reads cookies and `ytcfg` page context through the browser protocol;
 4. writes a private JSON file with mode `0600` on Unix;
-5. clears the helper bootstrap cache;
+5. clears the helper bootstrap and response caches;
 6. refreshes Home asynchronously.
 
 The default output is:
@@ -380,24 +389,24 @@ older checkout, ytm-radio copies them into the new directory on first startup.
 
 By default, ytm-radio opens the system default browser when that browser has a
 supported login flow. Chromium-based browsers use the DevTools protocol;
-Firefox uses WebDriver BiDi. On macOS this uses the default application for
-`https://` URLs. On Linux this uses the default `x-scheme-handler/https`
-desktop entry.
+Firefox and Zen use WebDriver BiDi. On macOS this uses the default application
+for `https://` URLs. On Linux this uses the default
+`x-scheme-handler/https` desktop entry.
 
 Set a preferred login browser when the default browser is unsupported or when
 you want a specific browser. Use `chrome`, `brave`, `edge`, `chromium`,
-`firefox`, `dia`, or an executable path:
+`firefox`, `zen`, `dia`, or an executable path:
 
 ```elisp
 (setq ytm-radio-helper-login-browser "chrome")
 ```
 
-By default, the helper uses browser-specific profile behavior. Dia and Firefox
-use their normal profile. Chrome uses an isolated profile next to the auth file
-when no explicit profile is configured. With the default auth file, that is
-`~/.ytm-radio/login-profile/`. Chrome 136 and newer do not enable DevTools for
-the default Chrome profile. If you want a specific isolated login profile for
-any supported browser, set:
+By default, only Chrome uses an isolated profile next to the auth file when no
+explicit profile is configured. With the default auth file, that is
+`~/.ytm-radio/login-profile/`. Other supported browsers, including Dia,
+Firefox, and Zen, use their normal profile. Chrome 136 and newer do not enable
+DevTools for the default Chrome profile. If you want a specific isolated login
+profile for any supported browser, set:
 
 ```elisp
 (setq ytm-radio-helper-login-profile-directory
@@ -407,9 +416,10 @@ any supported browser, set:
 Set `ytm-radio-helper-login-profile-directory` to nil to use the helper's
 browser-specific default behavior.
 
-Firefox is supported through WebDriver BiDi. If Firefox is already running
-without the helper's remote control port, close it before login or configure an
-isolated profile directory so ytm-radio can start a separate Firefox instance.
+Firefox and Zen are supported through WebDriver BiDi. If the selected browser
+is already running without the helper's remote control port, close it before
+login or configure an isolated profile directory so ytm-radio can start a
+separate instance.
 
 The default local browser remote-control port is `29317`:
 
@@ -457,10 +467,12 @@ HTTPS proxy URLs are also used for Emacs cover downloads and passed to mpv for
 direct media URL playback.
 
 When ytm-radio starts a Chromium-compatible login browser, the helper also
-launches it with that proxy. Already-running browser sessions and Firefox login
-windows still use the browser or system proxy configuration. When a SOCKS proxy
-is configured, ytm-radio avoids using cached direct media URLs because mpv's
-direct transport may not preserve SOCKS routing.
+launches it with that proxy by passing a browser process argument. ytm-radio does
+not rewrite Firefox or Zen profile preferences for WebDriver BiDi login, and it
+does not alter already-running browser sessions. Firefox and Zen login windows
+and existing browser sessions must use the browser or system proxy
+configuration. When a SOCKS proxy is configured, ytm-radio avoids using cached
+direct media URLs because mpv's direct transport may not preserve SOCKS routing.
 
 ## URL Cookies
 

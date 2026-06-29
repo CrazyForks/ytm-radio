@@ -109,10 +109,11 @@ repository. It is adapted from `~/repos/coding-guidelines/general.md` and
   a Python helper or an Emacs dynamic module.
 - Keep the helper short-lived by default: one command reads configuration,
   writes one JSON response to stdout, and exits.
-- The supported account-auth workflow is a browser login window
-  driven through DevTools by `auth login-window`. Do not add browser-cookie
-  database import, copied-header import, Dia-specific restart commands, or
-  other fallback auth paths unless the product decision changes.
+- The supported account-auth workflow is a browser login window driven by
+  `auth login-window` through Chromium DevTools or Firefox-family WebDriver
+  BiDi. Do not add browser-cookie database import, copied-header import,
+  Dia-specific restart commands, or other fallback auth paths unless the
+  product decision changes.
 - Do not duplicate browser-specific cookie database crypto in Rust.
 - Version the helper JSON envelope. Emacs must reject unsupported schema
   versions instead of guessing.

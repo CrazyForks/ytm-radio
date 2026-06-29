@@ -16,9 +16,9 @@ The login-window workflow now accepts the same proxy setting. ytm-radio passes
 it to `auth login-window`, and the helper applies it when it launches a
 Chromium-compatible CDP browser by adding `--proxy-server=...`. This is limited
 to the browser process that ytm-radio starts. Already-running browser sessions
-keep their existing network configuration, and Firefox/WebDriver BiDi login
-continues to rely on browser or system proxy settings because it needs a
-separate implementation path.
+keep their existing network configuration. Firefox-family WebDriver BiDi login
+also uses browser or system proxy settings; ytm-radio deliberately does not
+rewrite Firefox or Zen profile preferences for login.
 
 For mpv direct media URL playback, ytm-radio keeps passing `--http-proxy` and
 also passes `--stream-lavf-o-append=http_proxy=...`. The ytdl hook still
@@ -29,5 +29,5 @@ existing direct-stream-cache avoidance behavior.
 
 Users with a local proxy can rely on one ytm-radio setting for helper requests,
 yt-dlp discovery, Chromium login launches, cover downloads, and mpv playback
-paths. Users who log in through Firefox or an already-running browser still need
-that browser to have working proxy configuration.
+paths. Users who log in through Firefox, Zen, or an already-running browser
+still need that browser to have working proxy configuration.

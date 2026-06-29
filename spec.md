@@ -1,7 +1,7 @@
-# ytm-radio UI Spec
+# ytm-radio Behavioral Spec
 
-This file records narrow UI contracts that are easy to regress but too detailed
-for the PRD.
+This file records narrow behavioral contracts that are easy to regress but too
+detailed for the PRD.
 
 ## Interface Scope
 
@@ -11,11 +11,10 @@ terminal TUI outside Emacs.
 
 ## Account State Markers
 
-Track rating state comes from the normalized `:like-status` field on ytm-radio
-tracks, or from helper item `like-status` values before they are normalized.
-When a visible row lacks its own rating state, ytm-radio may reuse a known
-rating from another cached row with the same YouTube video id. Saved/library
-state (`in-library`) is not a substitute for a thumbs-up rating.
+Track rating state is indexed at runtime by YouTube video id. Helper source and
+item fields seed that index, and mutation results override older source
+snapshots without rewriting every cached payload. Saved/library state
+(`in-library`) is not a substitute for a thumbs-up rating.
 
 Helper `like-status` fields distinguish unknown state from a known unrated
 state. If the helper cannot determine rating state, it omits `like-status`.
@@ -56,6 +55,19 @@ Action labels and messages may use words such as `liked`, `disliked`, `Like`,
 and `Dislike`; this icon contract applies only to persistent row/title rating
 markers.
 
+## Now-Playing Child Frame
+
+The now-playing child frame must not display a frame tab bar or buffer tab line,
+regardless of the user's global tab configuration.
+
+Cover art defines the child-frame width together with narrow visual side
+padding. That padding may account for Emacs image/text edge rendering instead
+of being mathematically symmetric, but it must remain small and deterministic.
+
+Metadata, progress, and playback controls are centered against the same
+child-frame body width. Text rows reserve the cover side padding as overflow
+guard space so a rating marker appended to the title stays on the title line.
+
 ## Detail Account Mutations
 
 Detail library and subscription mutations return refreshed detail sources from
@@ -69,9 +81,9 @@ playlist card must therefore enter a detail page with a saved bookmark marker
 even if the helper detail header does not expose reliable library state.
 
 After a detail library or subscription mutation succeeds, the returned target
-state must be written back to matching cached opener/list items by browse id or
-playlist id. Going back to Home, Explore, or Library should show the same saved
-or subscribed marker state that the detail header shows after the mutation.
+state must be indexed under matching browse and playlist ids. Going back to
+Home, Explore, or Library must resolve stale opener/list snapshots through that
+index and show the same state as the detail header.
 
 Detail header bodies are not enterable sections. Pressing `RET` on ordinary
 header text must not open a new view that only contains the same header image
@@ -92,11 +104,25 @@ fresh Home load so lazy loading can recover the next-page token.
 
 ## Helper Network Requests
 
-The Rust helper owns YouTube Music HTTP requests. A YouTubeI request that fails
-before any HTTP response is received is treated as a transient send failure and
-retried twice with short backoff. HTTP error responses are not retried because
-they may represent account, auth, or request-shape problems.
+The helper owns bootstrap and response cache locations. Explicit Emacs refresh
+commands pass `--fresh`; Elisp never deletes helper cache paths directly.
+Successful account mutations invalidate cached API responses before the helper
+exits. A successful browser login invalidates both bootstrap and response
+caches associated with the auth path.
 
-When send failures still exhaust all attempts, the helper error must include
-the underlying error source chain and the attempt count so the Emacs message can
-distinguish DNS, proxy, TLS, timeout, and connection failures.
+Both successful and failed helper commands write versioned JSON envelopes to
+stdout. Failed commands exit non-zero and include `code`, `message`,
+`retryable`, and `auth-required` fields. Emacs decides whether to start login
+from `auth-required`, not by matching the message text. Human-readable helper
+diagnostics remain on stderr.
+
+The Rust helper owns YouTube Music HTTP requests. A read-only YouTubeI request
+that fails before any HTTP response is received is treated as a transient send
+failure and retried twice with short backoff. Mutation requests are sent once;
+repeating a request whose response was lost could apply an action twice. HTTP
+error responses are not retried because they may represent account, auth, or
+request-shape problems.
+
+When retried read requests still exhaust all attempts, the helper error must
+include the underlying error source chain and the attempt count so the Emacs
+message can distinguish DNS, proxy, TLS, timeout, and connection failures.

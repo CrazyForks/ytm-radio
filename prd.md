@@ -79,6 +79,9 @@ and useful.
 - Browser refreshes should preserve point when possible and never park point at
   the end as a side effect of rendering.
 - The now-playing child frame should not steal focus during track changes.
+- The now-playing child frame should keep cover art, metadata, progress, and
+  playback controls compact, visually balanced, and independent from global tab
+  UI.
 - The child frame should resize deterministically from current track/player
   state and avoid speculative layout compensation.
 
@@ -91,8 +94,9 @@ and useful.
   browser login window, and helper JSON envelopes. Elisp may choose targets and
   update local display state, but it must not persist YouTube Music feedback
   tokens or duplicate Innertube request assembly.
-- The browser login window may use Chromium DevTools or Firefox WebDriver BiDi.
-  It must not read browser cookie databases directly.
+- The browser login window may use Chromium DevTools or WebDriver BiDi for
+  Firefox-family browsers, including Firefox and Zen. It must not read browser
+  cookie databases directly.
 - The helper may be built locally during development or installed as a
   platform-specific release binary. Emacs may download that binary through an
   explicit user command, but it must not silently download executable code while
@@ -100,10 +104,17 @@ and useful.
 - A single optional proxy URL may be applied to helper account requests,
   `yt-dlp` discovery and prefetching, cover image downloads, and mpv playback
   paths. When the helper starts a Chromium-compatible login browser, the proxy
-  is applied to that browser launch. Already-running browsers and Firefox login
-  windows continue to use browser or system proxy configuration.
+  is applied to that browser launch. ytm-radio does not rewrite Firefox or Zen
+  profile preferences for WebDriver BiDi login, and it does not alter
+  already-running browser sessions; those paths use browser or system proxy
+  configuration.
 - Helper stdout must remain machine-readable JSON; diagnostics belong on
   stderr.
+- Helper failures must expose stable error codes and auth/retry metadata rather
+  than requiring Elisp to classify diagnostic text.
+- The Rust helper owns its bootstrap and response cache paths, explicit refresh
+  bypass, and mutation invalidation. Elisp must not delete helper cache files
+  directly.
 - Helper schema versions are explicit, and unsupported schema versions must be
   rejected.
 - Deterministic tests must not require live YouTube Music, browser cookies, or
