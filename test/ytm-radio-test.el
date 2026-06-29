@@ -3030,6 +3030,47 @@ FIELDS are included on both the top-level mutation output and source."
     (should (string-empty-p (nth 1 lines)))
     (should (string-empty-p (nth 2 lines)))))
 
+(ert-deftest ytm-radio-side-window-title-scroll-uses-side-window-width ()
+  "Advance side-window title marquee without resetting through another layout."
+  (let* ((track (ytm-radio--make-track
+                 :id "v1"
+                 :title "Long Side Window Track Title"
+                 :url "https://music.youtube.com/watch?v=v1"
+                 :artist "Artist"
+                 :duration 185))
+         (ytm-radio-display-style 'side-window)
+         (ytm-radio--player
+          (ytm-radio--make-player :status 'playing
+                                  :current-track track
+                                  :position 42
+                                  :duration 185))
+         (ytm-radio--title-scroll-offset 0)
+         (ytm-radio--title-scroll-key nil)
+         (ytm-radio--title-scroll-timer nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer (ytm-radio--now-playing-buffer)
+            (let ((inhibit-read-only t))
+              (erase-buffer)))
+          (cl-letf (((symbol-function 'display-graphic-p)
+                     (lambda (&optional _frame) nil))
+                    ((symbol-function 'ytm-radio--mdicon)
+                     (lambda (_name fallback) fallback))
+                    ((symbol-function 'ytm-radio--side-window-content-width)
+                     (lambda () 48))
+                    ((symbol-function 'ytm-radio--now-playing-visible-p)
+                     (lambda () t))
+                    ((symbol-function 'ytm-radio--side-window-visible-p)
+                     (lambda () t))
+                    ((symbol-function 'ytm-radio--schedule-title-scroll)
+                     #'ignore))
+            (ytm-radio--render-side-window)
+            (should (equal ytm-radio--title-scroll-offset 0))
+            (should ytm-radio--title-scroll-key)
+            (ytm-radio--run-title-scroll)
+            (should (equal ytm-radio--title-scroll-offset 1))))
+      (ytm-radio--reset-title-scroll))))
+
 (ert-deftest ytm-radio-side-window-style-uses-top-dedicated-window ()
   "Show the side-window display style in a top dedicated side window."
   (let ((ytm-radio-display-style 'side-window)

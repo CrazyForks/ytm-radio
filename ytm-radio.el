@@ -2709,6 +2709,13 @@ When PRESERVE-RETRY-STAGE is non-nil, continue an automatic retry."
            (frame-visible-p ytm-radio--frame))
       (get-buffer-window ytm-radio--now-playing-buffer-name t)))
 
+(defun ytm-radio--render-visible-now-playing-without-fit ()
+  "Render the visible now-playing surface without child-frame fitting."
+  (if (and (eq ytm-radio-display-style 'side-window)
+           (ytm-radio--side-window-visible-p))
+      (ytm-radio--render-side-window)
+    (ytm-radio--render-now-playing-without-fit)))
+
 (defun ytm-radio--tty-child-frames-supported-p ()
   "Return non-nil when the current TTY can display child frames."
   (and (not (display-graphic-p))
@@ -2725,7 +2732,7 @@ When PRESERVE-RETRY-STAGE is non-nil, continue an automatic retry."
   (when (and (ytm-radio--now-playing-visible-p)
              (not (equal (ytm-radio--progress-render-key)
                          ytm-radio--last-rendered-progress-key)))
-    (ytm-radio--render-now-playing-without-fit)))
+    (ytm-radio--render-visible-now-playing-without-fit)))
 
 (defun ytm-radio--schedule-progress-render ()
   "Schedule a throttled now-playing progress refresh."
@@ -2759,7 +2766,7 @@ When PRESERVE-RETRY-STAGE is non-nil, continue an automatic retry."
              (ytm-radio--current-track))
     (setq ytm-radio--title-scroll-offset
           (1+ ytm-radio--title-scroll-offset))
-    (ytm-radio--render-now-playing-without-fit)))
+    (ytm-radio--render-visible-now-playing-without-fit)))
 
 (defun ytm-radio--schedule-title-scroll ()
   "Schedule a now-playing title marquee frame."
@@ -2774,7 +2781,7 @@ When PRESERVE-RETRY-STAGE is non-nil, continue an automatic retry."
   (setf (map-elt ytm-radio--player property) value)
   (if (eq property :position)
       (ytm-radio--schedule-progress-render)
-    (ytm-radio--render-now-playing-without-fit)))
+    (ytm-radio--render-visible-now-playing-without-fit)))
 
 (defun ytm-radio--mpv-filter (process output)
   "Parse newline-delimited JSON OUTPUT from mpv PROCESS."
