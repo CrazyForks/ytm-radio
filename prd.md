@@ -16,8 +16,8 @@ and useful.
 - Emacs users who want keyboard-first YouTube Music playback.
 - Users who want a guided YouTube Music login flow without copying headers or
   exposing raw cookies to Emacs state.
-- Users who prefer a compact now-playing child frame for artwork and transport
-  controls while continuing to work in other buffers.
+- Users who prefer a compact now-playing child frame or frame-level side window
+  for artwork and transport controls while continuing to work in other buffers.
 
 ## Goals
 
@@ -30,8 +30,8 @@ and useful.
 - Keep playback controls keyboard-first: open, play, pause, next, previous,
   seek, repeat, shuffle, share, queue viewing, current-song actions, and back
   navigation must be available without mouse interaction.
-- Keep the now-playing child frame focused on cover art, title, artist,
-  progress, and compact playback-mode controls.
+- Keep now-playing surfaces focused on cover art, title, artist, progress, and
+  compact playback-mode controls.
 - Treat the currently playing track as a first-class action target, separate
   from browser point, so account actions and local queue actions remain
   predictable when point is on a search result, section, album, or artist.
@@ -78,12 +78,16 @@ and useful.
   transient menu, while each action remains callable as a normal command.
 - Browser refreshes should preserve point when possible and never park point at
   the end as a side effect of rendering.
-- The now-playing child frame should not steal focus during track changes.
+- Now-playing refreshes should not steal focus during track changes.
 - The now-playing child frame should keep cover art, metadata, progress, and
   playback controls compact, visually balanced, and independent from global tab
   UI.
+- Mouse users should be able to drag the now-playing child frame without
+  breaking keyboard-only operation or playback controls.
 - The child frame should resize deterministically from current track/player
   state and avoid speculative layout compensation.
+- The side-window now-playing style should appear once per frame instead of once
+  per window, reserve layout space, and avoid unrelated tab-bar semantics.
 
 ## Technical Requirements
 

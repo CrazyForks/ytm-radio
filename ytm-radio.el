@@ -110,6 +110,16 @@
   "Face for the filled now-playing progress bar cells."
   :group 'ytm-radio)
 
+(defface ytm-radio-side-window-title
+  '((t (:inherit bold :underline nil)))
+  "Face for the side-window now-playing track title."
+  :group 'ytm-radio)
+
+(defface ytm-radio-side-window-artist
+  '((t (:inherit shadow :underline nil)))
+  "Face for the side-window now-playing track artist."
+  :group 'ytm-radio)
+
 (defcustom ytm-radio-yt-dlp-program "yt-dlp"
   "Program name or path used to run yt-dlp."
   :type 'string
@@ -272,9 +282,35 @@ helper-managed non-default profile when its DevTools login flow requires one."
   :group 'ytm-radio)
 
 (defcustom ytm-radio-display-style 'child-frame
-  "Preferred display style for the now-playing view."
+  "Preferred display style for the now-playing view.
+The `side-window' style installs a compact top side window on the frame."
   :type '(choice (const :tag "Child frame" child-frame)
-                 (const :tag "Regular buffer" buffer))
+          (const :tag "Top side window" side-window)
+          (const :tag "Regular buffer" buffer))
+  :group 'ytm-radio)
+
+(defcustom ytm-radio-side-window-height 2
+  "Height in lines of the side-window now-playing view."
+  :type '(restricted-sexp
+          :match-alternatives
+          ((lambda (value)
+             (and (integerp value) (> value 0)))))
+  :group 'ytm-radio)
+
+(defcustom ytm-radio-side-window-cover-size 34
+  "Displayed side-window cover image edge size in pixels."
+  :type '(restricted-sexp
+          :match-alternatives
+          ((lambda (value)
+             (and (integerp value) (> value 0)))))
+  :group 'ytm-radio)
+
+(defcustom ytm-radio-side-window-title-width 32
+  "Maximum title width in columns for the side-window now-playing view."
+  :type '(restricted-sexp
+          :match-alternatives
+          ((lambda (value)
+             (and (integerp value) (> value 0)))))
   :group 'ytm-radio)
 
 (defcustom ytm-radio-child-frame-width 34
@@ -487,8 +523,14 @@ stored in `ytm-radio-state-file'."
 (defvar ytm-radio--frame nil
   "Child frame currently showing the now-playing buffer.")
 
+(defvar ytm-radio--frame-manual-position nil
+  "Manual pixel position for the now-playing child frame.")
+
 (defconst ytm-radio--frame-border-width 1
   "Width in pixels of the now-playing child-frame border.")
+
+(defvar ytm-radio--side-window nil
+  "Top side window currently showing the now-playing buffer.")
 
 (defvar ytm-radio--cover-render-width nil
   "Temporary cover image width used while rendering now-playing.")
@@ -2649,9 +2691,16 @@ When PRESERVE-RETRY-STAGE is non-nil, continue an automatic retry."
            (or (map-elt ytm-radio--player :duration)
                (map-elt track :duration))))))
 
+(defun ytm-radio--side-window-visible-p ()
+  "Return non-nil when the ytm-radio side-window view is visible."
+  (and (window-live-p ytm-radio--side-window)
+       (eq (window-buffer ytm-radio--side-window)
+           (get-buffer ytm-radio--now-playing-buffer-name))))
+
 (defun ytm-radio--now-playing-visible-p ()
   "Return non-nil when now-playing is visible."
-  (or (and (frame-live-p ytm-radio--frame)
+  (or (ytm-radio--side-window-visible-p)
+      (and (frame-live-p ytm-radio--frame)
            (frame-visible-p ytm-radio--frame))
       (get-buffer-window ytm-radio--now-playing-buffer-name t)))
 
@@ -2983,6 +3032,13 @@ When AUTOMATIC is non-nil, honor single-track repeat."
     (define-key map (kbd "S") #'ytm-radio-share)
     (define-key map (kbd "Q") #'ytm-radio-queue)
     (define-key map (kbd "q") #'ytm-radio-hide-now-playing)
+    (dolist (event '([mouse-1] [down-mouse-1] [drag-mouse-1]
+                     [double-mouse-1] [triple-mouse-1]
+                     [mouse-2] [down-mouse-2] [drag-mouse-2]
+                     [double-mouse-2] [triple-mouse-2]
+                     [mouse-3] [down-mouse-3] [drag-mouse-3]
+                     [double-mouse-3] [triple-mouse-3]))
+      (define-key map event #'ignore))
     (dolist (command '(scroll-up-command scroll-down-command
                        scroll-up scroll-down scroll-left scroll-right
                        mwheel-scroll pixel-scroll-precision))
@@ -5479,14 +5535,23 @@ nil when no matching states exist."
         (ytm-radio--cache-cover url callback)
         nil)))
 
-(defun ytm-radio--scaled-cover-size (natural-width natural-height)
-  "Return cover display size for NATURAL-WIDTH and NATURAL-HEIGHT."
+(defun ytm-radio--scaled-image-size
+    (natural-width natural-height max-width max-height)
+  "Return image size fitting NATURAL-WIDTH and NATURAL-HEIGHT.
+MAX-WIDTH and MAX-HEIGHT bound the returned display size."
   (let* ((natural-width (max 1 natural-width))
          (natural-height (max 1 natural-height))
-         (scale (min (/ (float ytm-radio-cover-max-width) natural-width)
-                     (/ (float ytm-radio-cover-max-height) natural-height))))
+         (scale (min (/ (float max-width) natural-width)
+                     (/ (float max-height) natural-height))))
     (cons (max 1 (round (* natural-width scale)))
           (max 1 (round (* natural-height scale))))))
+
+(defun ytm-radio--scaled-cover-size (natural-width natural-height)
+  "Return cover display size for NATURAL-WIDTH and NATURAL-HEIGHT."
+  (ytm-radio--scaled-image-size natural-width
+                                natural-height
+                                ytm-radio-cover-max-width
+                                ytm-radio-cover-max-height))
 
 (defun ytm-radio--cover-display-size (file)
   "Return display size for cover FILE, or nil."
@@ -5497,18 +5562,19 @@ nil when no matching states exist."
     (ytm-radio--scaled-cover-size (ceiling (car dimensions))
                                   (ceiling (cdr dimensions)))))
 
+(defun ytm-radio--cover-refresh-current-track (url _file)
+  "Refresh now-playing when URL belongs to the current track."
+  (when-let* ((current (ytm-radio--current-track)))
+    (when (equal url (ytm-radio--track-thumbnail-url current))
+      (ytm-radio--render-now-playing))))
+
 (defun ytm-radio--cover-spec (track)
   "Return an image spec and display size for TRACK's cover."
   (when-let* ((thumbnail (ytm-radio--track-thumbnail-url track))
               (file (and (display-graphic-p)
                          (ytm-radio--ensure-cover-file
                           thumbnail
-                          (lambda (url _file)
-                            (when-let* ((current (ytm-radio--current-track)))
-                              (when (equal url
-                                           (ytm-radio--track-thumbnail-url
-                                            current))
-                                (ytm-radio--render-now-playing)))))))
+                          #'ytm-radio--cover-refresh-current-track)))
               (size (ytm-radio--cover-display-size file))
               (image (ignore-errors
                        (create-image file nil nil
@@ -5708,10 +5774,146 @@ When PIXEL-WIDTH is non-nil, also fit the result to that pixel width."
         (error fallback))
     fallback))
 
+(defvar ytm-radio--now-playing-inert-button-map
+  (let ((map (make-sparse-keymap)))
+    (dolist (event '([mouse-1] [down-mouse-1] [drag-mouse-1]
+                     [double-mouse-1] [triple-mouse-1]
+                     [mouse-2] [down-mouse-2] [drag-mouse-2]
+                     [double-mouse-2] [triple-mouse-2]
+                     [mouse-3] [down-mouse-3] [drag-mouse-3]
+                     [double-mouse-3] [triple-mouse-3]))
+      (define-key map event #'ignore))
+    map)
+  "Keymap for inert now-playing surface buttons.")
+
+(defvar ytm-radio--now-playing-button-map
+  (let ((map (copy-keymap button-map)))
+    (dolist (event '([down-mouse-1] [drag-mouse-1]
+                     [double-mouse-1] [triple-mouse-1]
+                     [down-mouse-2] [drag-mouse-2]
+                     [double-mouse-2] [triple-mouse-2]
+                     [mouse-3] [down-mouse-3] [drag-mouse-3]
+                     [double-mouse-3] [triple-mouse-3]))
+      (define-key map event #'ignore))
+    (define-key map [mouse-1] #'ytm-radio--push-now-playing-button)
+    (define-key map [mouse-2] #'ytm-radio--push-now-playing-button)
+    map)
+  "Keymap for now-playing controls that does not select their window.")
+
 (define-button-type 'ytm-radio-now-playing-button
   'follow-link t
   'face 'default
-  'mouse-face 'highlight)
+  'mouse-face 'highlight
+  'keymap ytm-radio--now-playing-button-map)
+
+(defvar ytm-radio--now-playing-drag-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [down-mouse-1] #'ytm-radio--drag-now-playing)
+    map)
+  "Keymap for dragging the now-playing child frame from text areas.")
+
+(defun ytm-radio--now-playing-button-at-event (event)
+  "Return the now-playing button at mouse EVENT, or nil."
+  (let* ((position (event-start event))
+         (window (posn-window position))
+         (point (posn-point position)))
+    (when (and (window-live-p window)
+               (integer-or-marker-p point))
+      (with-current-buffer (window-buffer window)
+        (or (button-at point)
+            (and (> point (point-min))
+                 (button-at (1- point))))))))
+
+(defun ytm-radio--now-playing-button-event-p (event)
+  "Return non-nil when mouse EVENT starts on a button."
+  (and (ytm-radio--now-playing-button-at-event event) t))
+
+(defun ytm-radio--push-now-playing-button (event)
+  "Push the now-playing button at mouse EVENT without selecting its window."
+  (interactive "e")
+  (let* ((position (event-start event))
+         (window (posn-window position))
+         (point (posn-point position)))
+    (when (and (window-live-p window)
+               (integer-or-marker-p point))
+      (with-current-buffer (window-buffer window)
+        (when-let* ((button (or (button-at point)
+                                (and (> point (point-min))
+                                     (button-at (1- point))))))
+          (button-activate button t))))))
+
+(defun ytm-radio--drag-now-playing (event)
+  "Drag the now-playing child frame from mouse EVENT."
+  (interactive "e")
+  (unless (ytm-radio--now-playing-button-event-p event)
+    (let* ((position (event-start event))
+           (window (posn-window position))
+           (frame (if (window-live-p window)
+                      (window-frame window)
+                    window)))
+      (when (and (frame-live-p ytm-radio--frame)
+                 (eq frame ytm-radio--frame))
+        (let ((start (mouse-absolute-pixel-position))
+              (origin (frame-position frame))
+              moved)
+          (when (and (consp start)
+                     (numberp (car start))
+                     (numberp (cdr start)))
+            (track-mouse
+              (while (eq (car-safe (setq event (read-event)))
+                         'mouse-movement)
+                (when-let* ((current (mouse-absolute-pixel-position))
+                            ((numberp (car current)))
+                            ((numberp (cdr current))))
+                  (let ((new-position
+                         (ytm-radio--constrain-frame-position
+                          frame
+                          (cons (+ (car origin)
+                                   (- (car current) (car start)))
+                                (+ (cdr origin)
+                                   (- (cdr current) (cdr start)))))))
+                    (set-frame-position frame
+                                        (car new-position)
+                                        (cdr new-position))
+                    (setq ytm-radio--frame-manual-position new-position
+                          moved t)))))
+            (when moved
+              (ytm-radio--remember-frame-position frame))))))))
+
+(defun ytm-radio--add-now-playing-drag-bindings ()
+  "Add child-frame drag bindings to non-button text in the current buffer."
+  (when (and (eq ytm-radio-display-style 'child-frame)
+             (display-graphic-p (ytm-radio--now-playing-frame)))
+    (let ((position (point-min))
+          (end (point-max)))
+      (while (< position end)
+        (let ((next (or (next-single-property-change position 'button nil end)
+                        end)))
+          (unless (get-text-property position 'button)
+            (add-text-properties
+             position next
+             `(keymap ,ytm-radio--now-playing-drag-map
+               help-echo "Drag to move now-playing")))
+          (setq position next))))))
+
+(defun ytm-radio--add-now-playing-inert-button-properties ()
+  "Make non-control now-playing text behave like inert buttons."
+  (let ((position (point-min))
+        (end (point-max)))
+    (while (< position end)
+      (let ((next (or (next-single-property-change position 'button nil end)
+                      end)))
+        (unless (get-text-property position 'button)
+          (add-text-properties
+           position next
+           `(button ,(list t)
+             category t
+             follow-link t
+             keymap ,ytm-radio--now-playing-inert-button-map
+             action ignore
+             mouse-action ignore
+             rear-nonsticky t)))
+        (setq position next)))))
 
 (defun ytm-radio--insert-now-playing-control (icon command help &optional face)
   "Insert a now-playing ICON button running COMMAND with HELP text.
@@ -5720,6 +5922,8 @@ When FACE is non-nil, use it for the button label."
                       'type 'ytm-radio-now-playing-button
                       'action (lambda (_button)
                                 (call-interactively command))
+                      'mouse-action (lambda (_button)
+                                      (call-interactively command))
                       'help-echo help
                       'face (or face 'default)
                       'mouse-face 'highlight))
@@ -5771,6 +5975,94 @@ When FACE is non-nil, use it for the button label."
          #'ytm-radio-next
          "Next track")
    (ytm-radio--shuffle-control)))
+
+(defun ytm-radio--side-window-cover (track)
+  "Return TRACK's cover image for the side-window view."
+  (or (when-let* ((thumbnail (ytm-radio--track-thumbnail-url track))
+                  (file (and (display-graphic-p)
+                             (ytm-radio--ensure-cover-file
+                              thumbnail
+                              #'ytm-radio--cover-refresh-current-track)))
+                  (dimensions (ytm-radio--image-file-dimensions file))
+                  (size (ytm-radio--scaled-image-size
+                         (car dimensions)
+                         (cdr dimensions)
+                         ytm-radio-side-window-cover-size
+                         ytm-radio-side-window-cover-size))
+                  (image (ignore-errors
+                           (create-image file nil nil
+                                         :width (car size)
+                                         :height (cdr size)))))
+        (propertize " " 'display image 'line-height t))
+      (propertize (ytm-radio--mdicon "nf-md-music_box" "♪")
+                  'face 'ytm-radio-side-window-title)))
+
+(defun ytm-radio--side-window-track-text (track)
+  "Return TRACK title and artist text for the side-window view."
+  (let* ((title-width ytm-radio-side-window-title-width)
+         (title (ytm-radio--scrolling-track-title-with-rating
+                 track title-width 'ytm-radio-side-window-title))
+         (artist (map-elt track :artist)))
+    (concat title
+            (when (and (stringp artist)
+                       (not (string-empty-p artist)))
+              (concat
+               "  "
+               (propertize
+                (ytm-radio--truncate artist
+                                     (max 8 (/ ytm-radio-side-window-title-width
+                                               2)))
+                'face 'ytm-radio-side-window-artist))))))
+
+(defun ytm-radio--insert-side-window-controls ()
+  "Insert compact playback controls for the side-window view."
+  (let ((separator ytm-radio--now-playing-control-separator))
+    (cl-loop for (icon command help face) in (ytm-radio--now-playing-controls)
+             for first = t then nil
+             unless first do (insert separator)
+             do (ytm-radio--insert-now-playing-control icon command help face))))
+
+(defun ytm-radio--insert-side-window-fill ()
+  "Insert a stretch glyph covering the rest of the side-window row."
+  (insert (propertize " " 'display '(space :align-to right))))
+
+(defun ytm-radio--finish-side-window-lines ()
+  "Fill the configured side-window height with inert display rows."
+  (ytm-radio--insert-side-window-fill)
+  (insert "\n")
+  (dotimes (_ (1- ytm-radio-side-window-height))
+    (ytm-radio--insert-side-window-fill)
+    (insert "\n")))
+
+(defun ytm-radio--render-side-window ()
+  "Render the now-playing buffer for the side-window display style."
+  (when-let* ((buffer (get-buffer ytm-radio--now-playing-buffer-name)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t)
+            (track (ytm-radio--current-track)))
+        (erase-buffer)
+        (if track
+            (progn
+              (insert " ")
+              (insert (ytm-radio--side-window-cover track))
+              (insert "  ")
+              (insert (ytm-radio--side-window-track-text track))
+              (insert "    ")
+              (ytm-radio--insert-side-window-controls)
+              (when-let* ((time-label (ytm-radio--playback-time-label track)))
+                (insert "    ")
+                (insert (propertize time-label 'face 'shadow))))
+          (ytm-radio--reset-title-scroll)
+          (insert " "
+                  (propertize (ytm-radio--mdicon "nf-md-music_box" "♪")
+                              'face 'ytm-radio-side-window-title)
+                  " "
+                  (propertize "No track" 'face 'ytm-radio-side-window-artist)))
+        (ytm-radio--finish-side-window-lines)
+        (ytm-radio--add-now-playing-inert-button-properties)
+        (setq ytm-radio--last-rendered-progress-key
+              (ytm-radio--progress-render-key))
+        (goto-char (point-min))))))
 
 (defun ytm-radio--insert-now-playing-controls ()
   "Insert centered now-playing controls."
@@ -5833,6 +6125,7 @@ When FACE is non-nil, use it for the button label."
           (progn
             (ytm-radio--reset-title-scroll)
             (ytm-radio--insert-centered-now-playing-line "No track")))
+        (ytm-radio--add-now-playing-drag-bindings)
         (setq ytm-radio--last-rendered-progress-key
               (ytm-radio--progress-render-key))
         (goto-char (min (max old-point (point-min)) (point-max)))
@@ -5841,7 +6134,9 @@ When FACE is non-nil, use it for the button label."
     (when (and (frame-live-p ytm-radio--frame)
                (not ytm-radio--inhibit-frame-fit))
       (ytm-radio--fit-frame ytm-radio--frame buffer)
-      (ytm-radio--position-frame ytm-radio--frame))))
+      (ytm-radio--position-frame ytm-radio--frame))
+    (when (ytm-radio--side-window-visible-p)
+      (ytm-radio--render-side-window))))
 
 (defun ytm-radio--show-regular-buffer (buffer)
   "Show BUFFER in a regular Emacs window."
@@ -5851,10 +6146,12 @@ When FACE is non-nil, use it for the button label."
   "Delete the now-playing child frame, if any."
   (when (frame-live-p ytm-radio--frame)
     (let ((parent (frame-parent ytm-radio--frame)))
+      (redirect-frame-focus ytm-radio--frame nil)
       (delete-frame ytm-radio--frame)
       (when (frame-live-p parent)
         (select-frame-set-input-focus parent))))
-  (setq ytm-radio--frame nil))
+  (setq ytm-radio--frame nil
+        ytm-radio--frame-manual-position nil))
 
 (defun ytm-radio--buffer-image (buffer)
   "Return the first image displayed in BUFFER, or nil."
@@ -5963,8 +6260,19 @@ When FACE is non-nil, use it for the button label."
       (set-frame-width frame (max ytm-radio-child-frame-width
                                   (+ 2 (frame-width frame)))))))
 
-(defun ytm-radio--position-frame (frame)
-  "Position child FRAME at the lower right of its parent."
+(defun ytm-radio--constrain-frame-position (frame position)
+  "Return POSITION constrained within FRAME's parent."
+  (if-let* ((parent (frame-parent frame)))
+      (cons (max 0 (min (car position)
+                        (max 0 (- (frame-pixel-width parent)
+                                  (frame-pixel-width frame)))))
+            (max 0 (min (cdr position)
+                        (max 0 (- (frame-pixel-height parent)
+                                  (frame-pixel-height frame))))))
+    position))
+
+(defun ytm-radio--default-frame-position (frame)
+  "Return FRAME's default lower-right child-frame position."
   (when-let* ((parent (frame-parent frame)))
     (let* ((bottom-window (car (window-at-side-list parent 'bottom)))
            (mode-line-height (if bottom-window
@@ -5975,14 +6283,26 @@ When FACE is non-nil, use it for the button label."
                               mode-line-height))
            (x-margin (* 2 (frame-char-width parent)))
            (y-margin (frame-char-height parent)))
-      (set-frame-position
-       frame
-       (max 0 (- (frame-pixel-width parent)
-                 (frame-pixel-width frame)
-                 x-margin))
-       (max 0 (- content-bottom
-                 (frame-pixel-height frame)
-                 y-margin))))))
+      (cons (max 0 (- (frame-pixel-width parent)
+                      (frame-pixel-width frame)
+                      x-margin))
+            (max 0 (- content-bottom
+                      (frame-pixel-height frame)
+                      y-margin))))))
+
+(defun ytm-radio--remember-frame-position (frame)
+  "Remember FRAME's current manual child-frame position."
+  (setq ytm-radio--frame-manual-position
+        (ytm-radio--constrain-frame-position frame (frame-position frame))))
+
+(defun ytm-radio--position-frame (frame)
+  "Position child FRAME at its manual or default position."
+  (when-let* ((position (or ytm-radio--frame-manual-position
+                            (ytm-radio--default-frame-position frame))))
+    (setq position (ytm-radio--constrain-frame-position frame position))
+    (when ytm-radio--frame-manual-position
+      (setq ytm-radio--frame-manual-position position))
+    (set-frame-position frame (car position) (cdr position))))
 
 (defun ytm-radio--apply-child-frame-border-face (frame)
   "Apply ytm-radio child-frame border styling to FRAME."
@@ -5994,6 +6314,7 @@ When FACE is non-nil, use it for the button label."
 (defun ytm-radio--ensure-frame (buffer)
   "Return a child frame showing the now-playing BUFFER."
   (unless (frame-live-p ytm-radio--frame)
+    (setq ytm-radio--frame-manual-position nil)
     (let* ((parent (selected-frame))
            (frame-resize-pixelwise t)
            (frame (make-frame
@@ -6017,12 +6338,18 @@ When FACE is non-nil, use it for the button label."
                      (internal-border-width . 0)
                      (child-frame-border-width . ,ytm-radio--frame-border-width)
                      (no-focus-on-map . t)
+                     (no-accept-focus . t)
                      (visibility . nil)))))
+      (redirect-frame-focus frame parent)
       (setq ytm-radio--frame frame)))
   (ytm-radio--apply-child-frame-border-face ytm-radio--frame)
   (let ((window (frame-root-window ytm-radio--frame)))
+    (when-let* ((parent (frame-parent ytm-radio--frame)))
+      (redirect-frame-focus ytm-radio--frame parent))
     (set-window-buffer window buffer)
     (set-window-dedicated-p window t)
+    (set-window-parameter window 'no-other-window t)
+    (set-window-parameter window 'no-delete-other-windows t)
     (set-window-fringes window 0 0 nil t)
     (set-window-margins window 0 0)
     (set-window-scroll-bars window 0 nil 0 nil t))
@@ -6030,9 +6357,8 @@ When FACE is non-nil, use it for the button label."
   (ytm-radio--position-frame ytm-radio--frame)
   ytm-radio--frame)
 
-(defun ytm-radio--show-child-frame (buffer &optional focus)
-  "Show now-playing BUFFER in a child frame.
-When FOCUS is non-nil, select the child frame."
+(defun ytm-radio--show-child-frame (buffer &optional _focus)
+  "Show now-playing BUFFER in a non-focusable child frame."
   (let ((selected-frame (selected-frame))
         (selected-window (selected-window))
         (frame (ytm-radio--ensure-frame buffer)))
@@ -6040,14 +6366,11 @@ When FOCUS is non-nil, select the child frame."
         (progn
           (unless (frame-visible-p frame)
             (make-frame-visible frame))
-          (when focus
-            (select-frame-set-input-focus frame))
           frame)
-      (unless focus
-        (when (frame-live-p selected-frame)
-          (select-frame selected-frame)
-          (when (window-live-p selected-window)
-            (select-window selected-window)))))))
+      (when (frame-live-p selected-frame)
+        (select-frame selected-frame)
+        (when (window-live-p selected-window)
+          (select-window selected-window))))))
 
 (defun ytm-radio--reposition-on-resize (frame)
   "Re-pin the now-playing child frame when parent FRAME changes size."
@@ -6061,15 +6384,62 @@ When FOCUS is non-nil, select the child frame."
   "Show browser BUFFER in a regular Emacs window."
   (ytm-radio--show-regular-buffer buffer))
 
+(defun ytm-radio--show-side-window (buffer)
+  "Show BUFFER in a top side window."
+  (ytm-radio--render-side-window)
+  (let* ((selected-window (selected-window))
+         (window
+          (display-buffer
+           buffer
+           `((display-buffer-in-side-window)
+             (side . top)
+             (slot . -1)
+             (window-height . ,ytm-radio-side-window-height)
+             (dedicated . side)
+             (post-command-select-window . nil)
+             (window-parameters
+              . ((no-other-window . t)
+                 (no-delete-other-windows . t)
+                 (mode-line-format . none)
+                 (header-line-format . none)))))))
+    (setq ytm-radio--side-window window)
+    (when (window-live-p window)
+      (set-window-dedicated-p window 'side)
+      (set-window-fringes window 0 0 nil t)
+      (set-window-margins window 0 0)
+      (set-window-scroll-bars window 0 nil 0 nil t)
+      (window-preserve-size window nil t))
+    (when (window-live-p selected-window)
+      (select-window selected-window 'norecord))
+    window))
+
+(defun ytm-radio--hide-side-window ()
+  "Hide the side-window now-playing view."
+  (when (window-live-p ytm-radio--side-window)
+    (let ((window ytm-radio--side-window))
+      (setq ytm-radio--side-window nil)
+      (set-window-dedicated-p window nil)
+      (delete-window window)))
+  (setq ytm-radio--side-window nil))
+
 (defun ytm-radio--show-now-playing (&optional focus)
   "Show the now-playing view using `ytm-radio-display-style'.
-When FOCUS is non-nil, focus the now-playing child frame."
+FOCUS is accepted for compatibility; child frames stay non-focusable."
   (let ((buffer (ytm-radio--now-playing-buffer)))
     (ytm-radio--render-now-playing)
-    (if (and (eq ytm-radio-display-style 'child-frame)
-             (display-graphic-p))
-        (ytm-radio--show-child-frame buffer focus)
-      (ytm-radio--show-regular-buffer buffer))))
+    (pcase ytm-radio-display-style
+      ('side-window
+       (ytm-radio--delete-frame)
+       (ytm-radio--quit-buffer-window ytm-radio--now-playing-buffer-name)
+       (ytm-radio--show-side-window buffer))
+      ('child-frame
+       (ytm-radio--hide-side-window)
+       (if (display-graphic-p)
+           (ytm-radio--show-child-frame buffer focus)
+         (ytm-radio--show-regular-buffer buffer)))
+      (_
+       (ytm-radio--hide-side-window)
+       (ytm-radio--show-regular-buffer buffer)))))
 
 ;;; Commands
 
@@ -6276,7 +6646,7 @@ When AFTER-SUCCESS is non-nil, call it after importing auth."
 
 ;;;###autoload
 (defun ytm-radio-now-playing ()
-  "Show the now-playing cover view."
+  "Show the configured now-playing view."
   (interactive)
   (ytm-radio--ensure-loaded)
   (ytm-radio--show-now-playing t))
@@ -7022,6 +7392,7 @@ DESCRIPTION is used in the user error."
 (defun ytm-radio-hide-now-playing ()
   "Hide the ytm-radio now-playing view without stopping playback."
   (interactive)
+  (ytm-radio--hide-side-window)
   (ytm-radio--delete-frame)
   (ytm-radio--quit-buffer-window ytm-radio--now-playing-buffer-name))
 
