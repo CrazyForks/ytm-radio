@@ -289,6 +289,11 @@ The `side-window' style installs a compact top side window on the frame."
           (const :tag "Regular buffer" buffer))
   :group 'ytm-radio)
 
+(defcustom ytm-radio-child-frame-draggable t
+  "Whether graphical now-playing child frames can be dragged with the mouse."
+  :type 'boolean
+  :group 'ytm-radio)
+
 (defcustom ytm-radio-side-window-height 1
   "Height in lines of the side-window now-playing view."
   :type '(restricted-sexp
@@ -3682,13 +3687,31 @@ When RESTORE-ENTRY is non-nil, restore that position after rendering VIEW."
   "Return non-nil when root VIEW is the active browser root."
   (eq (ytm-radio--current-root-view) view))
 
+(defun ytm-radio--browser-header-keymap (command)
+  "Return a header-line keymap that runs COMMAND when clicked."
+  (let ((map (make-sparse-keymap)))
+    (define-key map [header-line down-mouse-1] #'ignore)
+    (define-key map [header-line mouse-1] command)
+    (define-key map [follow-link] 'mouse-face)
+    map))
+
+(defvar ytm-radio--browser-header-keymaps
+  `((home . ,(ytm-radio--browser-header-keymap #'ytm-radio-home))
+    (explore . ,(ytm-radio--browser-header-keymap #'ytm-radio-explore))
+    (library . ,(ytm-radio--browser-header-keymap #'ytm-radio-library)))
+  "Mouse keymaps for root items in the browser header line.")
+
 (defun ytm-radio--browser-header-item (label view)
   "Return a header-line LABEL for root VIEW."
   (let ((active (ytm-radio--browser-root-active-p view)))
     (propertize label
                 'face (if active
                           'ytm-radio-header-active
-                        'ytm-radio-header-inactive))))
+                        'ytm-radio-header-inactive)
+                'keymap (alist-get view ytm-radio--browser-header-keymaps)
+                'mouse-face 'mode-line-highlight
+                'help-echo (format "Mouse-1: Open %s" label)
+                'follow-link 'ignore)))
 
 (defun ytm-radio--browser-current-page-header-item ()
   "Return a highlighted non-root page label for the header line, or nil."
@@ -5869,7 +5892,8 @@ When PIXEL-WIDTH is non-nil, also fit the result to that pixel width."
 (defun ytm-radio--drag-now-playing (event)
   "Drag the now-playing child frame from mouse EVENT."
   (interactive "e")
-  (unless (ytm-radio--now-playing-button-event-p event)
+  (when (and ytm-radio-child-frame-draggable
+             (not (ytm-radio--now-playing-button-event-p event)))
     (let* ((position (event-start event))
            (window (posn-window position))
            (frame (if (window-live-p window)
@@ -5906,7 +5930,8 @@ When PIXEL-WIDTH is non-nil, also fit the result to that pixel width."
 
 (defun ytm-radio--add-now-playing-drag-bindings ()
   "Add child-frame drag bindings to non-button text in the current buffer."
-  (when (and (eq ytm-radio-display-style 'child-frame)
+  (when (and ytm-radio-child-frame-draggable
+             (eq ytm-radio-display-style 'child-frame)
              (display-graphic-p (ytm-radio--now-playing-frame)))
     (let ((position (point-min))
           (end (point-max)))

@@ -81,6 +81,8 @@ and useful.
   repeat mode, shuffle, like, dislike, and library, in visible action labels.
 - Browser and now-playing UI rows should truncate instead of visually wrapping
   in narrow frames.
+- Home, Explore, and Library header-line items should support direct mouse
+  navigation while retaining their keyboard commands.
 - Browser refreshes should preserve point when possible and never park point at
   the end as a side effect of rendering.
 - Now-playing refreshes should not steal focus during track changes.
@@ -95,7 +97,8 @@ and useful.
   should fall back to a regular buffer instead of failing.
 - Terminal child-frame rendering should omit textual cover placeholders.
 - Mouse users should be able to drag the now-playing child frame without
-  breaking keyboard-only operation or playback controls.
+  breaking keyboard-only operation or playback controls, unless child-frame
+  dragging is disabled by the user option.
 - The child frame should resize deterministically from current track/player
   state and avoid speculative layout compensation.
 - The side-window now-playing style should appear once per frame instead of once

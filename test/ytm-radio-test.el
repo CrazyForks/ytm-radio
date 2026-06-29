@@ -765,6 +765,18 @@ FIELDS are included on both the top-level mutation output and source."
                               header))
       (should-not (string-match-p "Album" header)))))
 
+(ert-deftest ytm-radio-browser-header-root-items-are-clickable ()
+  "Route browser header root items through their public commands."
+  (let ((ytm-radio--browser-view 'home))
+    (dolist (spec '(("Home" home ytm-radio-home)
+                    ("Explore" explore ytm-radio-explore)
+                    ("Library" library ytm-radio-library)))
+      (pcase-let* ((`(,label ,view ,command) spec)
+                   (item (ytm-radio--browser-header-item label view))
+                   (map (get-text-property 0 'keymap item)))
+        (should (eq (lookup-key map [header-line mouse-1]) command))
+        (should (eq (lookup-key map [header-line down-mouse-1]) #'ignore))))))
+
 (ert-deftest ytm-radio-browser-header-highlights-detail-origin ()
   "Highlight the root view that opened a detail view."
   (let ((ytm-radio--browser-view
@@ -4744,6 +4756,7 @@ FIELDS are included on both the top-level mutation output and source."
 (ert-deftest ytm-radio-now-playing-text-areas-bind-mouse-drag ()
   "Bind rendered now-playing non-button text to frame movement."
   (let ((ytm-radio-display-style 'child-frame)
+        (ytm-radio-child-frame-draggable t)
         (ytm-radio--frame 'child))
     (with-temp-buffer
       (insert "Title ")
@@ -4759,6 +4772,21 @@ FIELDS are included on both the top-level mutation output and source."
       (search-backward ">")
       (should-not (eq (get-text-property (point) 'keymap)
                       ytm-radio--now-playing-drag-map)))))
+
+(ert-deftest ytm-radio-now-playing-drag-respects-disabled-option ()
+  "Do not bind or execute child-frame dragging when disabled."
+  (let ((ytm-radio-display-style 'child-frame)
+        (ytm-radio-child-frame-draggable nil)
+        (ytm-radio--frame 'child))
+    (with-temp-buffer
+      (insert "Title")
+      (cl-letf (((symbol-function 'display-graphic-p)
+                 (lambda (&optional _frame) t))
+                ((symbol-function 'frame-live-p)
+                 (lambda (frame) (eq frame 'child))))
+        (ytm-radio--add-now-playing-drag-bindings))
+      (should-not (get-text-property (point-min) 'keymap)))
+    (should-not (ytm-radio--drag-now-playing 'event))))
 
 (ert-deftest ytm-radio-now-playing-button-events-do-not-drag ()
   "Keep now-playing control button clicks from moving the frame."

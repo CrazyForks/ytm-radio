@@ -99,7 +99,8 @@ compact track/card rows. Home, Explore, and Library sections preserve YouTube
 Music modules such as listen-again, mixed-for-you, albums, playlists, artists,
 and liked music when the web response includes them. UI rows truncate instead
 of visually wrapping in narrow windows, so long titles do not disturb the list
-layout.
+layout. Click Home, Explore, or Library in the header line to switch root views;
+the `H`, `E`, and `L` keys provide the same navigation.
 Home, Explore, and Library use cached sections first and only load asynchronously
 when a view has no cached data or when explicitly refreshed. Home continuation
 pages load lazily when the visible Home buffer reaches the rendered end, and the
@@ -114,7 +115,8 @@ graphical display it fits itself to the current cover image, shows title,
 artist, time, and progress, and exposes the core playback controls without
 turning the child frame into the main browser. Click the transport buttons to
 control playback or drag any non-button area of the graphical child frame to
-move it for the current now-playing session.
+move it for the current now-playing session. Set
+`ytm-radio-child-frame-draggable` to nil to disable dragging.
 
 In terminal Emacs, `child-frame` uses Emacs's TTY child-frame support when
 available, detected with `(featurep 'tty-child-frames)`. That support requires
