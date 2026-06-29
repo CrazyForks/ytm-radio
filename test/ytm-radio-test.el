@@ -928,7 +928,7 @@ FIELDS are included on both the top-level mutation output and source."
       (should (string-match-p "YouTube Music Home" (buffer-string)))
       (should (string-match-p "01[[:space:]]+Album Title"
                               (buffer-string)))
-      (should (string-match-p "Album Title[^\n]*\n[[:space:]]+ALBM[[:space:]]+Artist"
+      (should (string-match-p "Album Title[^\n]*\nALBM[[:space:]]+Artist"
                               (buffer-string)))
       (goto-char (point-min))
       (search-forward "Album Title")
@@ -2730,6 +2730,23 @@ FIELDS are included on both the top-level mutation output and source."
                        '((height 0.25)))))
       (should-not (string-match-p "Home[[:space:]]+Explore"
                                   (buffer-string))))))
+
+(ert-deftest ytm-radio-terminal-source-items-do-not-reserve-thumbnail-space ()
+  "Keep terminal browser rows close to the left edge when images are unavailable."
+  (let* ((source (ytm-radio--make-source
+                  :id "ytm:home:quick"
+                  :kind 'youtube-music-home-section
+                  :title "Quick picks"))
+         (item '((type . "track")
+                 (id . "v1")
+                 (title . "Terminal Song")
+                 (url . "https://music.youtube.com/watch?v=v1"))))
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'display-graphic-p)
+                 (lambda (&optional _frame) nil)))
+        (ytm-radio--insert-source-item source item 1))
+      (goto-char (point-min))
+      (should (looking-at-p "01[[:space:]]+Terminal Song")))))
 
 (ert-deftest ytm-radio-browser-navigation-uses-view-keys ()
   "Bind Home, Explore, and Library navigation to direct view keys."

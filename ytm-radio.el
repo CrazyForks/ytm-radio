@@ -4666,29 +4666,30 @@ When UPDATE is non-nil, mutate an existing compatible state to THUMBNAIL."
 (defun ytm-radio--insert-thumbnail-cell (thumbnail slice)
   "Insert a thumbnail cell using THUMBNAIL and SLICE.
 SLICE is either `top', `bottom', or nil for the full placeholder."
-  (insert "  ")
-  (cond
-   ((and thumbnail (memq slice '(top bottom)))
-    (let* ((image-width (cadr thumbnail))
-           (empty-width (max 0 (- (ytm-radio--browser-thumbnail-slot-width)
-                                  image-width)))
-           (left-pad (/ empty-width 2))
-           (right-pad (- empty-width left-pad)))
-      (ytm-radio--insert-pixel-space left-pad)
-      (insert (ytm-radio--thumbnail-slice thumbnail slice))
-      (ytm-radio--insert-pixel-space right-pad)))
-   (thumbnail
-    (let* ((image-width (cadr thumbnail))
-           (empty-width (max 0 (- (ytm-radio--browser-thumbnail-slot-width)
-                                  image-width)))
-           (left-pad (/ empty-width 2))
-           (right-pad (- empty-width left-pad)))
-      (ytm-radio--insert-pixel-space left-pad)
-      (insert (ytm-radio--thumbnail-full thumbnail))
-      (ytm-radio--insert-pixel-space right-pad)))
-   (t
-    (insert (ytm-radio--thumbnail-space))))
-  (insert "  "))
+  (when (or thumbnail (display-graphic-p))
+    (insert "  ")
+    (cond
+     ((and thumbnail (memq slice '(top bottom)))
+      (let* ((image-width (cadr thumbnail))
+             (empty-width (max 0 (- (ytm-radio--browser-thumbnail-slot-width)
+                                    image-width)))
+             (left-pad (/ empty-width 2))
+             (right-pad (- empty-width left-pad)))
+        (ytm-radio--insert-pixel-space left-pad)
+        (insert (ytm-radio--thumbnail-slice thumbnail slice))
+        (ytm-radio--insert-pixel-space right-pad)))
+     (thumbnail
+      (let* ((image-width (cadr thumbnail))
+             (empty-width (max 0 (- (ytm-radio--browser-thumbnail-slot-width)
+                                    image-width)))
+             (left-pad (/ empty-width 2))
+             (right-pad (- empty-width left-pad)))
+        (ytm-radio--insert-pixel-space left-pad)
+        (insert (ytm-radio--thumbnail-full thumbnail))
+        (ytm-radio--insert-pixel-space right-pad)))
+     (t
+      (insert (ytm-radio--thumbnail-space))))
+    (insert "  ")))
 
 (defun ytm-radio--item-prefix-string (index _type-cell _item)
   "Return the first-line item prefix for INDEX."
