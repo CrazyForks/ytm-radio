@@ -77,6 +77,8 @@ and useful.
   runtime queue that `next`, `previous`, and the queue view use consistently.
 - Current-track actions should be fast to reach through direct bindings and a
   transient menu, while each action remains callable as a normal command.
+- The current-track transient menu should show stateful action state, including
+  repeat mode, shuffle, like, dislike, and library, in visible action labels.
 - Browser and now-playing UI rows should truncate instead of visually wrapping
   in narrow frames.
 - Browser refreshes should preserve point when possible and never park point at

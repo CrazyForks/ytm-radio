@@ -201,6 +201,8 @@ directory, and the auth file are visible from Emacs.
 - `M-x ytm-radio-play-track` selects a known track.
 - `M-x ytm-radio-play-source` selects a known source.
 - `M-x ytm-radio-current-actions` opens actions for the current track.
+  Stateful actions such as repeat, shuffle, like, dislike, and library show
+  their current state in the menu labels.
 - `M-x ytm-radio-like-current-track` likes the current track or clears an
   existing like.
 - `M-x ytm-radio-dislike-current-track` dislikes the current track or clears an

@@ -3752,6 +3752,11 @@ FIELDS are included on both the top-level mutation output and source."
       (should-not (ytm-radio--track-like-status track))
       (should (eq (map-elt library-track :like-status) 'like)))))
 
+(defun ytm-radio-test--should-state-label (label text face)
+  "Assert LABEL has TEXT and state token FACE."
+  (should (string-equal (substring-no-properties label) text))
+  (should (eq (get-text-property 0 'face label) face)))
+
 (ert-deftest ytm-radio-current-actions-labels-follow-track-state ()
   "Use action labels for current-track transient suffixes."
   (let* ((track (ytm-radio--make-track
@@ -3759,20 +3764,44 @@ FIELDS are included on both the top-level mutation output and source."
                  :title "Song"
                  :url "https://music.youtube.com/watch?v=abc123_DEF4"))
          (ytm-radio--player (ytm-radio--make-player :current-track track)))
-    (should (string-equal (ytm-radio--current-like-action-label) "Like"))
-    (should (string-equal (ytm-radio--current-dislike-action-label) "Dislike"))
-    (should (string-equal (ytm-radio--current-track-library-action-label)
-                          "Save to library"))
+    (ytm-radio-test--should-state-label
+     (ytm-radio--current-like-action-label) "[ ] Like" 'shadow)
+    (ytm-radio-test--should-state-label
+     (ytm-radio--current-dislike-action-label) "[ ] Dislike" 'shadow)
+    (ytm-radio-test--should-state-label
+     (ytm-radio--current-track-library-action-label) "[ ] Library" 'shadow)
     (setf (map-elt track :like-status) 'like)
-    (should (string-equal (ytm-radio--current-like-action-label) "Unlike"))
-    (should (string-equal (ytm-radio--current-dislike-action-label) "Dislike"))
+    (ytm-radio-test--should-state-label
+     (ytm-radio--current-like-action-label) "[✔] Like" 'transient-value)
+    (ytm-radio-test--should-state-label
+     (ytm-radio--current-dislike-action-label) "[ ] Dislike" 'shadow)
     (setf (map-elt track :like-status) 'dislike)
-    (should (string-equal (ytm-radio--current-like-action-label) "Like"))
-    (should (string-equal (ytm-radio--current-dislike-action-label)
-                          "Remove dislike"))
+    (ytm-radio-test--should-state-label
+     (ytm-radio--current-like-action-label) "[ ] Like" 'shadow)
+    (ytm-radio-test--should-state-label
+     (ytm-radio--current-dislike-action-label) "[✔] Dislike" 'transient-value)
     (setf (map-elt track :in-library) t)
-    (should (string-equal (ytm-radio--current-track-library-action-label)
-                          "Remove from library"))))
+    (ytm-radio-test--should-state-label
+     (ytm-radio--current-track-library-action-label)
+     "[✔] Library"
+     'transient-value)))
+
+(ert-deftest ytm-radio-playback-action-labels-follow-player-state ()
+  "Use state markers for playback transient suffixes."
+  (let ((ytm-radio--player (ytm-radio--make-player)))
+    (ytm-radio-test--should-state-label
+     (ytm-radio--repeat-action-label) "[ ] Repeat" 'shadow)
+    (ytm-radio-test--should-state-label
+     (ytm-radio--shuffle-action-label) "[ ] Shuffle" 'shadow)
+    (setf (map-elt ytm-radio--player :repeat) 'all)
+    (ytm-radio-test--should-state-label
+     (ytm-radio--repeat-action-label) "[A] Repeat all" 'transient-value)
+    (setf (map-elt ytm-radio--player :repeat) 'one)
+    (ytm-radio-test--should-state-label
+     (ytm-radio--repeat-action-label) "[1] Repeat one" 'transient-value)
+    (setf (map-elt ytm-radio--player :shuffle) t)
+    (ytm-radio-test--should-state-label
+     (ytm-radio--shuffle-action-label) "[✔] Shuffle" 'transient-value)))
 
 (ert-deftest ytm-radio-set-track-like-status-indexes-source-items ()
   "Expose local rating changes without mutating cached source payloads."

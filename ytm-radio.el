@@ -7127,23 +7127,44 @@ When AFTER-SUCCESS is non-nil, call it after importing auth."
   "Return the current track like status, or nil."
   (ytm-radio--track-like-status (ytm-radio--current-track)))
 
+(defun ytm-radio--transient-state-token (label active)
+  "Return propertized transient state LABEL.
+When ACTIVE is non-nil, use the transient value face."
+  (propertize label 'face (if active 'transient-value 'shadow)))
+
 (defun ytm-radio--current-like-action-label ()
   "Return the current-track like action label."
   (if (eq (ytm-radio--current-track-like-status) 'like)
-      "Unlike"
-    "Like"))
+      (concat (ytm-radio--transient-state-token "[✔]" t) " Like")
+    (concat (ytm-radio--transient-state-token "[ ]" nil) " Like")))
 
 (defun ytm-radio--current-dislike-action-label ()
   "Return the current-track dislike action label."
   (if (eq (ytm-radio--current-track-like-status) 'dislike)
-      "Remove dislike"
-    "Dislike"))
+      (concat (ytm-radio--transient-state-token "[✔]" t) " Dislike")
+    (concat (ytm-radio--transient-state-token "[ ]" nil) " Dislike")))
 
 (defun ytm-radio--current-track-library-action-label ()
   "Return the current-track library action label."
   (if (ytm-radio--track-library-status-p (ytm-radio--current-track))
-      "Remove from library"
-    "Save to library"))
+      (concat (ytm-radio--transient-state-token "[✔]" t) " Library")
+    (concat (ytm-radio--transient-state-token "[ ]" nil) " Library")))
+
+(defun ytm-radio--repeat-action-label ()
+  "Return the repeat action label with current state."
+  (pcase (ytm-radio--repeat-mode)
+    ('all (concat (ytm-radio--transient-state-token "[A]" t)
+                  " Repeat all"))
+    ('one (concat (ytm-radio--transient-state-token "[1]" t)
+                  " Repeat one"))
+    (_ (concat (ytm-radio--transient-state-token "[ ]" nil)
+               " Repeat"))))
+
+(defun ytm-radio--shuffle-action-label ()
+  "Return the shuffle action label with current state."
+  (if (map-elt ytm-radio--player :shuffle)
+      (concat (ytm-radio--transient-state-token "[✔]" t) " Shuffle")
+    (concat (ytm-radio--transient-state-token "[ ]" nil) " Shuffle")))
 
 (defun ytm-radio--merge-missing-track-metadata (target source)
   "Fill missing metadata in TARGET from SOURCE and return TARGET."
@@ -7415,8 +7436,10 @@ DESCRIPTION is used in the user error."
     ("SPC" "Pause/resume" ytm-radio-toggle-pause)
     ("n" "Next" ytm-radio-next)
     ("p" "Previous" ytm-radio-previous)
-    ("r" "Repeat" ytm-radio-cycle-repeat)
-    ("s" "Shuffle" ytm-radio-toggle-shuffle)]
+    ("r" ytm-radio-cycle-repeat
+     :description ytm-radio--repeat-action-label)
+    ("s" ytm-radio-toggle-shuffle
+     :description ytm-radio--shuffle-action-label)]
    ["Track"
     ("l" ytm-radio-like-current-track
      :description ytm-radio--current-like-action-label)

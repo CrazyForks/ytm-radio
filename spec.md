@@ -81,6 +81,13 @@ Metadata, progress, and playback controls are centered against the same
 child-frame body width. Text rows reserve the cover side padding as overflow
 guard space so a rating marker appended to the title stays on the title line.
 
+## Transient Menu State
+
+The current-track transient menu shows stateful action state in the action
+labels. Repeat uses `[ ]`, `[A]`, and `[1]` for off, all, and one. Shuffle,
+like, dislike, and library use `[ ]` and `[✔]`. Inactive state tokens use the
+`shadow` face; active state tokens use `transient-value`.
+
 ## Now-Playing Side Window
 
 The `side-window` display style uses a top Emacs side window in both graphical
