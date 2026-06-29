@@ -295,7 +295,9 @@ The `side-window' style installs a compact top side window on the frame."
   :group 'ytm-radio)
 
 (defcustom ytm-radio-side-window-height 1
-  "Height in lines of the side-window now-playing view."
+  "Height in lines of the side-window now-playing view.
+Graphical side windows use at least two lines to avoid clipping cover images
+and larger fonts."
   :type '(restricted-sexp
           :match-alternatives
           ((lambda (value)
@@ -6006,11 +6008,11 @@ When FACE is non-nil, use it for the button label."
 (defun ytm-radio--shuffle-control ()
   "Return the shuffle control button spec."
   (if (map-elt ytm-radio--player :shuffle)
-      (list (ytm-radio--mdicon "nf-md-shuffle_variant" "S")
+      (list (ytm-radio--mdicon "nf-md-shuffle" "S")
             #'ytm-radio-toggle-shuffle
             "Shuffle on"
             'bold)
-    (list (ytm-radio--mdicon "nf-md-shuffle_variant" "S")
+    (list (ytm-radio--mdicon "nf-md-shuffle" "S")
           #'ytm-radio-toggle-shuffle
           "Shuffle off"
           'shadow)))
@@ -6035,7 +6037,7 @@ When FACE is non-nil, use it for the button label."
 (defun ytm-radio--side-window-cover (track)
   "Return TRACK's cover image for the side-window view."
   (or (when-let* ((thumbnail (ytm-radio--track-thumbnail-url track))
-                  (file (and (display-graphic-p)
+                  (file (and (ytm-radio--side-window-graphic-p)
                              (ytm-radio--ensure-cover-file
                               thumbnail
                               #'ytm-radio--cover-refresh-current-track)))
@@ -6048,8 +6050,9 @@ When FACE is non-nil, use it for the button label."
                   (image (ignore-errors
                            (create-image file nil nil
                                          :width (car size)
-                                         :height (cdr size)))))
-        (propertize " " 'display image 'line-height t))
+                                         :height (cdr size)
+                                         :ascent 'center))))
+        (propertize " " 'display image))
       (propertize (ytm-radio--mdicon "nf-md-music_box" "♪")
                   'face 'ytm-radio-side-window-title)))
 
@@ -6066,6 +6069,24 @@ When FACE is non-nil, use it for the button label."
         (or (and (window-live-p ytm-radio--side-window)
                  (window-body-width ytm-radio--side-window))
             (frame-width (selected-frame))))))
+
+(defun ytm-radio--side-window-graphic-p ()
+  "Return non-nil when the side-window target frame is graphical."
+  (display-graphic-p
+   (and (window-live-p ytm-radio--side-window)
+        (window-frame ytm-radio--side-window))))
+
+(defun ytm-radio--side-window-window-height ()
+  "Return the effective side-window height for the current display."
+  (if (ytm-radio--side-window-graphic-p)
+      (max 2 ytm-radio-side-window-height)
+    ytm-radio-side-window-height))
+
+(defun ytm-radio--side-window-content-pixel-width ()
+  "Return available side-window content pixels, or nil."
+  (when (and (window-live-p ytm-radio--side-window)
+             (ytm-radio--side-window-graphic-p))
+    (window-body-width ytm-radio--side-window t)))
 
 (defun ytm-radio--side-window-track-text (track &optional width)
   "Return TRACK title and artist text for the side-window view.
@@ -6162,20 +6183,36 @@ When WIDTH is non-nil, fit the returned text within WIDTH columns."
              width))))
     label))
 
-(defun ytm-radio--insert-side-window-line (track)
-  "Insert the single side-window layout line for TRACK."
-  (let* ((width (ytm-radio--side-window-content-width))
+(defun ytm-radio--side-window-show-controls-p (track width)
+  "Return non-nil when side-window controls fit TRACK at WIDTH columns."
+  (let* ((separator-width (string-width ytm-radio--side-window-line-separator))
+         (controls-width (string-width (ytm-radio--now-playing-controls-text)))
+         (progress-preferred-width
+          (ytm-radio--side-window-progress-preferred-width track)))
+    (>= width
+        (+ ytm-radio--side-window-min-track-columns
+           progress-preferred-width
+           controls-width
+           (* 2 separator-width)))))
+
+(defun ytm-radio--side-window-line-fits-p (start)
+  "Return non-nil when the text after START fits the side-window pixels."
+  (if-let* ((pixel-width (ytm-radio--side-window-content-pixel-width)))
+      (<= (string-pixel-width
+           (buffer-substring start (point))
+           (current-buffer))
+          pixel-width)
+    t))
+
+(defun ytm-radio--insert-side-window-line-layout (track width show-controls)
+  "Insert one side-window TRACK line at WIDTH columns.
+When SHOW-CONTROLS is non-nil, include playback controls."
+  (let* ((width (max 1 width))
          (separator ytm-radio--side-window-line-separator)
          (separator-width (string-width separator))
          (controls-width (string-width (ytm-radio--now-playing-controls-text)))
          (progress-preferred-width
           (ytm-radio--side-window-progress-preferred-width track))
-         (show-controls
-          (>= width
-              (+ ytm-radio--side-window-min-track-columns
-                 progress-preferred-width
-                 controls-width
-                 (* 2 separator-width))))
          (progress-width
           (max 1
                (min progress-preferred-width
@@ -6197,6 +6234,26 @@ When WIDTH is non-nil, fit the returned text within WIDTH columns."
       (insert separator)
       (ytm-radio--insert-side-window-controls))))
 
+(defun ytm-radio--insert-side-window-line (track)
+  "Insert the single side-window layout line for TRACK."
+  (let* ((width (ytm-radio--side-window-content-width))
+         (start (point))
+         (show-controls (ytm-radio--side-window-show-controls-p track width))
+         (render (lambda ()
+                   (delete-region start (point))
+                   (goto-char start)
+                   (ytm-radio--insert-side-window-line-layout
+                    track width show-controls))))
+    (ytm-radio--insert-side-window-line-layout track width show-controls)
+    (when (and show-controls
+               (not (ytm-radio--side-window-line-fits-p start)))
+      (setq show-controls nil)
+      (funcall render))
+    (while (and (> width 1)
+                (not (ytm-radio--side-window-line-fits-p start)))
+      (setq width (1- width))
+      (funcall render))))
+
 (defun ytm-radio--insert-side-window-empty-line ()
   "Insert the side-window line when no track is active."
   (insert
@@ -6212,13 +6269,25 @@ When WIDTH is non-nil, fit the returned text within WIDTH columns."
   "Insert a stretch glyph covering the rest of the side-window row."
   (insert (propertize " " 'display '(space :align-to right))))
 
+(defun ytm-radio--side-window-centered-line-height ()
+  "Return a line-height value for centering the graphical side-window line."
+  (let ((height (ytm-radio--side-window-window-height)))
+    (when (and (ytm-radio--side-window-graphic-p)
+               (> height 1))
+      (list (/ (1+ height) 2.0)
+            (float height)))))
+
 (defun ytm-radio--finish-side-window-lines ()
   "Fill the remaining configured side-window rows."
-  (ytm-radio--insert-side-window-fill)
-  (insert "\n")
-  (dotimes (_ (max 0 (1- ytm-radio-side-window-height)))
+  (let ((line-height (ytm-radio--side-window-centered-line-height)))
     (ytm-radio--insert-side-window-fill)
-    (insert "\n")))
+    (insert (if line-height
+                (propertize "\n" 'line-height line-height)
+              "\n"))
+    (unless line-height
+      (dotimes (_ (max 0 (1- (ytm-radio--side-window-window-height))))
+        (ytm-radio--insert-side-window-fill)
+        (insert "\n")))))
 
 (defun ytm-radio--render-side-window ()
   "Render the now-playing buffer for the side-window display style."
@@ -6579,7 +6648,7 @@ FOCUS is passed through to `ytm-radio--show-child-frame'."
            `((display-buffer-in-side-window)
              (side . top)
              (slot . -1)
-             (window-height . ,ytm-radio-side-window-height)
+             (window-height . ,(ytm-radio--side-window-window-height))
              (dedicated . side)
              (post-command-select-window . nil)
              (window-parameters
@@ -6590,10 +6659,12 @@ FOCUS is passed through to `ytm-radio--show-child-frame'."
     (setq ytm-radio--side-window window)
     (when (window-live-p window)
       (set-window-dedicated-p window 'side)
-      (set-window-fringes window 0 0 nil t)
+      (set-window-fringes
+       window 0 (if (ytm-radio--side-window-graphic-p) nil 0) nil t)
       (set-window-margins window 0 0)
       (set-window-scroll-bars window 0 nil 0 nil t)
-      (window-preserve-size window nil t))
+      (window-preserve-size window nil t)
+      (ytm-radio--render-side-window))
     (when (window-live-p selected-window)
       (select-window selected-window 'norecord))
     window))

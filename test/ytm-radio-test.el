@@ -3030,6 +3030,99 @@ FIELDS are included on both the top-level mutation output and source."
     (should (string-empty-p (nth 1 lines)))
     (should (string-empty-p (nth 2 lines)))))
 
+(defun ytm-radio-test--render-graphic-side-window
+    (pixel-width column-width string-pixel-width)
+  "Render a fake graphical side-window.
+PIXEL-WIDTH and COLUMN-WIDTH are returned by `window-body-width'.
+STRING-PIXEL-WIDTH replaces `string-pixel-width' during rendering."
+  (let ((track (ytm-radio--make-track
+                :id "v1"
+                :title "Perfect Tokyo"
+                :url "https://music.youtube.com/watch?v=v1"
+                :artist "LoFi Tokyo"
+                :duration 209))
+        (ytm-radio--side-window 'side-window)
+        (ytm-radio-side-window-height 1)
+        (ytm-radio--player
+         (ytm-radio--make-player :status 'playing
+                                 :position 11
+                                 :duration 209)))
+    (setf (map-elt ytm-radio--player :current-track) track)
+    (with-current-buffer (ytm-radio--now-playing-buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (cl-letf (((symbol-function 'display-graphic-p)
+               (lambda (&optional _frame) t))
+              ((symbol-function 'ytm-radio--mdicon)
+               (lambda (_name fallback) fallback))
+              ((symbol-function 'window-live-p)
+               (lambda (window) (eq window 'side-window)))
+              ((symbol-function 'window-frame)
+               (lambda (_window) 'side-frame))
+              ((symbol-function 'window-body-width)
+               (lambda (_window &optional pixelwise)
+                 (if pixelwise pixel-width column-width)))
+              ((symbol-function 'string-pixel-width)
+               string-pixel-width))
+      (ytm-radio--render-side-window))
+    (get-buffer ytm-radio--now-playing-buffer-name)))
+
+(ert-deftest ytm-radio-side-window-layout-hides-controls-when-pixel-narrow ()
+  "Hide controls when graphical side-window pixels are narrow."
+  (with-current-buffer
+      (ytm-radio-test--render-graphic-side-window
+       420 68
+       (lambda (string &optional _buffer)
+         (if (string-match-p (regexp-quote "||") string)
+             460
+           360)))
+      (should (string-match-p "Perfect Tokyo" (buffer-string)))
+      (should (string-match-p "0:11" (buffer-string)))
+      (should-not (string-match-p (regexp-quote "||") (buffer-string)))
+      (should-not (string-match-p (regexp-quote ">>") (buffer-string)))))
+
+(ert-deftest ytm-radio-side-window-layout-centers-graphical-line ()
+  "Use line height to vertically center graphical side-window content."
+  (with-current-buffer
+      (ytm-radio-test--render-graphic-side-window
+       800 120 (lambda (_string &optional _buffer) 320))
+      (should (= (cl-count ?\n (buffer-string)) 1))
+      (goto-char (point-min))
+      (search-forward "\n")
+      (should (equal (get-text-property (1- (point)) 'line-height)
+                     '(1.5 2.0)))))
+
+(ert-deftest ytm-radio-side-window-cover-centers-image-ascent ()
+  "Center side-window cover images against adjacent text."
+  (let ((track (ytm-radio--make-track
+                :id "v1"
+                :title "Song"
+                :url "https://music.youtube.com/watch?v=v1"
+                :thumbnail-url "https://example.invalid/cover.jpg"))
+        (ytm-radio--side-window 'side-window)
+        create-image-args)
+    (cl-letf (((symbol-function 'display-graphic-p)
+               (lambda (&optional frame) (eq frame 'side-frame)))
+              ((symbol-function 'window-live-p)
+               (lambda (window) (eq window 'side-window)))
+              ((symbol-function 'window-frame)
+               (lambda (_window) 'side-frame))
+              ((symbol-function 'ytm-radio--ensure-cover-file)
+               (lambda (_url _callback) "/tmp/cover.jpg"))
+              ((symbol-function 'ytm-radio--image-file-dimensions)
+               (lambda (_file) (cons 80 80)))
+              ((symbol-function 'ytm-radio--scaled-image-size)
+               (lambda (&rest _args) (cons 34 34)))
+              ((symbol-function 'create-image)
+               (lambda (&rest args)
+                 (setq create-image-args args)
+                 '(image :type png))))
+      (let ((cover (ytm-radio--side-window-cover track)))
+        (should (equal (get-text-property 0 'display cover)
+                       '(image :type png)))
+        (should (eq (plist-get (nthcdr 3 create-image-args) :ascent)
+                    'center))))))
+
 (ert-deftest ytm-radio-side-window-title-scroll-uses-side-window-width ()
   "Advance side-window title marquee without resetting through another layout."
   (let* ((track (ytm-radio--make-track
@@ -3079,9 +3172,12 @@ FIELDS are included on both the top-level mutation output and source."
         captured-action
         deleted-frame
         hidden-window
+        fringe-args
         restored-window)
     (cl-letf (((symbol-function 'ytm-radio--render-now-playing)
                #'ignore)
+              ((symbol-function 'display-graphic-p)
+               (lambda (&optional _frame) t))
               ((symbol-function 'ytm-radio--render-side-window)
                #'ignore)
               ((symbol-function 'ytm-radio--delete-frame)
@@ -3103,7 +3199,8 @@ FIELDS are included on both the top-level mutation output and source."
               ((symbol-function 'delete-window)
                #'ignore)
               ((symbol-function 'set-window-fringes)
-               #'ignore)
+               (lambda (&rest args)
+                 (setq fringe-args args)))
               ((symbol-function 'set-window-margins)
                #'ignore)
               ((symbol-function 'set-window-scroll-bars)
@@ -3112,6 +3209,8 @@ FIELDS are included on both the top-level mutation output and source."
                #'ignore)
               ((symbol-function 'window-live-p)
                (lambda (window) (memq window '(side-window normal-window))))
+              ((symbol-function 'window-frame)
+               (lambda (_window) 'side-frame))
               ((symbol-function 'window-buffer)
                (lambda (_window) (get-buffer ytm-radio--now-playing-buffer-name))))
       (ytm-radio--show-now-playing)
@@ -3121,6 +3220,8 @@ FIELDS are included on both the top-level mutation output and source."
       (should (equal (car captured-action) '(display-buffer-in-side-window)))
       (should (eq (alist-get 'side (cdr captured-action)) 'top))
       (should (= (alist-get 'slot (cdr captured-action)) -1))
+      (should (= (alist-get 'window-height (cdr captured-action)) 2))
+      (should (equal fringe-args '(side-window 0 nil nil t)))
       (should (eq (alist-get 'dedicated (cdr captured-action)) 'side))
       (should (eq (alist-get 'post-command-select-window
                              (cdr captured-action))
@@ -3135,6 +3236,7 @@ FIELDS are included on both the top-level mutation output and source."
         (ytm-radio--player (ytm-radio--make-player))
         captured-action
         child-frame-shown
+        fringe-args
         regular-buffer-shown)
     (cl-letf (((symbol-function 'display-graphic-p)
                (lambda (&optional _frame) nil))
@@ -3160,18 +3262,23 @@ FIELDS are included on both the top-level mutation output and source."
                #'ignore)
               ((symbol-function 'set-window-dedicated-p)
                #'ignore)
-              ((symbol-function 'set-window-fringes)
-               #'ignore)
               ((symbol-function 'set-window-margins)
                #'ignore)
               ((symbol-function 'set-window-scroll-bars)
                #'ignore)
+              ((symbol-function 'set-window-fringes)
+               (lambda (&rest args)
+                 (setq fringe-args args)))
               ((symbol-function 'window-preserve-size)
                #'ignore)
               ((symbol-function 'window-live-p)
-               (lambda (window) (memq window '(side-window normal-window)))))
+               (lambda (window) (memq window '(side-window normal-window))))
+              ((symbol-function 'window-frame)
+               (lambda (_window) 'side-frame)))
       (ytm-radio--show-now-playing)
       (should (equal (car captured-action) '(display-buffer-in-side-window)))
+      (should (= (alist-get 'window-height (cdr captured-action)) 1))
+      (should (equal fringe-args '(side-window 0 0 nil t)))
       (should-not child-frame-shown)
       (should-not regular-buffer-shown))))
 
@@ -3428,7 +3535,7 @@ FIELDS are included on both the top-level mutation output and source."
         (should (equal (nth 2 shuffle) "Shuffle off"))
         (should (eq (nth 3 shuffle) 'shadow))
         (should (member "nf-md-repeat" requested-icons))
-        (should (member "nf-md-shuffle_variant" requested-icons)))
+        (should (member "nf-md-shuffle" requested-icons)))
       (setq requested-icons nil)
       (let* ((ytm-radio--player (ytm-radio--make-player
                                  :repeat 'all
@@ -3440,7 +3547,7 @@ FIELDS are included on both the top-level mutation output and source."
         (should (equal (nth 2 shuffle) "Shuffle on"))
         (should (eq (nth 3 shuffle) 'bold))
         (should (member "nf-md-repeat" requested-icons))
-        (should (member "nf-md-shuffle_variant" requested-icons)))
+        (should (member "nf-md-shuffle" requested-icons)))
       (setq requested-icons nil)
       (let* ((ytm-radio--player (ytm-radio--make-player :repeat 'one))
              (repeat (ytm-radio--repeat-control)))
