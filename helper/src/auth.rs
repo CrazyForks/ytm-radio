@@ -606,10 +606,25 @@ struct BrowserSession {
 
 impl BrowserSession {
     fn has_identity(&self) -> bool {
-        self.innertube_context.is_some()
-            || self.session_index.is_some()
+        self.session_index.is_some()
             || self.delegated_session_id.is_some()
             || self.data_sync_id.is_some()
+            || self
+                .innertube_context
+                .as_ref()
+                .and_then(context_page_id)
+                .is_some()
+    }
+
+    fn require_identity(self) -> Result<Self, String> {
+        if self.has_identity() {
+            Ok(self)
+        } else {
+            Err(
+                "login window session identity is not ready; wait for music.youtube.com to finish loading"
+                    .to_string(),
+            )
+        }
     }
 }
 
@@ -1270,6 +1285,7 @@ fn login_config_once(
     version: &CdpVersion,
     browser_name: &str,
 ) -> Result<AuthConfig, String> {
+    let session = cdp_session(&target.websocket_url)?.require_identity()?;
     let cookies = cdp_cookies(&target.websocket_url)?;
     let mut config = auth_from_cdp_cookies_with_error(
         "login-window",
@@ -1278,11 +1294,7 @@ fn login_config_once(
         version.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT),
         "login window is not authenticated yet; finish signing in to music.youtube.com",
     )?;
-    if let Ok(session) = cdp_session(&target.websocket_url) {
-        if session.has_identity() {
-            apply_browser_session(&mut config, session);
-        }
-    }
+    apply_browser_session(&mut config, session);
     Ok(config)
 }
 
@@ -1664,10 +1676,10 @@ fn bidi_login_config_once(
     context: &str,
     browser_name: &str,
 ) -> Result<AuthConfig, String> {
-    let session = bidi_session(connection, context).ok();
+    let session = bidi_session(connection, context)?.require_identity()?;
     let user_agent = session
-        .as_ref()
-        .and_then(|session| session.user_agent.as_deref())
+        .user_agent
+        .as_deref()
         .or(connection.user_agent.as_deref())
         .unwrap_or(DEFAULT_USER_AGENT)
         .to_string();
@@ -1679,9 +1691,7 @@ fn bidi_login_config_once(
         &user_agent,
         "login window is not authenticated yet; finish signing in to music.youtube.com",
     )?;
-    if let Some(session) = session.filter(BrowserSession::has_identity) {
-        apply_browser_session(&mut config, session);
-    }
+    apply_browser_session(&mut config, session);
     Ok(config)
 }
 
@@ -1935,6 +1945,30 @@ mod tests {
         .unwrap();
         let error = config.validate().unwrap_err();
         assert!(error.contains("auth login-window"));
+    }
+
+    #[test]
+    fn waits_for_browser_session_identity_before_completing_login() {
+        let error = BrowserSession::default().require_identity().unwrap_err();
+        assert!(error.contains("session identity is not ready"));
+
+        let context_only = BrowserSession {
+            innertube_context: Some(json!({
+                "client": {"clientName": "WEB_REMIX"},
+                "user": {}
+            })),
+            ..BrowserSession::default()
+        };
+        assert!(context_only.require_identity().is_err());
+
+        let session = BrowserSession {
+            session_index: Some("1".to_string()),
+            ..BrowserSession::default()
+        };
+        assert_eq!(
+            session.require_identity().unwrap().session_index.as_deref(),
+            Some("1")
+        );
     }
 
     #[test]
