@@ -2473,11 +2473,44 @@ FIELDS are included on both the top-level mutation output and source."
 
 (ert-deftest ytm-radio-thumbnail-height-follows-text-rows ()
   "Keep split thumbnail slices at least as tall as rendered text rows."
-  (let ((ytm-radio-browser-thumbnail-size 48))
+  (let ((ytm-radio-browser-thumbnail-size 48)
+        (ytm-radio-browser-item-line-height-scale 1.0))
     (cl-letf (((symbol-function 'frame-char-height)
                (lambda (&optional _frame) 31)))
       (should (= (ytm-radio--browser-thumbnail-row-height) 31))
       (should (= (ytm-radio--browser-thumbnail-pixel-size) 62)))))
+
+(ert-deftest ytm-radio-browser-item-line-height-scale-enlarges-thumbnail-rows ()
+  "Scale item rows while keeping thumbnail content at its base size."
+  (let ((ytm-radio-browser-thumbnail-size 48)
+        (ytm-radio-browser-item-line-height-scale 1.25))
+    (cl-letf (((symbol-function 'frame-char-height)
+               (lambda (&optional _frame) 20)))
+      (should (= (ytm-radio--browser-thumbnail-content-size) 48))
+      (should (= (ytm-radio--browser-thumbnail-slot-width) 48))
+      (should (= (ytm-radio--browser-thumbnail-row-height) 30))
+      (should (= (ytm-radio--browser-thumbnail-pixel-size) 60)))))
+
+(ert-deftest ytm-radio-browser-item-line-height-scale-keeps-row-count ()
+  "Do not add blank logical rows when item row height is scaled."
+  (let ((source (ytm-radio--make-source
+                 :id "search"
+                 :kind 'youtube-music-search
+                 :title "Search"))
+        (item '((type . "track")
+                (id . "v1")
+                (title . "Scaled Song")
+                (url . "https://music.youtube.com/watch?v=v1")
+                (artist . "Artist")))
+        (ytm-radio-browser-item-line-height-scale 1.25))
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'ytm-radio--item-thumbnail-image)
+                 (lambda (_item) '((image :type svg :data "thumb")
+                              60 60 fixed-canvas))))
+        (ytm-radio--insert-source-item source item 1))
+      (should (= (count-lines (point-min) (point-max)) 2))
+      (should (= (length (split-string (buffer-string) "\n" t)) 2))
+      (should-not (string-match-p "\n\n" (buffer-string))))))
 
 (ert-deftest ytm-radio-placeholder-thumbnail-renders-without-url ()
   "Render a fixed-canvas placeholder when an item has no thumbnail URL."

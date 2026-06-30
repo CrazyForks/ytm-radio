@@ -109,6 +109,9 @@ Home, Explore, and Library use cached sections first and only load asynchronousl
 when a view has no cached data or when explicitly refreshed. Home continuation
 pages load lazily when the visible Home buffer reaches the rendered end, and the
 next Home continuation token is stored with the durable browser state.
+Browser rows keep a small amount of visual breathing room without inserting
+blank lines. Customize `ytm-radio-browser-item-line-height-scale` to make rows
+tighter or looser.
 Thumbnail downloads in large browser views are capped per render to reduce UI
 jank while covers are still loading. Customize
 `ytm-radio-browser-thumbnail-downloads-per-render` to change the batch size, or

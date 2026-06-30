@@ -359,6 +359,17 @@ The frame normally fits itself to the displayed cover image."
              (and (integerp value) (> value 0)))))
   :group 'ytm-radio)
 
+(defcustom ytm-radio-browser-item-line-height-scale 1.10
+  "Scale applied to browser item row height.
+Values above 1 add visual breathing room without inserting extra logical
+rows.  Thumbnail canvases grow vertically while cover content stays at its
+base size, so adjacent covers have space without splitting at the row boundary."
+  :type '(restricted-sexp
+          :match-alternatives
+          ((lambda (value)
+             (and (numberp value) (>= value 1.0)))))
+  :group 'ytm-radio)
+
 (defcustom ytm-radio-browser-thumbnail-workaround-gaps t
   "Non-nil to render browser thumbnails through a fixed SVG canvas.
 This mirrors telega's avatar gap workaround: the image is first placed
@@ -4210,17 +4221,26 @@ When FACE is non-nil, use it as the button face."
     (ytm-radio--play-track track)))
 
 (defun ytm-radio--browser-thumbnail-pixel-size ()
-  "Return the thumbnail edge size for two-line browser rows."
+  "Return the thumbnail canvas height for two-line browser rows."
   (* 2 (ytm-radio--browser-thumbnail-row-height)))
 
-(defun ytm-radio--browser-thumbnail-row-height ()
-  "Return one rendered text row height in pixels for thumbnails."
+(defun ytm-radio--browser-thumbnail-content-size ()
+  "Return the unscaled thumbnail content edge size in pixels."
+  (* 2 (ytm-radio--browser-thumbnail-base-row-height)))
+
+(defun ytm-radio--browser-thumbnail-base-row-height ()
+  "Return one unscaled text row height in pixels for thumbnails."
   (max (frame-char-height (selected-frame))
        (ceiling (/ (float ytm-radio-browser-thumbnail-size) 2))))
 
+(defun ytm-radio--browser-thumbnail-row-height ()
+  "Return one rendered text row height in pixels for thumbnails."
+  (ceiling (* (ytm-radio--browser-thumbnail-base-row-height)
+              ytm-radio-browser-item-line-height-scale)))
+
 (defun ytm-radio--browser-thumbnail-slot-width ()
   "Return thumbnail slot width in pixels."
-  (ytm-radio--browser-thumbnail-pixel-size))
+  (ytm-radio--browser-thumbnail-content-size))
 
 (defun ytm-radio--browser-thumbnail-columns ()
   "Return the display columns reserved for browser thumbnails."
@@ -4344,15 +4364,14 @@ When FACE is non-nil, use it as the button face."
 
 (defun ytm-radio--browser-thumbnail-display-size (file)
   "Return thumbnail display size for FILE without cropping."
-  (let* ((slot-width (ytm-radio--browser-thumbnail-slot-width))
-         (slot-height (ytm-radio--browser-thumbnail-pixel-size))
+  (let* ((content-size (ytm-radio--browser-thumbnail-content-size))
          (dimensions (ytm-radio--image-file-dimensions file)))
     (if (not dimensions)
-        (cons slot-width slot-height)
+        (cons content-size content-size)
       (let* ((natural-width (max 1 (ceiling (car dimensions))))
              (natural-height (max 1 (ceiling (cdr dimensions))))
-             (scale (min (/ (float slot-width) natural-width)
-                         (/ (float slot-height) natural-height))))
+             (scale (min (/ (float content-size) natural-width)
+                         (/ (float content-size) natural-height))))
         (cons (max 1 (round (* natural-width scale)))
               (max 1 (round (* natural-height scale))))))))
 
@@ -4463,11 +4482,13 @@ When ROW-HEIGHT and ROW-COUNT are non-nil, size the canvas from them."
                 (dimensions (ytm-radio--image-file-dimensions file)))
       (let* ((slot-width (ytm-radio--browser-thumbnail-slot-width))
              (slot-height (* 2 (ytm-radio--browser-thumbnail-row-height)))
+             (content-size (ytm-radio--browser-thumbnail-content-size))
+             (content-top (max 0 (/ (- slot-height content-size) 2)))
              (svg (svg-create slot-width slot-height))
              (fit (ytm-radio--fit-rect (ceiling (car dimensions))
                                        (ceiling (cdr dimensions))
-                                       slot-width
-                                       slot-height)))
+                                       content-size
+                                       content-size)))
         (condition-case nil
             (progn
               (if (fboundp 'svg-embed-base-uri-image)
@@ -4475,7 +4496,7 @@ When ROW-HEIGHT and ROW-COUNT are non-nil, size the canvas from them."
                    svg
                    (file-name-nondirectory file)
                    :x (nth 2 fit)
-                   :y (nth 3 fit)
+                   :y (+ content-top (nth 3 fit))
                    :width (nth 0 fit)
                    :height (nth 1 fit))
                 (svg-embed
@@ -4484,7 +4505,7 @@ When ROW-HEIGHT and ROW-COUNT are non-nil, size the canvas from them."
                  mime-type
                  nil
                  :x (nth 2 fit)
-                 :y (nth 3 fit)
+                 :y (+ content-top (nth 3 fit))
                  :width (nth 0 fit)
                  :height (nth 1 fit)))
               (svg-image svg
@@ -4521,17 +4542,19 @@ When ROW-HEIGHT and ROW-COUNT are non-nil, size the canvas from them."
              (fboundp 'svg-create))
     (let* ((slot-width (ytm-radio--browser-thumbnail-slot-width))
            (slot-height (ytm-radio--browser-thumbnail-pixel-size))
-           (font-size (max 9 (floor (* slot-width 0.28))))
+           (content-size (ytm-radio--browser-thumbnail-content-size))
+           (content-top (max 0 (/ (- slot-height content-size) 2)))
+           (font-size (max 9 (floor (* content-size 0.28))))
            (svg (svg-create slot-width slot-height)))
-      (svg-rectangle svg 0 0 slot-width slot-height
+      (svg-rectangle svg 0 content-top content-size content-size
                      :fill (ytm-radio--placeholder-thumbnail-fill item))
-      (svg-rectangle svg 0 0 slot-width slot-height
+      (svg-rectangle svg 0 content-top content-size content-size
                      :fill "none"
                      :stroke "#4b5050"
                      :stroke-width 1)
       (svg-text svg (ytm-radio--placeholder-thumbnail-label item)
-                :x (/ slot-width 2)
-                :y (/ slot-height 2)
+                :x (/ content-size 2)
+                :y (+ content-top (/ content-size 2))
                 :fill "#d8dfd0"
                 :font-size font-size
                 :font-family "monospace"
@@ -4594,6 +4617,7 @@ When ROW-HEIGHT and ROW-COUNT are non-nil, size the canvas from them."
    file
    'thumbnail
    ytm-radio-browser-thumbnail-size
+   ytm-radio-browser-item-line-height-scale
    ytm-radio-browser-thumbnail-workaround-gaps
    (frame-char-height (selected-frame))
    (frame-char-width (selected-frame))))
