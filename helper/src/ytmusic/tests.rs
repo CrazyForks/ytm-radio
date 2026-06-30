@@ -1840,6 +1840,93 @@ fn normalizes_search_card_shelf_as_top_result_section() {
 }
 
 #[test]
+fn normalizes_search_card_shelf_song_header_as_playable_top_result() {
+    let response = json!({
+        "contents": {
+            "sectionListRenderer": {
+                "contents": [{
+                    "musicCardShelfRenderer": {
+                        "title": {"runs": [{"text": "开不了口"}]},
+                        "subtitle": {"runs": [
+                            {"text": "Song"},
+                            {"text": " • "},
+                            {"text": "Jay Chou"}
+                        ]},
+                        "navigationEndpoint": {
+                            "watchEndpoint": {"videoId": "top-song"}
+                        },
+                        "thumbnail": {"musicThumbnailRenderer": {
+                            "thumbnail": {"thumbnails": [{"url": "song-small"}, {"url": "song-large"}]}
+                        }}
+                    }
+                }]
+            }
+        }
+    });
+    let normalized = normalize_search_response("开不了口", 10, &response);
+    let item = normalized.pointer("/sources/0/items/0").unwrap();
+    assert_eq!(
+        normalized
+            .pointer("/sources/0/title")
+            .and_then(Value::as_str),
+        Some("Top result")
+    );
+    assert_eq!(item.get("type").and_then(Value::as_str), Some("track"));
+    assert_eq!(item.get("id").and_then(Value::as_str), Some("top-song"));
+    assert_eq!(item.get("title").and_then(Value::as_str), Some("开不了口"));
+    assert_eq!(item.get("artist").and_then(Value::as_str), Some("Jay Chou"));
+    assert_eq!(
+        item.get("url").and_then(Value::as_str),
+        Some("https://music.youtube.com/watch?v=top-song")
+    );
+    assert_eq!(
+        item.get("thumbnail-url").and_then(Value::as_str),
+        Some("song-large")
+    );
+}
+
+#[test]
+fn normalizes_search_card_shelf_playlist_watch_header_as_playlist() {
+    let response = json!({
+        "contents": {
+            "sectionListRenderer": {
+                "contents": [{
+                    "musicCardShelfRenderer": {
+                        "title": {"runs": [{"text": "Late night songs"}]},
+                        "subtitle": {"runs": [
+                            {"text": "Playlist"},
+                            {"text": " • "},
+                            {"text": "YouTube Music"}
+                        ]},
+                        "navigationEndpoint": {
+                            "watchEndpoint": {
+                                "videoId": "first-song",
+                                "playlistId": "VLPLAYLIST"
+                            }
+                        },
+                        "thumbnail": {"musicThumbnailRenderer": {
+                            "thumbnail": {"thumbnails": [{"url": "playlist-thumb"}]}
+                        }}
+                    }
+                }]
+            }
+        }
+    });
+    let normalized = normalize_search_response("late night songs", 10, &response);
+    let item = normalized.pointer("/sources/0/items/0").unwrap();
+    assert_eq!(item.get("type").and_then(Value::as_str), Some("playlist"));
+    assert_eq!(item.get("id").and_then(Value::as_str), Some("VLPLAYLIST"));
+    assert_eq!(
+        item.get("playlist-id").and_then(Value::as_str),
+        Some("VLPLAYLIST")
+    );
+    assert_eq!(
+        item.get("url").and_then(Value::as_str),
+        Some("https://music.youtube.com/playlist?list=VLPLAYLIST")
+    );
+}
+
+#[test]
 fn normalizes_search_item_sections_after_top_result() {
     let response = json!({
         "contents": {

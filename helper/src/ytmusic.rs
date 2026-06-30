@@ -3245,6 +3245,10 @@ fn is_library_playlists_new_playlist_action(item: &Value) -> bool {
 }
 
 fn parse_card_shelf_header(renderer: &Value) -> Option<Value> {
+    if let Some(item) = parse_card_shelf_playable_header(renderer) {
+        return Some(item);
+    }
+
     let title = renderer_title(renderer)?;
     let runs = item_metadata_runs(renderer);
     let browse_endpoint = find_direct_browse_endpoint(renderer);
@@ -3327,6 +3331,81 @@ fn parse_card_shelf_header(renderer: &Value) -> Option<Value> {
             state.subscribed.map(Value::Bool).unwrap_or(Value::Null),
         ),
     ]);
+    Some(Value::Object(std::mem::take(&mut item)))
+}
+
+fn parse_card_shelf_playable_header(renderer: &Value) -> Option<Value> {
+    let video_id = find_primary_watch_endpoint(renderer)?.video_id;
+    let title = renderer_title(renderer)?;
+    let runs = item_metadata_runs(renderer);
+    if !runs
+        .iter()
+        .any(|run| playable_kind_metadata_text(&run.text))
+    {
+        return None;
+    }
+    let kind = playable_item_kind(&runs);
+    let artist = runs
+        .iter()
+        .find(|run| {
+            run.browse_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("UC"))
+        })
+        .map(|run| run.text.clone())
+        .or_else(|| {
+            runs.iter()
+                .find(|run| {
+                    item_metadata_text(&title, &run.text) && !playable_kind_metadata_text(&run.text)
+                })
+                .map(|run| run.text.clone())
+        });
+    let album = runs
+        .iter()
+        .find(|run| {
+            run.browse_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("MPRE"))
+        })
+        .map(|run| run.text.clone());
+    let duration = runs.iter().find_map(|run| parse_duration(&run.text));
+    let thumbnail_url = renderer
+        .get("thumbnail")
+        .and_then(find_best_thumbnail)
+        .or_else(|| {
+            renderer
+                .get("thumbnailRenderer")
+                .and_then(find_best_thumbnail)
+        })
+        .or_else(|| find_best_thumbnail(renderer));
+    let menu = panel_menu_state(renderer);
+    let mut item = Map::from_iter([
+        ("type".to_string(), Value::String(kind)),
+        ("id".to_string(), Value::String(video_id.clone())),
+        ("title".to_string(), Value::String(title)),
+        (
+            "url".to_string(),
+            Value::String(format!("https://music.youtube.com/watch?v={video_id}")),
+        ),
+        (
+            "artist".to_string(),
+            artist.map(Value::String).unwrap_or(Value::Null),
+        ),
+        (
+            "album".to_string(),
+            album.map(Value::String).unwrap_or(Value::Null),
+        ),
+        (
+            "duration".to_string(),
+            duration.map(Value::from).unwrap_or(Value::Null),
+        ),
+        (
+            "thumbnail-url".to_string(),
+            thumbnail_url.map(Value::String).unwrap_or(Value::Null),
+        ),
+        ("in-library".to_string(), menu_state_in_library_value(&menu)),
+    ]);
+    insert_like_status(&mut item, &menu);
     Some(Value::Object(std::mem::take(&mut item)))
 }
 
@@ -3865,6 +3944,13 @@ fn item_metadata_text(title: &str, text: &str) -> bool {
         && !is_separator(text)
         && !is_action_text(text)
         && parse_duration(text).is_none()
+}
+
+fn playable_kind_metadata_text(text: &str) -> bool {
+    matches!(
+        text.trim().to_ascii_lowercase().as_str(),
+        "song" | "track" | "video" | "music video" | "episode" | "podcast" | "podcast episode"
+    )
 }
 
 fn parse_duration(text: &str) -> Option<u64> {
