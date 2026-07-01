@@ -170,6 +170,14 @@ only.  Set to 0 to disable stream prefetching."
   :type 'natnum
   :group 'ytm-radio)
 
+(defcustom ytm-radio-seek-step 15
+  "Default seek step in seconds for forward and backward commands."
+  :type '(restricted-sexp
+          :match-alternatives
+          ((lambda (value)
+             (and (numberp value) (> value 0)))))
+  :group 'ytm-radio)
+
 (defcustom ytm-radio-ytdl-raw-options nil
   "Raw ytdl options passed to mpv's ytdl hook.
 Each string should be in mpv's `--ytdl-raw-options' item form, for
@@ -7742,11 +7750,100 @@ DESCRIPTION is used in the user error."
           (append queue (list (copy-tree track))))
     (message "Added %s to queue" (ytm-radio--track-label track))))
 
+(defun ytm-radio--valid-seek-seconds-p (seconds)
+  "Return non-nil when SECONDS is a valid seek step."
+  (and (numberp seconds) (> seconds 0)))
+
+(defun ytm-radio--parse-seek-seconds (string)
+  "Return positive seek seconds parsed from STRING, or nil."
+  (when (and (stringp string)
+             (string-match-p
+              "\\`[[:space:]]*[+]?[0-9]+\\(?:\\.[0-9]+\\)?[[:space:]]*\\'"
+              string))
+    (let ((seconds (string-to-number string)))
+      (and (ytm-radio--valid-seek-seconds-p seconds) seconds))))
+
+(defun ytm-radio--seek-step ()
+  "Return the configured default seek step."
+  (unless (ytm-radio--valid-seek-seconds-p ytm-radio-seek-step)
+    (user-error "Invalid `ytm-radio-seek-step': %S" ytm-radio-seek-step))
+  ytm-radio-seek-step)
+
+(defun ytm-radio--seek-amount (seconds)
+  "Return validated seek amount from SECONDS or `ytm-radio-seek-step'."
+  (let ((amount (or seconds (ytm-radio--seek-step))))
+    (unless (numberp amount)
+      (user-error "Seek seconds must be numeric"))
+    amount))
+
+(defun ytm-radio--read-seek-seconds (prompt initial-input _history)
+  "Read seek seconds with PROMPT and INITIAL-INPUT."
+  (let* ((initial (cond
+                   ((numberp initial-input) initial-input)
+                   ((and (stringp initial-input)
+                         (not (string-empty-p initial-input)))
+                    (or (ytm-radio--parse-seek-seconds initial-input)
+                        (user-error "Seek seconds must be positive")))
+                   (t
+                    (ytm-radio--seek-step))))
+         (seconds (read-number prompt initial)))
+    (unless (ytm-radio--valid-seek-seconds-p seconds)
+      (user-error "Seek seconds must be positive"))
+    (number-to-string seconds)))
+
+(defun ytm-radio--init-current-actions-seek-step (object)
+  "Initialize transient seek step OBJECT from `ytm-radio-seek-step'."
+  (oset object value (number-to-string (ytm-radio--seek-step))))
+
+(transient-define-infix ytm-radio--current-actions-seek-step ()
+  "Set seek seconds for the current transient menu."
+  :description "Seek seconds"
+  :class 'transient-option
+  :argument "--seek="
+  :format " %k %d %v"
+  :reader #'ytm-radio--read-seek-seconds
+  :init-value #'ytm-radio--init-current-actions-seek-step
+  :always-read t)
+
+(defun ytm-radio--current-actions-args ()
+  "Return active current-actions transient arguments."
+  (unless (eq transient-current-command 'ytm-radio-current-actions)
+    (user-error "Current actions transient is not active"))
+  (transient-args transient-current-command))
+
+(defun ytm-radio--current-actions-seek-seconds (arguments)
+  "Return seek seconds from transient ARGUMENTS."
+  (let* ((raw (seq-some
+               (lambda (argument)
+                 (when (and (stringp argument)
+                            (string-prefix-p "--seek=" argument))
+                   (substring argument (length "--seek="))))
+               arguments))
+         (seconds (and raw (ytm-radio--parse-seek-seconds raw))))
+    (unless (ytm-radio--valid-seek-seconds-p seconds)
+      (user-error "Current actions has no valid seek seconds"))
+    seconds))
+
+(transient-define-suffix ytm-radio--current-actions-seek-forward (arguments)
+  "Seek forward using the current transient seek step."
+  (interactive (list (ytm-radio--current-actions-args)))
+  (ytm-radio-seek-forward
+   (ytm-radio--current-actions-seek-seconds arguments)))
+
+(transient-define-suffix ytm-radio--current-actions-seek-backward (arguments)
+  "Seek backward using the current transient seek step."
+  (interactive (list (ytm-radio--current-actions-args)))
+  (ytm-radio-seek-backward
+   (ytm-radio--current-actions-seek-seconds arguments)))
+
 ;;;###autoload(autoload 'ytm-radio-current-actions "ytm-radio" nil t)
 (transient-define-prefix ytm-radio-current-actions ()
   "Show actions for the current track."
   [["Playback"
     ("SPC" "Pause/resume" ytm-radio-toggle-pause)
+    ("b" "Back" ytm-radio--current-actions-seek-backward)
+    ("f" "Forward" ytm-radio--current-actions-seek-forward)
+    ("-s" "Seek seconds" ytm-radio--current-actions-seek-step)
     ("n" "Next" ytm-radio-next)
     ("p" "Previous" ytm-radio-previous)
     ("r" ytm-radio-cycle-repeat
@@ -7763,9 +7860,9 @@ DESCRIPTION is used in the user error."
     ("P" "Add to playlist" ytm-radio-add-current-track-to-playlist)
     ("R" "Start mix" ytm-radio-start-current-track-mix)
     ("S" "Share" ytm-radio-share)]
-   ["Queue"
+   ["View/Queue"
+    ("c" "Now playing" ytm-radio-now-playing)
     ("Q" "View queue" ytm-radio-queue)
-    ("x" "Play next" ytm-radio-play-current-track-next)
     ("a" "Add to queue" ytm-radio-add-current-track-to-queue)]])
 
 ;;;###autoload
@@ -7843,25 +7940,18 @@ DESCRIPTION is used in the user error."
     (user-error "No track URL to share")))
 
 ;;;###autoload
-(defun ytm-radio-seek-forward (seconds)
-  "Seek forward SECONDS seconds, defaulting to five."
-  (interactive "P")
+(defun ytm-radio-seek-forward (&optional seconds)
+  "Seek forward SECONDS seconds, defaulting to `ytm-radio-seek-step'."
+  (interactive)
   (unless (process-live-p (map-elt ytm-radio--player :ipc-process))
     (user-error "Not playing"))
-  (let ((amount (cond ((numberp seconds) seconds)
-                      (seconds (* 60 (/ (prefix-numeric-value seconds) 4)))
-                      (t 5))))
-    (ytm-radio--mpv-send (list "seek" amount))))
+  (ytm-radio--mpv-send (list "seek" (ytm-radio--seek-amount seconds))))
 
 ;;;###autoload
-(defun ytm-radio-seek-backward (seconds)
-  "Seek backward SECONDS seconds, defaulting to five."
-  (interactive "P")
-  (unless seconds
-    (setq seconds 5))
-  (when (and seconds (not (numberp seconds)))
-    (setq seconds (* 60 (/ (prefix-numeric-value seconds) 4))))
-  (ytm-radio-seek-forward (- seconds)))
+(defun ytm-radio-seek-backward (&optional seconds)
+  "Seek backward SECONDS seconds, defaulting to `ytm-radio-seek-step'."
+  (interactive)
+  (ytm-radio-seek-forward (- (ytm-radio--seek-amount seconds))))
 
 (defun ytm-radio--quit-buffer-window (buffer-name)
   "Quit the visible window showing BUFFER-NAME."

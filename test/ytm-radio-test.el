@@ -4176,6 +4176,46 @@ STRING-PIXEL-WIDTH replaces `string-pixel-width' during rendering."
     (ytm-radio-test--should-state-label
      (ytm-radio--shuffle-action-label) "Shuffle (Off|On)" "On" "Off")))
 
+(ert-deftest ytm-radio-current-actions-exposes-seek-and-now-playing ()
+  "Expose now-playing and seek controls in the current-track transient."
+  (dolist (key '("b" "f" "-s" "c"))
+    (should (transient-get-suffix 'ytm-radio-current-actions key)))
+  (should-error (transient-get-suffix 'ytm-radio-current-actions "x")))
+
+(ert-deftest ytm-radio-current-actions-seek-seconds-reads-option ()
+  "Read seek seconds from the current-track transient option."
+  (should (= (ytm-radio--current-actions-seek-seconds '("--seek=30")) 30))
+  (should (= (ytm-radio--current-actions-seek-seconds '("--seek=12.5")) 12.5))
+  (should-error (ytm-radio--current-actions-seek-seconds nil)
+                :type 'user-error)
+  (should-error (ytm-radio--current-actions-seek-seconds '("--seek=0"))
+                :type 'user-error)
+  (should-error (ytm-radio--current-actions-seek-seconds '("--seek=abc"))
+                :type 'user-error)
+  (should-error (ytm-radio--current-actions-seek-seconds '("--seek=12abc"))
+                :type 'user-error))
+
+(ert-deftest ytm-radio-seek-commands-use-configured-step ()
+  "Seek by `ytm-radio-seek-step' unless a caller supplies seconds."
+  (let ((ytm-radio-seek-step 15)
+        (ytm-radio--player (ytm-radio--make-player :ipc-process 'ipc))
+        commands)
+    (cl-letf (((symbol-function 'process-live-p)
+               (lambda (process) (eq process 'ipc)))
+              ((symbol-function 'ytm-radio--mpv-send)
+               (lambda (command) (push command commands))))
+      (ytm-radio-seek-forward)
+      (ytm-radio-seek-backward)
+      (ytm-radio-seek-forward 30)
+      (ytm-radio-seek-backward 45)
+      (should-error (ytm-radio-seek-forward "30") :type 'user-error)
+      (should-error (ytm-radio-seek-backward "30") :type 'user-error))
+    (should (equal (nreverse commands)
+                   '(("seek" 15)
+                     ("seek" -15)
+                     ("seek" 30)
+                     ("seek" -45))))))
+
 (ert-deftest ytm-radio-set-track-like-status-indexes-source-items ()
   "Expose local rating changes without mutating cached source payloads."
   (let* ((item '((type . "track")

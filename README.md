@@ -217,7 +217,9 @@ directory, and the auth file are visible from Emacs.
 - `M-x ytm-radio-play-source` selects a known source.
 - `M-x ytm-radio-current-actions` opens actions for the current track.
   Stateful actions such as repeat, shuffle, like, dislike, and library show
-  their current state in the menu labels.
+  their current state in the menu labels. The menu also includes now-playing,
+  queue, and seek controls; set `Seek seconds` with `-s` to change the current
+  menu's back/forward seek amount.
 - `M-x ytm-radio-like-current-track` likes the current track or clears an
   existing like.
 - `M-x ytm-radio-dislike-current-track` dislikes the current track or clears an
@@ -243,8 +245,8 @@ directory, and the auth file are visible from Emacs.
 - `M-x ytm-radio-next` plays the next track.
 - `M-x ytm-radio-previous` plays the previous track.
 - `M-x ytm-radio-share` copies the current track URL.
-- `M-x ytm-radio-seek-forward` seeks forward.
-- `M-x ytm-radio-seek-backward` seeks backward.
+- `M-x ytm-radio-seek-forward` seeks forward by `ytm-radio-seek-step` seconds.
+- `M-x ytm-radio-seek-backward` seeks backward by `ytm-radio-seek-step` seconds.
 - `M-x ytm-radio-hide-browser` hides the browser buffer.
 - `M-x ytm-radio-hide-now-playing` hides the now-playing view.
 - `M-x ytm-radio-hide` hides ytm-radio UI.
@@ -277,9 +279,11 @@ Inside the browser buffer:
 | `t` | Save or remove current track from library |
 | `S` | Copy current track URL |
 | `Q` | Show the runtime queue |
-| `f` | Seek forward |
-| `B` | Seek backward |
+| `f` | Seek forward by `ytm-radio-seek-step` seconds |
+| `B` | Seek backward by `ytm-radio-seek-step` seconds |
 | `q` | Hide the browser buffer |
+
+Seek commands use `ytm-radio-seek-step`, which defaults to 15 seconds.
 
 Use `M-x imenu` in Home, Explore, or Library to jump between rendered
 sections.
