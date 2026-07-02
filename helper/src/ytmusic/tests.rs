@@ -2198,6 +2198,56 @@ fn normalizes_browse_id_response_as_detail_source() {
 }
 
 #[test]
+fn normalizes_browse_episode_item_url_from_watch_endpoint() {
+    let response = json!({
+        "contents": [{
+            "musicResponsiveListItemRenderer": {
+                "flexColumns": [{
+                    "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {"runs": [{"text": "Queued Episode"}]}
+                    }
+                }, {
+                    "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {"runs": [{"text": "Apr 14"}, {"text": " • "}, {"text": "Podcast"}]}
+                    }
+                }],
+                "navigationEndpoint": {
+                    "browseEndpoint": {
+                        "browseId": "MPEDZfk01EKkzTA",
+                        "params": "ggMHmgEECgJTRQ=="
+                    }
+                },
+                "thumbnailOverlay": {
+                    "musicItemThumbnailOverlayRenderer": {
+                        "content": {
+                            "musicPlayButtonRenderer": {
+                                "playNavigationEndpoint": {
+                                    "watchEndpoint": {
+                                        "videoId": "Zfk01EKkzTA",
+                                        "playlistId": "SE"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    });
+    let normalized = normalize_browse_id_response("VLSE", 10, &response);
+    let item = normalized.pointer("/sources/0/items/0").unwrap();
+    assert_eq!(item.get("type").and_then(Value::as_str), Some("episode"));
+    assert_eq!(
+        item.get("browse-id").and_then(Value::as_str),
+        Some("MPEDZfk01EKkzTA")
+    );
+    assert_eq!(
+        item.get("url").and_then(Value::as_str),
+        Some("https://music.youtube.com/watch?v=Zfk01EKkzTA&list=SE")
+    );
+}
+
+#[test]
 fn normalizes_browse_id_response_without_internal_title() {
     let response = json!({
         "contents": {

@@ -3292,7 +3292,13 @@ fn parse_card_shelf_header(renderer: &Value) -> Option<Value> {
                 .and_then(find_best_thumbnail)
         })
         .or_else(|| find_best_thumbnail(renderer));
-    let url = item_url(&kind, browse_id.as_deref(), playlist_id.as_deref());
+    let watch_endpoint = find_first_watch_endpoint(renderer);
+    let url = item_url(
+        &kind,
+        browse_id.as_deref(),
+        playlist_id.as_deref(),
+        watch_endpoint.as_ref(),
+    );
     let state = panel_menu_state(renderer);
     let mut item = Map::from_iter([
         ("type".to_string(), Value::String(kind)),
@@ -3343,7 +3349,8 @@ fn parse_card_shelf_header(renderer: &Value) -> Option<Value> {
 }
 
 fn parse_card_shelf_playable_header(renderer: &Value) -> Option<Value> {
-    let video_id = find_primary_watch_endpoint(renderer)?.video_id;
+    let watch_endpoint = find_primary_watch_endpoint(renderer)?;
+    let video_id = watch_endpoint.video_id.clone();
     let title = renderer_title(renderer)?;
     let runs = item_metadata_runs(renderer);
     if !runs
@@ -3393,7 +3400,7 @@ fn parse_card_shelf_playable_header(renderer: &Value) -> Option<Value> {
         ("title".to_string(), Value::String(title)),
         (
             "url".to_string(),
-            Value::String(format!("https://music.youtube.com/watch?v={video_id}")),
+            Value::String(watch_endpoint_url(&watch_endpoint)),
         ),
         (
             "artist".to_string(),
@@ -3435,7 +3442,8 @@ fn parse_item(renderer: &Value) -> Option<Value> {
 }
 
 fn parse_track(renderer: &Value) -> Option<Value> {
-    let video_id = find_primary_watch_endpoint(renderer)?.video_id;
+    let watch_endpoint = find_primary_watch_endpoint(renderer)?;
+    let video_id = watch_endpoint.video_id.clone();
     let title = renderer_title(renderer)?;
     let runs = collect_text_runs(renderer);
     let kind = playable_item_kind(&runs);
@@ -3469,7 +3477,7 @@ fn parse_track(renderer: &Value) -> Option<Value> {
         ("title".to_string(), Value::String(title)),
         (
             "url".to_string(),
-            Value::String(format!("https://music.youtube.com/watch?v={video_id}")),
+            Value::String(watch_endpoint_url(&watch_endpoint)),
         ),
         (
             "artist".to_string(),
@@ -3527,7 +3535,13 @@ fn parse_card(renderer: &Value) -> Option<Value> {
     let subtitle = metadata_subtitle(&title, &metadata_runs);
     let metadata = metadata_tokens(&title, &metadata_runs);
     let thumbnail_url = find_best_thumbnail(renderer);
-    let url = item_url(&kind, browse_id.as_deref(), playlist_id.as_deref());
+    let watch_endpoint = find_first_watch_endpoint(renderer);
+    let url = item_url(
+        &kind,
+        browse_id.as_deref(),
+        playlist_id.as_deref(),
+        watch_endpoint.as_ref(),
+    );
     let state = panel_menu_state(renderer);
     let mut item = Map::from_iter([
         ("type".to_string(), Value::String(kind)),
@@ -3638,7 +3652,17 @@ fn item_kind_from_page_type(page_type: Option<&str>) -> Option<&'static str> {
     }
 }
 
-fn item_url(kind: &str, browse_id: Option<&str>, playlist_id: Option<&str>) -> Option<String> {
+fn item_url(
+    kind: &str,
+    browse_id: Option<&str>,
+    playlist_id: Option<&str>,
+    watch_endpoint: Option<&WatchEndpoint>,
+) -> Option<String> {
+    if matches!(kind, "track" | "episode") {
+        if let Some(watch_endpoint) = watch_endpoint {
+            return Some(watch_endpoint_url(watch_endpoint));
+        }
+    }
     if let Some(playlist_id) = playlist_id {
         return Some(format!(
             "https://music.youtube.com/playlist?list={playlist_id}"
@@ -3655,6 +3679,21 @@ fn item_url(kind: &str, browse_id: Option<&str>, playlist_id: Option<&str>) -> O
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WatchEndpoint {
     video_id: String,
+    playlist_id: Option<String>,
+}
+
+fn watch_endpoint_url(endpoint: &WatchEndpoint) -> String {
+    match endpoint
+        .playlist_id
+        .as_deref()
+        .filter(|playlist_id| !playlist_id.trim().is_empty())
+    {
+        Some(playlist_id) => format!(
+            "https://music.youtube.com/watch?v={}&list={}",
+            endpoint.video_id, playlist_id
+        ),
+        None => format!("https://music.youtube.com/watch?v={}", endpoint.video_id),
+    }
 }
 
 fn find_primary_watch_endpoint(renderer: &Value) -> Option<WatchEndpoint> {
@@ -3672,12 +3711,36 @@ fn find_primary_watch_endpoint(renderer: &Value) -> Option<WatchEndpoint> {
 }
 
 fn watch_endpoint_from_navigation_endpoint(value: &Value) -> Option<WatchEndpoint> {
-    let video_id = value
-        .get("watchEndpoint")
-        .and_then(|value| value.get("videoId"))
-        .and_then(Value::as_str)?
-        .to_string();
-    Some(WatchEndpoint { video_id })
+    watch_endpoint_from_watch_endpoint(value.get("watchEndpoint")?)
+}
+
+fn watch_endpoint_from_watch_endpoint(value: &Value) -> Option<WatchEndpoint> {
+    let video_id = value.get("videoId").and_then(Value::as_str)?.to_string();
+    let playlist_id = value
+        .get("playlistId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    Some(WatchEndpoint {
+        video_id,
+        playlist_id,
+    })
+}
+
+fn find_first_watch_endpoint(value: &Value) -> Option<WatchEndpoint> {
+    match value {
+        Value::Object(object) => {
+            if let Some(endpoint) = object
+                .get("watchEndpoint")
+                .and_then(watch_endpoint_from_watch_endpoint)
+            {
+                return Some(endpoint);
+            }
+            object.values().find_map(find_first_watch_endpoint)
+        }
+        Value::Array(array) => array.iter().find_map(find_first_watch_endpoint),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
