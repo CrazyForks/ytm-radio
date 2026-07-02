@@ -218,8 +218,8 @@ directory, and the auth file are visible from Emacs.
 - `M-x ytm-radio-current-actions` opens actions for the current track.
   Stateful actions such as repeat, shuffle, like, dislike, and library show
   their current state in the menu labels. The menu also includes now-playing,
-  queue, and seek controls; set `Seek seconds` with `-s` to change the current
-  menu's back/forward seek amount.
+  queue, and seek controls. Its Options section includes `Seek seconds`
+  (`-s`) for changing the current menu's back/forward seek amount.
 - `M-x ytm-radio-like-current-track` likes the current track or clears an
   existing like.
 - `M-x ytm-radio-dislike-current-track` dislikes the current track or clears an

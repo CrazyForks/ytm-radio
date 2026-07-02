@@ -7839,11 +7839,13 @@ DESCRIPTION is used in the user error."
 ;;;###autoload(autoload 'ytm-radio-current-actions "ytm-radio" nil t)
 (transient-define-prefix ytm-radio-current-actions ()
   "Show actions for the current track."
+  [:class transient-row
+   "Options"
+   ("-s" "Seek seconds" ytm-radio--current-actions-seek-step)]
   [["Playback"
     ("SPC" "Pause/resume" ytm-radio-toggle-pause)
     ("b" "Back" ytm-radio--current-actions-seek-backward)
     ("f" "Forward" ytm-radio--current-actions-seek-forward)
-    ("-s" "Seek seconds" ytm-radio--current-actions-seek-step)
     ("n" "Next" ytm-radio-next)
     ("p" "Previous" ytm-radio-previous)
     ("r" ytm-radio-cycle-repeat
