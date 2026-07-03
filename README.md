@@ -14,6 +14,8 @@ terminal TUI outside Emacs.
 YouTube Music account access is a separate Rust CLI. It is not an Emacs
 dynamic module and does not run as a resident service. Emacs starts one
 process for a request, reads a versioned JSON response, and the process exits.
+The helper also resolves authenticated account tracks before handing a direct
+audio stream to `mpv`.
 
 ![ytm-radio Home view with the now-playing child frame](assets/ytm-radio-home-now-playing.jpg)
 
@@ -37,6 +39,8 @@ Implemented:
 - make authenticated YouTube Music home, explore, library, liked, detail,
   search, radio/mix, playlist mutation, rating, track status, library
   mutation, item library, and subscription requests;
+- play helper-backed account tracks, including Music Premium-only tracks,
+  through the same browser-independent helper session;
 - normalize live music renderers into playable tracks;
 - preserve non-track YouTube Music items such as albums, artists, playlists,
   and recommendation cards when they are present in browse responses;
@@ -330,6 +334,7 @@ ytm-radio-helper library VIDEO_ID toggle|save|remove --auth FILE
 ytm-radio-helper item-library BROWSE_ID toggle|save|remove --auth FILE [--params PARAMS]
 ytm-radio-helper subscription BROWSE_ID toggle|subscribe|unsubscribe --auth FILE [--params PARAMS]
 ytm-radio-helper track-status VIDEO_ID --auth FILE
+ytm-radio-helper stream VIDEO_ID --auth FILE [--yt-dlp-program PROGRAM] [--format FORMAT] [--proxy URL]
 ```
 
 For `home`, `explore`, and `library`, the helper preserves YouTube Music
@@ -361,6 +366,9 @@ like/dislike and library state without mutating the song; the Emacs UI uses it
 to refresh the current track after playback starts. When rating state is not
 available, `track-status` omits `like-status`; a present JSON null means the
 track is known to be unrated.
+`stream` converts the helper session to a private, short-lived yt-dlp cookie
+file, resolves one direct audio URL, deletes the cookie file, and returns only
+the direct URL. The browser name is not part of this command.
 
 URL playback remains a general `yt-dlp` compatibility path. It is transient and
 does not store YouTube Music menu tokens. Actions that need YouTube Music
@@ -440,6 +448,11 @@ supported login flow. Chromium-based browsers use the DevTools protocol;
 Firefox and Zen use WebDriver BiDi. On macOS this uses the default application
 for `https://` URLs. On Linux this uses the default
 `x-scheme-handler/https` desktop entry.
+
+After login, helper-backed account playback reuses `auth.json` regardless of
+whether the session came from Dia, Chrome, Brave, Edge, Chromium, Firefox, or
+Zen. Do not configure `cookies-from-browser` for normal Library, Home, Explore,
+Search, or detail-page playback.
 
 Set a preferred login browser when the default browser is unsupported or when
 you want a specific browser. Use `chrome`, `brave`, `edge`, `chromium`,
@@ -521,11 +534,14 @@ does not alter already-running browser sessions. Firefox and Zen login windows
 and existing browser sessions must use the browser or system proxy
 configuration. When a SOCKS proxy is configured, ytm-radio avoids using cached
 direct media URLs because mpv's direct transport may not preserve SOCKS routing.
+Authenticated helper-backed playback requires a direct media URL and therefore
+currently requires no proxy or an HTTP/HTTPS proxy.
 
-## URL Cookies
+## Transient URL Cookies
 
-These options are for `yt-dlp` media discovery and mpv playback only. They are
-not used for ytm-radio account login.
+These optional escape hatches apply only to transient URLs imported outside the
+account browser. They are not used for account login or helper-backed account
+playback, and `yt-dlp` may not recognize every browser supported by the helper.
 
 Configure discovery-time `yt-dlp` options:
 

@@ -1478,6 +1478,14 @@ fn normalizes_explore_shelves_as_sources() {
                                 "navigationEndpoint": {
                                     "watchEndpoint": {"videoId": "v1"}
                                 },
+                                "badges": [{
+                                    "musicInlineBadgeRenderer": {
+                                        "icon": {"iconType": "MUSIC_EXPLICIT_BADGE"},
+                                        "accessibilityData": {
+                                            "accessibilityData": {"label": "Explicit"}
+                                        }
+                                    }
+                                }],
                                 "menu": {
                                     "menuRenderer": {
                                         "topLevelButtons": [{
@@ -1516,6 +1524,28 @@ fn normalizes_explore_shelves_as_sources() {
             .and_then(Value::as_str),
         Some("like")
     );
+    assert_eq!(
+        source.pointer("/items/1/explicit").and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+#[test]
+fn detects_explicit_badges_without_guessing_from_text() {
+    let renderer = json!({
+        "title": {"runs": [{"text": "Explicit by Title Only"}]},
+        "badges": [{
+            "musicInlineBadgeRenderer": {
+                "icon": {"iconType": "MUSIC_EXPLICIT_BADGE"}
+            }
+        }]
+    });
+    assert!(renderer_explicit(&renderer));
+
+    let renderer = json!({
+        "title": {"runs": [{"text": "Explicit by Title Only"}]}
+    });
+    assert!(!renderer_explicit(&renderer));
 }
 
 #[test]

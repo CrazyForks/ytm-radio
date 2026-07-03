@@ -113,11 +113,14 @@ and useful.
 
 - Elisp owns local catalog state, runtime queue state, UI rendering, user
   commands, and mpv IPC.
-- `yt-dlp` owns URL metadata discovery and mpv's ytdl media extraction path.
+- `yt-dlp` owns URL metadata discovery and media extraction compatibility.
+  Transient URLs use mpv's ytdl path; helper-backed account tracks are resolved
+  by the Rust helper with the existing browser-login session before mpv starts.
 - The Rust helper owns YouTube Music account requests, account mutations, the
-  browser login window, and helper JSON envelopes. Elisp may choose targets and
-  update local display state, but it must not persist YouTube Music feedback
-  tokens or duplicate Innertube request assembly.
+  browser login window, authenticated account stream resolution, and helper
+  JSON envelopes. Elisp may choose targets and update local display state, but
+  it must not persist cookies, YouTube Music feedback tokens, or duplicate
+  Innertube request assembly.
 - The browser login window may use Chromium DevTools or WebDriver BiDi for
   Firefox-family browsers, including Firefox and Zen. It must not read browser
   cookie databases directly.

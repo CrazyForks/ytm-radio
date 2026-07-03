@@ -262,6 +262,29 @@ fn parses_current_track_action_commands() {
 }
 
 #[test]
+fn parses_authenticated_stream_command() {
+    let options = parse_args([
+        "stream",
+        VIDEO_ID,
+        "--auth",
+        "/tmp/auth.json",
+        "--yt-dlp-program",
+        "/opt/bin/yt-dlp",
+        "--format",
+        "bestaudio/best",
+    ])
+    .unwrap();
+    assert_eq!(
+        options.command,
+        Command::Stream {
+            video_id: VIDEO_ID.to_string(),
+            yt_dlp_program: "/opt/bin/yt-dlp".to_string(),
+            format: "bestaudio/best".to_string(),
+        }
+    );
+}
+
+#[test]
 fn rejects_invalid_video_id() {
     let error = parse_args(["radio", "v1", "--mock"]).unwrap_err();
     assert!(error.contains("11-character YouTube video id"));
@@ -466,6 +489,16 @@ fn mock_current_track_actions_output_data() {
     let status_output = run(["track-status", VIDEO_ID, "--mock"]).unwrap();
     assert!(status_output.contains(r#""in-library":true"#));
     assert!(status_output.contains(r#""like-status":"like""#));
+}
+
+#[test]
+fn mock_stream_outputs_direct_url() {
+    let output = run(["stream", VIDEO_ID, "--mock"]).unwrap();
+    let parsed: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(
+        parsed["data"]["url"],
+        format!("https://media.example/{VIDEO_ID}")
+    );
 }
 
 #[test]

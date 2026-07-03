@@ -393,8 +393,8 @@ FIELDS are included on both the top-level mutation output and source."
     (should (equal (ytm-radio--playback-url-choice track)
                    (list "https://music.youtube.com/watch?v=v1" nil)))))
 
-(ert-deftest ytm-radio-play-track-prefetches-next-track ()
-  "Schedule the next track for background stream prefetch after playback starts."
+(ert-deftest ytm-radio-play-track-starts-with-retry-state-and-prefetches ()
+  "Preserve retry state while starting playback and prefetching the next track."
   (let* ((track-a (ytm-radio--make-track
                    :id "a"
                    :title "A"
@@ -411,16 +411,19 @@ FIELDS are included on both the top-level mutation output and source."
          (ytm-radio--state
           (ytm-radio--make-state
            :sources (list (cons "s" source))))
-         (ytm-radio--player (ytm-radio--make-player))
+         (ytm-radio--player (ytm-radio--make-player :retry-stage 'final))
          (ytm-radio-mpv-network-cache-args nil)
          (ytm-radio-mpv-extra-args nil)
          (ytm-radio-proxy-url nil)
          (ytm-radio-ytdl-raw-options nil)
          process
+         stop-preserve
          scheduled)
     (unwind-protect
         (cl-letf (((symbol-function 'ytm-radio--ensure-program) #'ignore)
-                  ((symbol-function 'ytm-radio--stop-process) #'ignore)
+                  ((symbol-function 'ytm-radio--stop-process)
+                   (lambda (&optional preserve-retry-stage)
+                     (setq stop-preserve preserve-retry-stage)))
                   ((symbol-function 'ytm-radio--mpv-connect) #'ignore)
                   ((symbol-function 'ytm-radio--render) #'ignore)
                   ((symbol-function 'ytm-radio--show-now-playing) #'ignore)
@@ -436,12 +439,51 @@ FIELDS are included on both the top-level mutation output and source."
                             :buffer buffer
                             :command '("sleep" "2")
                             :noquery t)))))
-          (ytm-radio--play-track track-a)
+          (ytm-radio--play-track track-a t)
+          (should stop-preserve)
+          (should (eq (map-elt ytm-radio--player :retry-stage) 'final))
           (should (equal scheduled (list track-b))))
       (when (processp process)
         (set-process-sentinel process nil)
         (when (process-live-p process)
           (delete-process process))))))
+
+(ert-deftest ytm-radio-account-track-resolves-before-starting-mpv ()
+  "Resolve helper account tracks before starting mpv."
+  (let* ((track (ytm-radio--make-track
+                 :id "abcdefghijk"
+                 :title "Premium song"
+                 :url "https://music.youtube.com/watch?v=abcdefghijk"
+                 :account-auth t))
+         (ytm-radio--state (ytm-radio--make-state))
+         (ytm-radio--player (ytm-radio--make-player))
+         (ytm-radio--stream-url-cache (make-hash-table :test #'equal))
+         (ytm-radio--playback-resolve-process nil)
+         success-callback
+         started-url)
+    (cl-letf (((symbol-function 'ytm-radio--with-account-auth)
+               (lambda (action &optional _message) (funcall action)))
+              ((symbol-function 'ytm-radio--resolve-stream-async)
+               (lambda (_track success _error)
+                 (setq success-callback success)
+                 'resolve-process))
+              ((symbol-function 'ytm-radio--stop-process) #'ignore)
+              ((symbol-function 'ytm-radio--save) #'ignore)
+              ((symbol-function 'ytm-radio--render) #'ignore)
+              ((symbol-function 'ytm-radio--show-now-playing) #'ignore)
+              ((symbol-function 'ytm-radio--refresh-track-status) #'ignore)
+              ((symbol-function 'ytm-radio--schedule-stream-prefetch) #'ignore)
+              ((symbol-function 'ytm-radio--play-track-now)
+               (lambda (resolved-track &optional _preserve-retry-stage)
+                 (setq started-url
+                       (car (ytm-radio--playback-url-choice resolved-track))))))
+      (ytm-radio--play-track track)
+      (should (eq ytm-radio--playback-resolve-process 'resolve-process))
+      (should-not started-url)
+      (funcall success-callback
+               "https://media.example/videoplayback?expire=9999999999")
+      (should (equal started-url
+                     "https://media.example/videoplayback?expire=9999999999")))))
 
 (ert-deftest ytm-radio-play-track-restarts-current-track-in-place ()
   "Restart the current track with mpv IPC instead of replacing mpv."
@@ -594,6 +636,34 @@ FIELDS are included on both the top-level mutation output and source."
       (should (eq (map-elt ytm-radio--player :status) 'loading))
       (should-not (map-elt ytm-radio--player :using-stream-cache))
       (should (eq (map-elt ytm-radio--player :retry-stage) 'original)))))
+
+(ert-deftest ytm-radio-account-playback-error-refreshes-authenticated-stream ()
+  "Refresh an account stream once instead of loading its public URL."
+  (let* ((ytm-radio--stream-url-cache (make-hash-table :test #'equal))
+         (track (ytm-radio--make-track
+                 :id "abcdefghijk"
+                 :title "Premium song"
+                 :url "https://music.youtube.com/watch?v=abcdefghijk"
+                 :account-auth t))
+         (ytm-radio--player
+          (ytm-radio--make-player
+           :current-track track
+           :using-stream-cache t))
+         retried-track
+         preserved)
+    (ytm-radio--cache-stream-url
+     track "https://media.example/videoplayback?expire=9999999999")
+    (cl-letf (((symbol-function 'ytm-radio--play-track)
+               (lambda (candidate &optional preserve-retry-stage)
+                 (setq retried-track candidate
+                       preserved preserve-retry-stage)))
+              ((symbol-function 'message) #'ignore))
+      (should (ytm-radio--retry-current-track-after-error))
+      (should (eq retried-track track))
+      (should preserved)
+      (should-not (gethash "abcdefghijk" ytm-radio--stream-url-cache))
+      (should (eq (map-elt ytm-radio--player :retry-stage) 'final))
+      (should-not (ytm-radio--retry-current-track-after-error)))))
 
 (ert-deftest ytm-radio-mpv-error-retries-original-url-once ()
   "Retry a transient mpv playback error once for the original track URL."
@@ -1123,6 +1193,53 @@ FIELDS are included on both the top-level mutation output and source."
         (should (equal indicator " I"))
         (should (eq (get-text-property 1 'face indicator)
                     'nerd-icons-test-face))))))
+
+(ert-deftest ytm-radio-explicit-badge-uses-icon-or-reverse-video-fallback ()
+  "Use a Nerd Icon explicit badge, falling back to a reversed E."
+  (let (requested)
+    (cl-letf (((symbol-function 'ytm-radio--mdicon)
+               (lambda (name fallback)
+                 (setq requested (list name fallback))
+                 "ICON")))
+      (should (equal (ytm-radio--explicit-badge) "ICON"))
+      (should (equal requested '("nf-md-alpha_e_box" nil)))))
+  (cl-letf (((symbol-function 'ytm-radio--mdicon)
+             (lambda (_name fallback) fallback)))
+    (let ((badge (ytm-radio--explicit-badge)))
+      (should (equal badge "E"))
+      (should (eq (get-text-property 0 'face badge)
+                  'ytm-radio-explicit-badge)))))
+
+(ert-deftest ytm-radio-render-explicit-badge-in-detail-row ()
+  "Render explicit tracks with a fallback E badge before artist metadata."
+  (let* ((source (ytm-radio--make-source
+                  :id "ytm:home"
+                  :kind 'youtube-music-home
+                  :title "YouTube Music Home"
+                  :url "https://music.youtube.com/"
+                  :items '(((type . "track")
+                            (id . "v1")
+                            (title . "Song")
+                            (artist . "Artist")
+                            (explicit . t)
+                            (url . "https://music.youtube.com/watch?v=v1")))))
+         (ytm-radio--browser-view 'home)
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons (map-elt source :id) source))))
+         (ytm-radio--player (ytm-radio--make-player)))
+    (with-current-buffer (ytm-radio--buffer)
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (cl-letf (((symbol-function 'ytm-radio--mdicon)
+               (lambda (_name fallback) fallback)))
+      (ytm-radio--render))
+    (with-current-buffer "*ytm-radio*"
+      (let* ((text (buffer-string))
+             (match (string-match (regexp-quote "E Artist") text)))
+        (should match)
+        (should (eq (get-text-property match 'face text)
+                    'ytm-radio-explicit-badge))))))
 
 (ert-deftest ytm-radio-render-library-items-use-detail-rows ()
   "Render Library song items with detail rows while preserving ratings."
@@ -4612,6 +4729,7 @@ STRING-PIXEL-WIDTH replaces `string-pixel-width' during rendering."
       (should (= (length (map-elt ytm-radio--player :queue)) 2))
       (should (eq (car (map-elt ytm-radio--player :queue)) track))
       (should (= (map-elt track :duration) 208))
+      (should (map-elt track :account-auth))
       (should (equal (map-elt (cadr (map-elt ytm-radio--player :queue)) :id)
                      "def456_GHI7")))))
 
@@ -5633,6 +5751,19 @@ STRING-PIXEL-WIDTH replaces `string-pixel-width' during rendering."
                      "--auth"
                      "/tmp/auth.json")))))
 
+(ert-deftest ytm-radio-helper-stream-arguments-include-playback-settings ()
+  "Build helper arguments for authenticated stream resolution."
+  (let ((ytm-radio-helper-auth-file "/tmp/auth.json")
+        (ytm-radio-yt-dlp-program "/opt/bin/yt-dlp")
+        (ytm-radio-mpv-ytdl-format "bestaudio/best")
+        (ytm-radio-proxy-url nil))
+    (should
+     (equal (ytm-radio--helper-stream-arguments "abcdefghijk")
+            '("stream" "abcdefghijk"
+              "--yt-dlp-program" "/opt/bin/yt-dlp"
+              "--format" "bestaudio/best"
+              "--auth" "/tmp/auth.json")))))
+
 (ert-deftest ytm-radio-helper-current-action-arguments-include-auth ()
   "Build Rust helper arguments for current-track actions."
   (let ((ytm-radio-helper-auth-file "/tmp/auth.json")
@@ -6253,7 +6384,8 @@ STRING-PIXEL-WIDTH replaces `string-pixel-width' during rendering."
                                (duration . 210)
                                (artist . "Artist")
                                (album . "Album")
-                              (thumbnail-url . "thumb.jpg"))
+                               (explicit . t)
+                               (thumbnail-url . "thumb.jpg"))
                               ((type . "playlist")
                                (id . "p1")
                                (title . "Playlist")
@@ -6266,6 +6398,8 @@ STRING-PIXEL-WIDTH replaces `string-pixel-width' during rendering."
     (should (= (length (map-elt source :tracks)) 1))
     (should (equal (map-elt track :source-id) "ytmusic-liked-songs"))
     (should (eq (map-elt track :source-kind) 'youtube-music-liked))
+    (should (map-elt track :account-auth))
+    (should (map-elt track :explicit))
     (should (equal (map-elt track :title) "Song"))
     (should (equal (map-elt track :thumbnail-url) "thumb.jpg"))))
 

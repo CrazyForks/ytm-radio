@@ -2084,6 +2084,7 @@ fn parse_playlist_panel_track(renderer: &Value) -> Option<Value> {
         ),
         ("in-library".to_string(), Value::Bool(menu.in_library)),
     ]);
+    insert_explicit(&mut item, renderer);
     insert_like_status(&mut item, &menu);
     Some(Value::Object(std::mem::take(&mut item)))
 }
@@ -2565,6 +2566,48 @@ fn insert_like_status(object: &mut Map<String, Value>, state: &MenuState) {
                 .unwrap_or(Value::Null),
         );
     }
+}
+
+fn insert_explicit(object: &mut Map<String, Value>, renderer: &Value) {
+    if renderer_explicit(renderer) {
+        object.insert("explicit".to_string(), Value::Bool(true));
+    }
+}
+
+fn renderer_explicit(renderer: &Value) -> bool {
+    ["badges", "subtitleBadges"]
+        .iter()
+        .any(|key| renderer.get(*key).is_some_and(contains_explicit_badge))
+}
+
+fn contains_explicit_badge(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            for renderer_name in ["musicInlineBadgeRenderer", "musicBadgeRenderer"] {
+                if let Some(renderer) = object.get(renderer_name) {
+                    if badge_renderer_explicit(renderer) {
+                        return true;
+                    }
+                }
+            }
+            object.values().any(contains_explicit_badge)
+        }
+        Value::Array(array) => array.iter().any(contains_explicit_badge),
+        _ => false,
+    }
+}
+
+fn badge_renderer_explicit(renderer: &Value) -> bool {
+    renderer
+        .pointer("/icon/iconType")
+        .and_then(Value::as_str)
+        .map(|icon| icon.to_ascii_uppercase().contains("EXPLICIT"))
+        .unwrap_or(false)
+        || renderer
+            .pointer("/accessibilityData/accessibilityData/label")
+            .and_then(Value::as_str)
+            .map(|label| label.trim().eq_ignore_ascii_case("explicit"))
+            .unwrap_or(false)
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -3420,6 +3463,7 @@ fn parse_card_shelf_playable_header(renderer: &Value) -> Option<Value> {
         ),
         ("in-library".to_string(), menu_state_in_library_value(&menu)),
     ]);
+    insert_explicit(&mut item, renderer);
     insert_like_status(&mut item, &menu);
     Some(Value::Object(std::mem::take(&mut item)))
 }
@@ -3497,6 +3541,7 @@ fn parse_track(renderer: &Value) -> Option<Value> {
         ),
         ("in-library".to_string(), Value::Bool(menu.in_library)),
     ]);
+    insert_explicit(&mut item, renderer);
     insert_like_status(&mut item, &menu);
     Some(Value::Object(std::mem::take(&mut item)))
 }

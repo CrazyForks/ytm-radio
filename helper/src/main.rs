@@ -2,10 +2,12 @@
 
 mod auth;
 mod error;
+mod playback;
 mod ytmusic;
 
 use auth::{login_window, AuthConfig};
 use error::HelperError;
+use playback::resolve_stream;
 use serde::Serialize;
 use serde_json::json;
 #[cfg(test)]
@@ -80,6 +82,11 @@ enum Command {
     },
     TrackStatus {
         video_id: String,
+    },
+    Stream {
+        video_id: String,
+        yt_dlp_program: String,
+        format: String,
     },
 }
 
@@ -381,6 +388,20 @@ where
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             track_status(video_id, &auth, Some(&cache_path), proxy)?
         }
+        #[cfg(test)]
+        Command::Stream { video_id, .. } if options.mock_data => {
+            json!({ "url": format!("https://media.example/{video_id}") })
+        }
+        Command::Stream {
+            video_id,
+            yt_dlp_program,
+            format,
+        } => {
+            let auth = AuthConfig::load(required_auth_path(&options)?)?;
+            json!({
+                "url": resolve_stream(video_id, &auth, yt_dlp_program, format, proxy)?
+            })
+        }
     };
     if options.command.mutation_p() && !options.mock_data {
         let auth_path = required_auth_path(&options)?;
@@ -439,6 +460,11 @@ where
         "item-library" => parse_item_library_command(&mut args)?,
         "subscription" => parse_subscription_command(&mut args)?,
         "track-status" => parse_track_status_command(&mut args)?,
+        "stream" => Command::Stream {
+            video_id: parse_required_video_id(&mut args)?,
+            yt_dlp_program: "yt-dlp".to_string(),
+            format: "bestaudio/best".to_string(),
+        },
         "help" | "--help" | "-h" => Command::Help,
         other => return Err(format!("unknown command `{other}`")),
     };
@@ -459,6 +485,8 @@ where
     let mut timeout_secs = None;
     let mut restart_running = false;
     let mut proxy = None;
+    let mut yt_dlp_program = None;
+    let mut stream_format = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -510,9 +538,29 @@ where
                 }
                 proxy = Some(value.to_string());
             }
+            "--yt-dlp-program" => {
+                let value = option_value(&args, &mut index)?.trim();
+                if value.is_empty() {
+                    return Err("yt-dlp program must not be empty".to_string());
+                }
+                yt_dlp_program = Some(value.to_string());
+            }
+            "--format" => {
+                let value = option_value(&args, &mut index)?.trim();
+                if value.is_empty() {
+                    return Err("stream format must not be empty".to_string());
+                }
+                stream_format = Some(value.to_string());
+            }
             other => return Err(format!("unknown option `{other}`")),
         }
         index += 1;
+    }
+
+    if !matches!(&command, Command::Stream { .. })
+        && (yt_dlp_program.is_some() || stream_format.is_some())
+    {
+        return Err("stream options require a stream action".to_string());
     }
 
     let command = match command {
@@ -636,6 +684,25 @@ where
                 return Err("browse options require a browse action".to_string());
             }
             Command::AuthCheck
+        }
+        Command::Stream { video_id, .. } => {
+            if browser.is_some()
+                || output.is_some()
+                || port.is_some()
+                || profile_dir.is_some()
+                || timeout_secs.is_some()
+                || browse_params.is_some()
+                || initial_only
+                || fresh
+                || restart_running
+            {
+                return Err("stream accepts only auth, proxy, and yt-dlp options".to_string());
+            }
+            Command::Stream {
+                video_id,
+                yt_dlp_program: yt_dlp_program.unwrap_or_else(|| "yt-dlp".to_string()),
+                format: stream_format.unwrap_or_else(|| "bestaudio/best".to_string()),
+            }
         }
         other => {
             if browser.is_some()
@@ -880,6 +947,7 @@ fn usage() -> String {
         "  ytm-radio-helper item-library BROWSE_ID toggle|save|remove --auth FILE [--params PARAMS]",
         "  ytm-radio-helper subscription BROWSE_ID toggle|subscribe|unsubscribe --auth FILE [--params PARAMS]",
         "  ytm-radio-helper track-status VIDEO_ID --auth FILE",
+        "  ytm-radio-helper stream VIDEO_ID --auth FILE [--yt-dlp-program PROGRAM] [--format FORMAT] [--proxy URL]",
         "",
         "options:",
         "  --proxy URL  proxy YouTube Music requests and supported login browsers",

@@ -114,6 +114,11 @@
   "Face for the filled now-playing progress bar cells."
   :group 'ytm-radio)
 
+(defface ytm-radio-explicit-badge
+  '((t (:inherit mode-line :inverse-video t :weight bold :underline nil)))
+  "Face for fallback explicit-content badges."
+  :group 'ytm-radio)
+
 (defface ytm-radio-side-window-title
   '((t (:inherit bold :underline nil)))
   "Face for the side-window now-playing track title."
@@ -465,10 +470,11 @@ When nil, thumbnail downloads are uncapped per render."
 
 (cl-defun ytm-radio--make-track
     (&key id title url duration artist album thumbnail-url source-id source-kind
-          like-status in-library)
+          like-status in-library account-auth explicit)
   "Return a track alist.
 ID, TITLE, URL, DURATION, ARTIST, ALBUM, THUMBNAIL-URL, SOURCE-ID,
-SOURCE-KIND, LIKE-STATUS, and IN-LIBRARY are stored as stable track fields."
+SOURCE-KIND, LIKE-STATUS, IN-LIBRARY, ACCOUNT-AUTH, and EXPLICIT are stored as
+stable track fields."
   (list (cons :id id)
         (cons :title title)
         (cons :url url)
@@ -479,7 +485,9 @@ SOURCE-KIND, LIKE-STATUS, and IN-LIBRARY are stored as stable track fields."
         (cons :source-id source-id)
         (cons :source-kind source-kind)
         (cons :like-status like-status)
-        (cons :in-library in-library)))
+        (cons :in-library in-library)
+        (cons :account-auth account-auth)
+        (cons :explicit explicit)))
 
 (cl-defun ytm-radio--make-source
     (&key id kind title url tracks items continuation subtitle thumbnail-url
@@ -632,6 +640,9 @@ stored in `ytm-radio-state-file'."
 
 (defvar ytm-radio--stream-prefetch-process nil
   "Current asynchronous stream prefetch process.")
+
+(defvar ytm-radio--playback-resolve-process nil
+  "Current authenticated stream resolver for immediate playback.")
 
 (defvar ytm-radio--track-status-refreshes (make-hash-table :test #'equal)
   "Track status requests keyed by video id and completion time.")
@@ -1678,6 +1689,15 @@ When FRESH is non-nil, bypass cached helper responses."
   (append (list "track-status" video-id)
           (ytm-radio--helper-shared-arguments)))
 
+(defun ytm-radio--helper-stream-arguments (video-id)
+  "Return helper arguments for resolving authenticated VIDEO-ID playback."
+  (append (list "stream" video-id
+                "--yt-dlp-program" ytm-radio-yt-dlp-program)
+          (when (and (stringp ytm-radio-mpv-ytdl-format)
+                     (not (string-empty-p ytm-radio-mpv-ytdl-format)))
+            (list "--format" ytm-radio-mpv-ytdl-format))
+          (ytm-radio--helper-shared-arguments)))
+
 (defun ytm-radio--helper-login-arguments (output &optional restart-running)
   "Return helper arguments for logging in and writing auth to OUTPUT.
 When RESTART-RUNNING is non-nil, ask the helper to restart a running browser
@@ -1761,7 +1781,9 @@ SOURCE-ID and SOURCE-KIND identify the imported helper source."
    :source-id source-id
    :source-kind source-kind
    :like-status (ytm-radio--symbol-value (map-elt item 'like-status) nil)
-   :in-library (map-elt item 'in-library)))
+   :in-library (map-elt item 'in-library)
+   :explicit (map-elt item 'explicit)
+   :account-auth t))
 
 (defun ytm-radio--helper-track-item-p (item)
   "Return non-nil when helper ITEM is playable."
@@ -2501,6 +2523,58 @@ When FRESH is non-nil, bypass cached helper responses."
         (forward-line 1))
       nil)))
 
+(defun ytm-radio--resolve-stream-with-yt-dlp-async
+    (track success error-callback)
+  "Resolve TRACK with yt-dlp, then call SUCCESS or ERROR-CALLBACK."
+  (ytm-radio--ensure-program ytm-radio-yt-dlp-program "yt-dlp")
+  (let* ((stdout (generate-new-buffer " *ytm-radio-stream-stdout*"))
+         (stderr (generate-new-buffer " *ytm-radio-stream-stderr*"))
+         (process
+          (make-process
+           :name "ytm-radio-stream-resolve"
+           :buffer stdout
+           :stderr stderr
+           :command (cons ytm-radio-yt-dlp-program
+                          (ytm-radio--stream-resolve-arguments
+                           (map-elt track :url)))
+           :noquery t
+           :sentinel
+           (lambda (process _event)
+             (when (memq (process-status process) '(exit signal))
+               (unwind-protect
+                   (if (zerop (process-exit-status process))
+                       (if-let* ((url (ytm-radio--first-output-line stdout)))
+                           (funcall success url)
+                         (funcall error-callback
+                                  "Yt-dlp returned no playable stream URL"))
+                     (funcall error-callback
+                              (ytm-radio--process-buffer-diagnostic
+                               stdout stderr)))
+                 (when (buffer-live-p stdout)
+                   (kill-buffer stdout))
+                 (when (buffer-live-p stderr)
+                   (kill-buffer stderr))))))))
+    process))
+
+(defun ytm-radio--resolve-stream-with-helper-async
+    (track success error-callback)
+  "Resolve account TRACK with the helper, then call SUCCESS or ERROR-CALLBACK."
+  (ytm-radio--call-helper-async
+   (ytm-radio--helper-stream-arguments (map-elt track :id))
+   (lambda (data)
+     (if-let* ((url (map-elt data 'url))
+               ((stringp url))
+               ((not (string-empty-p url))))
+         (funcall success url)
+       (funcall error-callback "Account helper returned no playable stream URL")))
+   error-callback))
+
+(defun ytm-radio--resolve-stream-async (track success error-callback)
+  "Resolve TRACK asynchronously, then call SUCCESS or ERROR-CALLBACK."
+  (if (map-elt track :account-auth)
+      (ytm-radio--resolve-stream-with-helper-async track success error-callback)
+    (ytm-radio--resolve-stream-with-yt-dlp-async track success error-callback)))
+
 (defun ytm-radio--stream-prefetch-queued-p (key)
   "Return non-nil when stream cache KEY is already queued."
   (seq-some (lambda (track)
@@ -2527,45 +2601,31 @@ When FRESH is non-nil, bypass cached helper responses."
   (unless (or (process-live-p ytm-radio--stream-prefetch-process)
               (null ytm-radio--stream-prefetch-queue))
     (let* ((track (pop ytm-radio--stream-prefetch-queue))
-           (url (map-elt track :url))
            (key (ytm-radio--stream-cache-key track)))
-      (if (or (not url) (ytm-radio--cached-stream-url track))
+      (if (or (not (map-elt track :url))
+              (ytm-radio--cached-stream-url track))
           (ytm-radio--start-next-stream-prefetch)
         (condition-case nil
-            (ytm-radio--ensure-program ytm-radio-yt-dlp-program "yt-dlp")
-          (user-error
-           (setq ytm-radio--stream-prefetch-queue nil
-                 track nil)))
-        (when track
-          (let* ((stdout (generate-new-buffer " *ytm-radio-stream-stdout*"))
-                 (stderr (generate-new-buffer " *ytm-radio-stream-stderr*"))
-                 (process
-                  (make-process
-                   :name "ytm-radio-stream-prefetch"
-                   :buffer stdout
-                   :stderr stderr
-                   :command (cons ytm-radio-yt-dlp-program
-                                  (ytm-radio--stream-resolve-arguments url))
-                   :noquery t
-                   :sentinel
-                   (lambda (process _event)
-                     (when (memq (process-status process) '(exit signal))
-                       (unwind-protect
-                           (when (zerop (process-exit-status process))
-                             (when-let* ((direct-url
-                                          (ytm-radio--first-output-line stdout)))
-                               (ytm-radio--cache-stream-url
-                                (process-get process 'ytm-radio-track)
-                                direct-url)))
-                         (setq ytm-radio--stream-prefetch-process nil)
-                         (when (buffer-live-p stdout)
-                           (kill-buffer stdout))
-                         (when (buffer-live-p stderr)
-                           (kill-buffer stderr))
-                         (ytm-radio--start-next-stream-prefetch)))))))
-            (process-put process 'ytm-radio-track track)
-            (process-put process 'ytm-radio-track-key key)
-            (setq ytm-radio--stream-prefetch-process process)))))))
+            (let (process)
+              (setq
+               process
+               (ytm-radio--resolve-stream-async
+                track
+                (lambda (url)
+                  (when (eq process ytm-radio--stream-prefetch-process)
+                    (setq ytm-radio--stream-prefetch-process nil)
+                    (ytm-radio--cache-stream-url track url)
+                    (ytm-radio--start-next-stream-prefetch)))
+                (lambda (_diagnostic)
+                  (when (eq process ytm-radio--stream-prefetch-process)
+                    (setq ytm-radio--stream-prefetch-process nil)
+                    (ytm-radio--start-next-stream-prefetch)))))
+              (process-put process 'ytm-radio-track track)
+              (process-put process 'ytm-radio-track-key key)
+              (setq ytm-radio--stream-prefetch-process process))
+          (error
+           (setq ytm-radio--stream-prefetch-process nil)
+           (ytm-radio--start-next-stream-prefetch)))))))
 
 (defun ytm-radio--schedule-stream-prefetch (tracks)
   "Schedule background stream prefetch for TRACKS."
@@ -2599,7 +2659,9 @@ When FRESH is non-nil, bypass cached helper responses."
   "Stop the current mpv process and IPC connection.
 When PRESERVE-RETRY-STAGE is non-nil, retain the current retry stage."
   (let ((process (map-elt ytm-radio--player :process))
-        (ipc-process (map-elt ytm-radio--player :ipc-process)))
+        (ipc-process (map-elt ytm-radio--player :ipc-process))
+        (resolve-process ytm-radio--playback-resolve-process))
+    (setq ytm-radio--playback-resolve-process nil)
     (ytm-radio--cancel-progress-render)
     (ytm-radio--reset-title-scroll)
     (setf (map-elt ytm-radio--player :process) nil
@@ -2617,6 +2679,8 @@ When PRESERVE-RETRY-STAGE is non-nil, retain the current retry stage."
       (delete-process ipc-process))
     (when (process-live-p process)
       (delete-process process))
+    (when (process-live-p resolve-process)
+      (delete-process resolve-process))
     (setq ytm-radio--last-rendered-progress-key nil)))
 
 (defun ytm-radio--schedule-next-track-prefetch (track)
@@ -2742,6 +2806,17 @@ When PRESERVE-RETRY-STAGE is non-nil, retain the current retry stage."
     (message "Cached stream failed; retrying original URL")
     t))
 
+(defun ytm-radio--retry-account-track-after-playback-error ()
+  "Refresh the authenticated stream once after an account playback error."
+  (when-let* ((track (map-elt ytm-radio--player :current-track))
+              ((map-elt track :account-auth))
+              ((not (eq (map-elt ytm-radio--player :retry-stage) 'final))))
+    (setf (map-elt ytm-radio--player :retry-stage) 'final)
+    (ytm-radio--uncache-stream-url track)
+    (ytm-radio--play-track track t)
+    (message "Playback failed; refreshing authenticated stream")
+    t))
+
 (defun ytm-radio--retry-current-track-after-playback-error ()
   "Retry the current track once after a transient mpv playback error."
   (when-let* ((track (map-elt ytm-radio--player :current-track))
@@ -2755,11 +2830,12 @@ When PRESERVE-RETRY-STAGE is non-nil, retain the current retry stage."
 
 (defun ytm-radio--retry-current-track-after-error ()
   "Retry the current track after a playback error when it is safe to do so."
-  (or (ytm-radio--retry-current-track-with-original-url)
+  (or (ytm-radio--retry-account-track-after-playback-error)
+      (ytm-radio--retry-current-track-with-original-url)
       (ytm-radio--retry-current-track-after-playback-error)))
 
-(defun ytm-radio--play-track (track &optional preserve-retry-stage)
-  "Play TRACK with mpv.
+(defun ytm-radio--play-track-now (track &optional preserve-retry-stage)
+  "Play resolved TRACK with mpv.
 When PRESERVE-RETRY-STAGE is non-nil, continue an automatic retry."
   (ytm-radio--ensure-program ytm-radio-mpv-program "mpv")
   (unless (map-elt track :url)
@@ -2767,7 +2843,7 @@ When PRESERVE-RETRY-STAGE is non-nil, continue an automatic retry."
   (ytm-radio--sync-queue-index track)
   (unless (or (ytm-radio--restart-current-track-in-place track)
               (ytm-radio--load-track-in-current-mpv track))
-    (ytm-radio--stop-process)
+    (ytm-radio--stop-process preserve-retry-stage)
     (pcase-let* ((`(,playback-url ,using-stream-cache)
                   (ytm-radio--playback-url-choice track))
                  (socket (make-temp-name
@@ -2786,6 +2862,50 @@ When PRESERVE-RETRY-STAGE is non-nil, continue an automatic retry."
       (ytm-radio--show-now-playing nil)))
   (ytm-radio--refresh-track-status track)
   (ytm-radio--schedule-next-track-prefetch track))
+
+(defun ytm-radio--resolve-account-track-and-play
+    (track preserve-retry-stage)
+  "Resolve account TRACK and play it.
+When PRESERVE-RETRY-STAGE is non-nil, retain the automatic retry state."
+  (unless (ytm-radio--direct-stream-cache-supported-p)
+    (user-error "Authenticated playback requires direct stream proxy support"))
+  (ytm-radio--sync-queue-index track)
+  (ytm-radio--stop-process preserve-retry-stage)
+  (ytm-radio--set-current-track-state
+   track 'loading nil nil nil preserve-retry-stage)
+  (ytm-radio--save)
+  (ytm-radio--render)
+  (ytm-radio--show-now-playing nil)
+  (ytm-radio--with-account-auth
+   (lambda ()
+     (let (process)
+       (setq
+        process
+        (ytm-radio--resolve-stream-async
+         track
+         (lambda (url)
+           (when (eq process ytm-radio--playback-resolve-process)
+             (setq ytm-radio--playback-resolve-process nil)
+             (ytm-radio--cache-stream-url track url)
+             (ytm-radio--play-track-now track preserve-retry-stage)))
+         (lambda (helper-error)
+           (when (eq process ytm-radio--playback-resolve-process)
+             (setq ytm-radio--playback-resolve-process nil)
+             (ytm-radio--set-status 'stopped)
+             (ytm-radio--handle-account-helper-error
+              helper-error
+              (lambda ()
+                (ytm-radio--play-track track preserve-retry-stage)))))))
+       (setq ytm-radio--playback-resolve-process process)))
+   "YouTube Music login required"))
+
+(defun ytm-radio--play-track (track &optional preserve-retry-stage)
+  "Play TRACK with mpv.
+When PRESERVE-RETRY-STAGE is non-nil, continue an automatic retry."
+  (if (and (map-elt track :account-auth)
+           (not (ytm-radio--cached-stream-url track)))
+      (ytm-radio--resolve-account-track-and-play track preserve-retry-stage)
+    (ytm-radio--play-track-now track preserve-retry-stage)))
 
 (defun ytm-radio--mpv-connect (socket process attempt)
   "Connect to mpv SOCKET for PROCESS, retrying from ATTEMPT."
@@ -3557,6 +3677,28 @@ The bar is measured between LEFT-LABEL and RIGHT-LABEL."
                              (map-elt item :id))
                          (map-elt track :id))))
         (map-elt ytm-radio--player :duration))))
+
+(defun ytm-radio--explicit-p (item)
+  "Return non-nil when ITEM is marked as explicit content."
+  (or (map-elt item 'explicit)
+      (map-elt item :explicit)))
+
+(defun ytm-radio--explicit-badge ()
+  "Return the display badge for explicit content."
+  (let ((icon (ytm-radio--mdicon "nf-md-alpha_e_box" nil)))
+    (propertize (or icon (propertize "E" 'face 'ytm-radio-explicit-badge))
+                'help-echo "Explicit")))
+
+(defun ytm-radio--track-secondary-text (track face)
+  "Return TRACK secondary text using FACE for non-badge text."
+  (let (parts)
+    (when (ytm-radio--explicit-p track)
+      (push (ytm-radio--explicit-badge) parts))
+    (when-let* ((artist (map-elt track :artist))
+                ((not (string-empty-p artist))))
+      (push (propertize artist 'face face) parts))
+    (unless (null parts)
+      (string-join (nreverse parts) " "))))
 
 (defun ytm-radio--item-detail (item)
   "Return compact secondary text for ITEM."
@@ -5023,6 +5165,9 @@ slices so covers do not appear split in the middle."
 
 (defun ytm-radio--insert-item-detail (item fallback-detail)
   "Insert ITEM detail, falling back to FALLBACK-DETAIL."
+  (when (ytm-radio--explicit-p item)
+    (insert (ytm-radio--explicit-badge))
+    (insert (propertize " " 'face 'shadow)))
   (if-let* ((metadata (ytm-radio--item-metadata item)))
       (progn
         (mapc #'ytm-radio--insert-metadata-token metadata)
@@ -5107,12 +5252,16 @@ slices so covers do not appear split in the middle."
   (let* ((start (point))
          (detail (ytm-radio--truncate (ytm-radio--item-detail item) 84))
          (metadata (ytm-radio--item-metadata item))
+         (explicit (ytm-radio--explicit-p item))
          (type-cell (ytm-radio--item-type-cell item))
          (prefix (ytm-radio--item-prefix-string index type-cell item))
          (detail-prefix
           (ytm-radio--item-detail-prefix-string index type-cell item))
          (thumbnail (ytm-radio--item-thumbnail-image item))
-         (two-line-p (or thumbnail metadata (not (string-empty-p detail))))
+         (two-line-p (or thumbnail
+                         metadata
+                         explicit
+                         (not (string-empty-p detail))))
          (split-layout-p (ytm-radio--browser-thumbnail-split-layout-p))
          (split-thumbnail-p (and thumbnail
                                  two-line-p
@@ -6299,21 +6448,19 @@ When FACE is non-nil, use it for the button label."
 When WIDTH is non-nil, fit the returned text within WIDTH columns."
   (let* ((width (max 1 (or width ytm-radio-side-window-title-width)))
          (artist-separator "  ")
-         (artist (map-elt track :artist))
-         (artist (and (stringp artist)
-                      (not (string-empty-p artist))
-                      artist))
-         (artist-width (and artist
-                            (min (string-width artist)
+         (secondary (ytm-radio--track-secondary-text
+                     track 'ytm-radio-side-window-artist))
+         (secondary-width (and secondary
+                            (min (string-width secondary)
                                  (max 8 (/ width 2)))))
          (include-artist
-          (and artist-width
-               (>= (- width (string-width artist-separator) artist-width)
+          (and secondary-width
+               (>= (- width (string-width artist-separator) secondary-width)
                    8)))
          (title-width (if include-artist
                           (- width
                              (string-width artist-separator)
-                             artist-width)
+                             secondary-width)
                         width))
          (title (ytm-radio--scrolling-track-title-with-rating
                  track title-width 'ytm-radio-side-window-title))
@@ -6322,8 +6469,7 @@ When WIDTH is non-nil, fit the returned text within WIDTH columns."
                 (when include-artist
                   (concat
                    artist-separator
-                   (propertize (ytm-radio--truncate artist artist-width)
-                               'face 'ytm-radio-side-window-artist))))))
+                   (ytm-radio--truncate secondary secondary-width))))))
     (ytm-radio--truncate text width)))
 
 (defun ytm-radio--side-window-track-line (track width)
@@ -6558,10 +6704,11 @@ When SHOW-CONTROLS is non-nil, include playback controls."
                 (ytm-radio--now-playing-content-pixel-width))
                nil
                text-width)
-              (when-let* ((artist (map-elt track :artist)))
+              (when-let* ((artist (ytm-radio--track-secondary-text
+                                   track 'shadow)))
                 (ytm-radio--insert-centered-now-playing-line
                  (ytm-radio--truncate artist text-width)
-                 'shadow
+                 nil
                  text-width))
               (when-let* ((time-label (ytm-radio--playback-time-label track)))
                 (ytm-radio--insert-centered-now-playing-line
@@ -7489,7 +7636,8 @@ When ACTIVE is non-nil, use the transient value face."
 
 (defun ytm-radio--merge-missing-track-metadata (target source)
   "Fill missing metadata in TARGET from SOURCE and return TARGET."
-  (dolist (field '(:title :url :duration :artist :album :thumbnail-url))
+  (dolist (field '(:title :url :duration :artist :album :thumbnail-url
+                   :account-auth :explicit))
     (when (and (null (map-elt target field))
                (map-elt source field))
       (setf (map-elt target field) (map-elt source field))))
