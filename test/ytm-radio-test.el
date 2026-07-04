@@ -595,6 +595,63 @@ FIELDS are included on both the top-level mutation output and source."
       (should (= (map-elt ytm-radio--player :duration) 200))
       (should (equal scheduled (list track-c))))))
 
+(ert-deftest ytm-radio-auto-show-now-playing-option-disables-track-change-popup ()
+  "Respect `ytm-radio-auto-show-now-playing' during track changes."
+  (let* ((track-a (ytm-radio--make-track
+                   :id "a"
+                   :title "A"
+                   :url "https://music.youtube.com/watch?v=a"))
+         (track-b (ytm-radio--make-track
+                   :id "b"
+                   :title "B"
+                   :url "https://music.youtube.com/watch?v=b"))
+         (source (ytm-radio--make-source
+                  :id "s"
+                  :kind 'youtube-music-library
+                  :title "S"
+                  :tracks (list track-a track-b)))
+         (ytm-radio-auto-show-now-playing nil)
+         (ytm-radio--state
+          (ytm-radio--make-state
+           :sources (list (cons "s" source))))
+         (ytm-radio--player
+          (ytm-radio--make-player
+           :status 'playing
+           :current-track track-a
+           :process 'mpv-process
+           :ipc-process 'mpv-ipc))
+         shown)
+    (cl-letf (((symbol-function 'process-live-p)
+               (lambda (process) (memq process '(mpv-process mpv-ipc))))
+              ((symbol-function 'ytm-radio--ensure-program) #'ignore)
+              ((symbol-function 'ytm-radio--stop-process)
+               (lambda () (error "should not stop mpv")))
+              ((symbol-function 'start-process)
+               (lambda (&rest _args) (error "should not start mpv")))
+              ((symbol-function 'ytm-radio--mpv-send)
+               (lambda (_command) t))
+              ((symbol-function 'ytm-radio--save) #'ignore)
+              ((symbol-function 'ytm-radio--render) #'ignore)
+              ((symbol-function 'ytm-radio--show-now-playing)
+               (lambda (&optional _focus) (setq shown t)))
+              ((symbol-function 'ytm-radio--refresh-track-status) #'ignore)
+              ((symbol-function 'ytm-radio--schedule-stream-prefetch) #'ignore))
+      (ytm-radio--play-track track-b)
+      (should-not shown)
+      (should (equal (map-elt ytm-radio--player :current-track) track-b)))))
+
+(ert-deftest ytm-radio-now-playing-command-ignores-auto-show-option ()
+  "Let manual now-playing toggles show the view regardless of auto-show config."
+  (let ((ytm-radio-auto-show-now-playing nil)
+        shown-focus)
+    (cl-letf (((symbol-function 'ytm-radio--ensure-loaded) #'ignore)
+              ((symbol-function 'ytm-radio--now-playing-visible-p)
+               (lambda () nil))
+              ((symbol-function 'ytm-radio--show-now-playing)
+               (lambda (&optional focus) (setq shown-focus focus))))
+      (ytm-radio-now-playing)
+      (should shown-focus))))
+
 (ert-deftest ytm-radio-mpv-error-retries-cached-stream-with-original-url ()
   "Recover from a bad cached stream URL by retrying the original URL once."
   (let* ((ytm-radio--stream-url-cache (make-hash-table :test #'equal))

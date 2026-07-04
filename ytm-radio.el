@@ -306,6 +306,13 @@ The `side-window' style installs a compact top side window on the frame."
           (const :tag "Regular buffer" buffer))
   :group 'ytm-radio)
 
+(defcustom ytm-radio-auto-show-now-playing t
+  "Whether track changes automatically show the now-playing view.
+This only controls automatic display during playback changes.  Manual calls to
+`ytm-radio-now-playing' still show or hide the now-playing view."
+  :type 'boolean
+  :group 'ytm-radio)
+
 (defcustom ytm-radio-child-frame-draggable t
   "Whether graphical now-playing child frames can be dragged with the mouse."
   :type 'boolean
@@ -2747,7 +2754,7 @@ When PRESERVE-RETRY-STAGE is non-nil, retain the current retry stage."
               (list "set_property" "pause" :json-false)))
         (progn
           (ytm-radio--render)
-          (ytm-radio--show-now-playing nil)
+          (ytm-radio--auto-show-now-playing)
           t)
       (ytm-radio--stop-process)
       nil)))
@@ -2769,7 +2776,7 @@ When PRESERVE-RETRY-STAGE is non-nil, retain the current retry stage."
       (if (ytm-radio--mpv-load-url playback-url)
           (progn
             (ytm-radio--render)
-            (ytm-radio--show-now-playing nil)
+            (ytm-radio--auto-show-now-playing)
             t)
         (ytm-radio--stop-process)
         nil))))
@@ -2790,7 +2797,7 @@ When PRESERVE-RETRY-STAGE is non-nil, retain the current retry stage."
       (if (ytm-radio--mpv-load-url url)
           (progn
             (ytm-radio--render)
-            (ytm-radio--show-now-playing nil))
+            (ytm-radio--auto-show-now-playing))
         (ytm-radio--restart-current-track-for-retry track))
     (ytm-radio--restart-current-track-for-retry track)))
 
@@ -2859,7 +2866,7 @@ When PRESERVE-RETRY-STAGE is non-nil, continue an automatic retry."
       (ytm-radio--save)
       (ytm-radio--mpv-connect socket process 0)
       (ytm-radio--render)
-      (ytm-radio--show-now-playing nil)))
+      (ytm-radio--auto-show-now-playing)))
   (ytm-radio--refresh-track-status track)
   (ytm-radio--schedule-next-track-prefetch track))
 
@@ -2875,7 +2882,7 @@ When PRESERVE-RETRY-STAGE is non-nil, retain the automatic retry state."
    track 'loading nil nil nil preserve-retry-stage)
   (ytm-radio--save)
   (ytm-radio--render)
-  (ytm-radio--show-now-playing nil)
+  (ytm-radio--auto-show-now-playing)
   (ytm-radio--with-account-auth
    (lambda ()
      (let (process)
@@ -7050,6 +7057,11 @@ FOCUS is accepted for compatibility; child frames stay non-focusable."
       (_
        (ytm-radio--hide-side-window)
        (ytm-radio--show-regular-buffer buffer)))))
+
+(defun ytm-radio--auto-show-now-playing ()
+  "Show the now-playing view after playback changes when configured."
+  (when ytm-radio-auto-show-now-playing
+    (ytm-radio--show-now-playing nil)))
 
 ;;; Commands
 

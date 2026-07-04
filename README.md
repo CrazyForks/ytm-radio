@@ -135,6 +135,11 @@ control playback or drag any non-button area of the graphical child frame to
 move it for the current now-playing session. Set
 `ytm-radio-child-frame-draggable` to nil to disable dragging.
 
+Track changes automatically show the configured now-playing view by default.
+Set `ytm-radio-auto-show-now-playing` to nil to keep playback changes from
+popping up now-playing. `M-x ytm-radio-now-playing` still manually shows or
+hides it.
+
 In terminal Emacs, `child-frame` uses Emacs's TTY child-frame support when
 available, detected with `(featurep 'tty-child-frames)`. That support requires
 newer Emacs builds. When TTY child frames are unavailable or rejected by the
