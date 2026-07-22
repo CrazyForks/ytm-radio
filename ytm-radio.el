@@ -4055,10 +4055,16 @@ When RESTORE-ENTRY is non-nil, restore that position after rendering VIEW."
         (error fallback))
     fallback))
 
+(defun ytm-radio--append-face (string face)
+  "Return a copy of STRING with FACE appended to existing faces."
+  (let ((result (copy-sequence string)))
+    (add-face-text-property 0 (length result) face t result)
+    result))
+
 (defun ytm-radio--browser-header-logo ()
   "Return the YouTube logo for the browser header line."
-  (propertize (ytm-radio--faicon "nf-fa-youtube" "YT")
-              'face 'ytm-radio-header-logo))
+  (ytm-radio--append-face (ytm-radio--faicon "nf-fa-youtube" "YT")
+                          'ytm-radio-header-logo))
 
 (defun ytm-radio--browser-header-line ()
   "Return the ytm-radio browser header line."
@@ -4458,11 +4464,13 @@ When HISTORY-ENTRY is non-nil, restore its stored browser position."
 (defun ytm-radio--insert-action-button (label action &optional face)
   "Insert a text button with LABEL running ACTION.
 When FACE is non-nil, use it as the button face."
-  (insert-text-button label
-                      'action (lambda (_button)
-                                (funcall action))
-                      'follow-link t
-                      'face (or face 'ytm-radio-button)))
+  (let ((start (point)))
+    (insert-text-button label
+                        'action (lambda (_button)
+                                  (funcall action))
+                        'follow-link t)
+    (add-face-text-property start (point)
+                            (or face 'ytm-radio-button) t)))
 
 (defun ytm-radio--insert-browser-heading-padding ()
   "Insert thin vertical padding after the browser heading block."
@@ -5098,7 +5106,7 @@ SLICE is either `top', `bottom', or nil for the full placeholder."
 
 (defun ytm-radio--item-detail-prefix-string (_index type-cell item)
   "Return the second-line item prefix for TYPE-CELL and ITEM."
-  (propertize type-cell 'face (ytm-radio--item-type-face item)))
+  (ytm-radio--append-face type-cell (ytm-radio--item-type-face item)))
 
 (defun ytm-radio--insert-aligned-prefix (prefix peer-prefix)
   "Insert PREFIX padded to align with PEER-PREFIX, plus a text gap."
@@ -6338,15 +6346,16 @@ When PIXEL-WIDTH is non-nil, also fit the result to that pixel width."
 (defun ytm-radio--insert-now-playing-control (icon command help &optional face)
   "Insert a now-playing ICON button running COMMAND with HELP text.
 When FACE is non-nil, use it for the button label."
-  (insert-text-button (format "%s" icon)
-                      'type 'ytm-radio-now-playing-button
-                      'action (lambda (_button)
-                                (call-interactively command))
-                      'mouse-action (lambda (_button)
-                                      (call-interactively command))
-                      'help-echo help
-                      'face (or face 'default)
-                      'mouse-face 'highlight))
+  (let ((start (point)))
+    (insert-text-button (format "%s" icon)
+                        'type 'ytm-radio-now-playing-button
+                        'action (lambda (_button)
+                                  (call-interactively command))
+                        'mouse-action (lambda (_button)
+                                        (call-interactively command))
+                        'help-echo help
+                        'mouse-face 'highlight)
+    (add-face-text-property start (point) (or face 'default) t)))
 
 (defun ytm-radio--repeat-control ()
   "Return the repeat control button spec."
@@ -6415,8 +6424,8 @@ When FACE is non-nil, use it for the button label."
                                          :height (cdr size)
                                          :ascent 'center))))
         (propertize " " 'display image))
-      (propertize (ytm-radio--mdicon "nf-md-music_box" "♪")
-                  'face 'ytm-radio-side-window-title)))
+      (ytm-radio--append-face (ytm-radio--mdicon "nf-md-music_box" "♪")
+                              'ytm-radio-side-window-title)))
 
 (defconst ytm-radio--side-window-line-separator "    "
   "Separator between side-window layout sections.")
@@ -6618,8 +6627,9 @@ When SHOW-CONTROLS is non-nil, include playback controls."
   (insert
    (ytm-radio--truncate
     (concat " "
-            (propertize (ytm-radio--mdicon "nf-md-music_box" "♪")
-                        'face 'ytm-radio-side-window-title)
+            (ytm-radio--append-face
+             (ytm-radio--mdicon "nf-md-music_box" "♪")
+             'ytm-radio-side-window-title)
             " "
             (propertize "No track" 'face 'ytm-radio-side-window-artist))
     (ytm-radio--side-window-content-width))))

@@ -2647,6 +2647,42 @@ FIELDS are included on both the top-level mutation output and source."
       (should (equal (get-text-property (1+ (point-min)) 'display)
                      '(space :width (44)))))))
 
+(ert-deftest ytm-radio-detail-prefix-preserves-icon-font-face ()
+  "Keep the Nerd Font family when coloring an item type icon."
+  (let* ((icon-face '(:family "Test Icon Font" :height 1.0))
+         (type-cell (propertize "I"
+                               'face icon-face
+                               'font-lock-face icon-face))
+         (prefix
+          (ytm-radio--item-detail-prefix-string
+           1 type-cell '((type . "album")))))
+    (should (equal (get-text-property 0 'face prefix)
+                   (list icon-face 'font-lock-keyword-face)))
+    (should (equal (get-text-property 0 'font-lock-face prefix)
+                   icon-face))))
+
+(ert-deftest ytm-radio-action-button-preserves-icon-font-face ()
+  "Keep an icon font face when styling an action button."
+  (let* ((icon-face '(:family "Test Icon Font" :height 1.0))
+         (label (concat (propertize "I" 'face icon-face) " Play")))
+    (with-temp-buffer
+      (ytm-radio--insert-action-button label #'ignore)
+      (should (equal (get-text-property (point-min) 'face)
+                     (list icon-face 'ytm-radio-button)))
+      (should (eq (get-text-property (+ (point-min) 2) 'face)
+                  'ytm-radio-button))
+      (should (button-at (point-min))))))
+
+(ert-deftest ytm-radio-now-playing-control-preserves-icon-font-face ()
+  "Keep an icon font face when styling a playback control."
+  (let* ((icon-face '(:family "Test Icon Font" :height 1.0))
+         (icon (propertize "I" 'face icon-face)))
+    (with-temp-buffer
+      (ytm-radio--insert-now-playing-control icon #'ignore "Play" 'bold)
+      (should (equal (get-text-property (point-min) 'face)
+                     (list icon-face 'bold)))
+      (should (button-at (point-min))))))
+
 (ert-deftest ytm-radio-item-type-icon-renders-on-detail-line ()
   "Render the item type icon below the row number."
   (let ((source (ytm-radio--make-source
