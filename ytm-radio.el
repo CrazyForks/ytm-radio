@@ -2,7 +2,7 @@
 
 ;; Author: Lucius Chen
 ;; URL: https://github.com/luciuschen/ytm-radio
-;; Version: 0.1.9
+;; Version: 0.1.10
 ;; Package-Requires: ((emacs "29.1") (transient "0.3.7"))
 ;; Keywords: multimedia
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -56,7 +56,7 @@
 (defconst ytm-radio--helper-protocol-version 1
   "Supported helper protocol version.")
 
-(defconst ytm-radio--helper-version "0.1.9"
+(defconst ytm-radio--helper-version "0.1.10"
   "Helper binary version expected by this Elisp package.")
 
 ;;; Customization

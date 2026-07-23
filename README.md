@@ -388,7 +388,7 @@ Responses use a stable envelope:
   "ok": true,
   "schema": 1,
   "protocol": 1,
-  "helper-version": "0.1.9",
+  "helper-version": "0.1.10",
   "data": {
     "sources": []
   },
