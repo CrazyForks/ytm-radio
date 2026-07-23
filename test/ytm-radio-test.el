@@ -6284,6 +6284,25 @@ STRING-PIXEL-WIDTH replaces `string-pixel-width' during rendering."
         "--timeout-secs"
         "60")))))
 
+(ert-deftest ytm-radio-helper-prepare-login-arguments ()
+  "Build helper arguments for preparing an isolated login profile."
+  (let ((ytm-radio-helper-login-browser "firefox")
+        (ytm-radio-helper-login-profile-directory "/tmp/ytm-login-profile")
+        (ytm-radio-helper-login-timeout 60))
+    (should
+     (equal
+      (ytm-radio--helper-prepare-login-arguments "/tmp/ytm-auth.json")
+      '("auth"
+        "prepare-login-profile"
+        "--output"
+        "/tmp/ytm-auth.json"
+        "--timeout-secs"
+        "60"
+        "--profile-dir"
+        "/tmp/ytm-login-profile"
+        "--browser"
+        "firefox")))))
+
 (ert-deftest ytm-radio-helper-login-profile-default-is-helper-managed ()
   "Leave default account login profile selection to the helper."
   (should-not ytm-radio-helper-login-profile-directory))
@@ -6376,6 +6395,36 @@ STRING-PIXEL-WIDTH replaces `string-pixel-width' during rendering."
       (should-not started-home)
       (should-not ytm-radio--login-status)
       (should-not ytm-radio--login-continuation))))
+
+(ert-deftest ytm-radio-prepare-login-imports-after-profile-closes ()
+  "Import account auth after the ordinary profile window exits."
+  (let ((ytm-radio--login-process nil)
+        (ytm-radio--login-status nil)
+        (ytm-radio-helper-auth-file "/tmp/ytm-auth.json")
+        captured-arguments
+        imported-output)
+    (cl-letf (((symbol-function 'ytm-radio--call-helper-async)
+               (lambda (arguments success _error-callback)
+                 (setq captured-arguments arguments)
+                 (funcall success '((profile . "/tmp/profile")))
+                 nil))
+              ((symbol-function 'ytm-radio--start-login)
+               (lambda (output &optional _restart-running _after-success)
+                 (setq imported-output output)))
+              ((symbol-function 'message)
+               (lambda (&rest _arguments) nil)))
+      (ytm-radio-prepare-login)
+      (should
+       (equal
+        captured-arguments
+        '("auth"
+          "prepare-login-profile"
+          "--output"
+          "/tmp/ytm-auth.json"
+          "--timeout-secs"
+          "180")))
+      (should (equal imported-output "/tmp/ytm-auth.json"))
+      (should-not ytm-radio--login-status))))
 
 (ert-deftest ytm-radio-account-auth-failure-starts-login ()
   "Treat structured auth errors as a prompt to refresh account auth."

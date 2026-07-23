@@ -67,6 +67,11 @@ pub struct AuthSource {
     pub browser: Option<String>,
 }
 
+pub struct PreparedLoginProfile {
+    pub browser: String,
+    pub path: PathBuf,
+}
+
 impl AuthConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path).map_err(|error| {
@@ -155,6 +160,33 @@ pub fn login_window(
     }
 }
 
+pub fn prepare_login_profile(
+    output: &Path,
+    browser: Option<&str>,
+    profile_dir: Option<&Path>,
+    timeout: Duration,
+) -> Result<PreparedLoginProfile> {
+    let browser = resolve_login_browser(browser)?;
+    if browser.protocol() != LoginProtocol::Bidi {
+        return Err(HelperError::invalid_request(
+            "login profile preparation supports only Firefox and Zen",
+        ));
+    }
+    let profile_dir =
+        effective_login_profile_dir(output, &browser, profile_dir).ok_or_else(|| {
+            HelperError::invalid_request(
+                "login profile preparation requires an isolated profile directory",
+            )
+        })?;
+    let arguments = profile_login_browser_arguments(&profile_dir);
+    let mut child = spawn_login_browser_process(&browser, Some(&profile_dir), arguments)?;
+    wait_for_profile_login_browser_exit(&mut child, timeout)?;
+    Ok(PreparedLoginProfile {
+        browser: browser.name().to_string(),
+        path: profile_dir,
+    })
+}
+
 fn effective_login_profile_dir(
     output: &Path,
     browser: &LoginBrowser,
@@ -166,11 +198,13 @@ fn effective_login_profile_dir(
 }
 
 fn automatic_login_profile_dir(output: &Path, browser: &LoginBrowser) -> Option<PathBuf> {
-    if browser.kind == BrowserKind::Chrome {
-        Some(output.with_file_name("login-profile"))
-    } else {
-        None
-    }
+    let profile_name = match &browser.kind {
+        BrowserKind::Chrome => "login-profile",
+        BrowserKind::Firefox => "login-profile-firefox",
+        BrowserKind::Zen => "login-profile-zen",
+        _ => return None,
+    };
+    Some(output.with_file_name(profile_name))
 }
 
 fn login_window_cdp(
@@ -1365,10 +1399,38 @@ fn spawn_login_browser(
     port: u16,
     proxy: Option<&str>,
 ) -> Result<Child> {
-    match browser.protocol() {
-        LoginProtocol::Cdp => spawn_cdp_login_browser(browser, profile_dir, port, proxy),
-        LoginProtocol::Bidi => spawn_bidi_login_browser(browser, profile_dir, port),
+    let arguments = match browser.protocol() {
+        LoginProtocol::Cdp => cdp_login_browser_arguments(profile_dir, port, proxy),
+        LoginProtocol::Bidi => bidi_login_browser_arguments(profile_dir, port),
+    };
+    spawn_login_browser_process(browser, profile_dir, arguments)
+}
+
+fn spawn_login_browser_process(
+    browser: &LoginBrowser,
+    profile_dir: Option<&Path>,
+    arguments: Vec<String>,
+) -> Result<Child> {
+    if let Some(profile_dir) = profile_dir {
+        fs::create_dir_all(profile_dir).map_err(|error| {
+            format!(
+                "cannot create login browser profile `{}`: {error}",
+                profile_dir.display()
+            )
+        })?;
     }
+    Command::new(&browser.executable)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            HelperError::helper_failure(format!(
+                "cannot start login browser `{}`: {error}",
+                browser.executable.display()
+            ))
+        })
 }
 
 fn cdp_login_browser_arguments(
@@ -1391,61 +1453,40 @@ fn cdp_login_browser_arguments(
     arguments
 }
 
-fn spawn_cdp_login_browser(
-    browser: &LoginBrowser,
-    profile_dir: Option<&Path>,
-    port: u16,
-    proxy: Option<&str>,
-) -> Result<Child> {
-    let mut command = Command::new(&browser.executable);
-    if let Some(profile_dir) = profile_dir {
-        fs::create_dir_all(profile_dir).map_err(|error| {
-            format!(
-                "cannot create login browser profile `{}`: {error}",
-                profile_dir.display()
-            )
-        })?;
-    }
-    command.args(cdp_login_browser_arguments(profile_dir, port, proxy));
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| {
-            HelperError::helper_failure(format!(
-                "cannot start login browser `{}`: {error}",
-                browser.executable.display()
-            ))
-        })
+fn profile_login_browser_arguments(profile_dir: &Path) -> Vec<String> {
+    vec![
+        "--profile".to_string(),
+        profile_dir.display().to_string(),
+        "--no-remote".to_string(),
+        "--new-window".to_string(),
+        YTM_ORIGIN.to_string(),
+    ]
 }
 
-fn spawn_bidi_login_browser(
-    browser: &LoginBrowser,
-    profile_dir: Option<&Path>,
-    port: u16,
-) -> Result<Child> {
-    let mut command = Command::new(&browser.executable);
-    if let Some(profile_dir) = profile_dir {
-        fs::create_dir_all(profile_dir).map_err(|error| {
-            format!(
-                "cannot create login browser profile `{}`: {error}",
-                profile_dir.display()
-            )
-        })?;
+fn wait_for_profile_login_browser_exit(child: &mut Child, timeout: Duration) -> Result<()> {
+    let started = SystemTime::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(HelperError::helper_failure(format!(
+                    "login profile browser exited with status {status}"
+                )));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(HelperError::helper_failure(format!(
+                    "cannot wait for login profile browser: {error}"
+                )));
+            }
+        }
+        if started.elapsed().unwrap_or_default() >= timeout {
+            return Err(HelperError::auth_required(
+                "finish signing in to music.youtube.com, close the isolated browser, and run login preparation again",
+            ));
+        }
+        sleep(Duration::from_millis(200));
     }
-    command
-        .args(bidi_login_browser_arguments(profile_dir, port))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| {
-            HelperError::helper_failure(format!(
-                "cannot start login browser `{}`: {error}",
-                browser.executable.display()
-            ))
-        })
 }
 
 fn bidi_login_browser_arguments(profile_dir: Option<&Path>, port: u16) -> Vec<String> {

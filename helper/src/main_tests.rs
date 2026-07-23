@@ -350,6 +350,32 @@ fn parses_login_window_command_with_browser_profile_and_timeout() {
 }
 
 #[test]
+fn parses_prepare_login_profile_command() {
+    let options = parse_args([
+        "auth",
+        "prepare-login-profile",
+        "--output",
+        "/tmp/auth.json",
+        "--browser",
+        "firefox",
+        "--profile-dir",
+        "/tmp/profile",
+        "--timeout-secs",
+        "60",
+    ])
+    .unwrap();
+    assert_eq!(
+        options.command,
+        Command::AuthPrepareLoginProfile {
+            output: PathBuf::from("/tmp/auth.json"),
+            browser: Some("firefox".to_string()),
+            profile_dir: Some(PathBuf::from("/tmp/profile")),
+            timeout_secs: 60,
+        }
+    );
+}
+
+#[test]
 fn rejects_unknown_browse_target() {
     let error = parse_args(["browse", "albums"]).unwrap_err();
     assert!(error.contains("unknown browse target"));

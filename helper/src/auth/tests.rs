@@ -218,19 +218,29 @@ fn chrome_uses_automatic_login_profile_by_default() {
 }
 
 #[test]
-fn non_chrome_browsers_use_normal_profile_by_default() {
+fn firefox_family_uses_automatic_login_profiles_by_default() {
     let output = Path::new("/tmp/ytm-radio/auth.json");
 
-    assert_eq!(
-        effective_login_profile_dir(output, &login_browser(BrowserKind::Dia, "dia"), None),
-        None
-    );
     assert_eq!(
         effective_login_profile_dir(
             output,
             &login_browser(BrowserKind::Firefox, "firefox"),
             None
         ),
+        Some(PathBuf::from("/tmp/ytm-radio/login-profile-firefox"))
+    );
+    assert_eq!(
+        effective_login_profile_dir(output, &login_browser(BrowserKind::Zen, "zen"), None),
+        Some(PathBuf::from("/tmp/ytm-radio/login-profile-zen"))
+    );
+}
+
+#[test]
+fn other_non_chrome_browsers_use_normal_profile_by_default() {
+    let output = Path::new("/tmp/ytm-radio/auth.json");
+
+    assert_eq!(
+        effective_login_profile_dir(output, &login_browser(BrowserKind::Dia, "dia"), None),
         None
     );
 }
@@ -277,6 +287,22 @@ fn bidi_login_browser_arguments_include_profile() {
             "--no-remote",
             "--new-window",
             "about:blank"
+        ]
+    );
+}
+
+#[test]
+fn profile_login_browser_arguments_omit_remote_control() {
+    let arguments = profile_login_browser_arguments(Path::new("/tmp/ytm-login-profile"));
+
+    assert_eq!(
+        arguments,
+        vec![
+            "--profile",
+            "/tmp/ytm-login-profile",
+            "--no-remote",
+            "--new-window",
+            "https://music.youtube.com"
         ]
     );
 }

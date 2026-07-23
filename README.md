@@ -324,6 +324,7 @@ The CLI surface is:
 
 ```text
 ytm-radio-helper auth check --auth FILE
+ytm-radio-helper auth prepare-login-profile --output FILE [--browser BROWSER] [--profile-dir DIR] [--timeout-secs N]
 ytm-radio-helper auth login-window --output FILE [--browser BROWSER] [--profile-dir DIR] [--port N] [--timeout-secs N] [--restart-running]
 ytm-radio-helper version
 ytm-radio-helper browse home --auth FILE [--limit N] [--initial-only]
@@ -417,6 +418,14 @@ ytm-radio opens the login browser at `https://music.youtube.com`. Sign in there
 if needed. The helper waits for the logged-in YouTube Music page to expose
 cookies and page context, then writes the auth JSON.
 
+Google may reject credential entry inside a WebDriver-controlled window for a
+fresh Firefox or Zen isolated profile. Run `M-x ytm-radio-prepare-login` once
+in that case. It opens the same isolated profile without remote control. Sign
+in, confirm that YouTube Music has loaded, and close the isolated browser.
+ytm-radio then starts the normal WebDriver BiDi import automatically. The
+normal Firefox or Zen profile is not opened or modified. Repeat this preparation
+only if the isolated profile loses its Google session.
+
 The login browser must be started with a local remote-control endpoint. If you
 opt into the browser's normal profile and that browser is already running
 without the endpoint, ytm-radio asks before restarting it once. Chrome uses a
@@ -467,12 +476,13 @@ you want a specific browser. Use `chrome`, `brave`, `edge`, `chromium`,
 (setq ytm-radio-helper-login-browser "chrome")
 ```
 
-By default, only Chrome uses an isolated profile next to the auth file when no
-explicit profile is configured. With the default auth file, that is
-`~/.ytm-radio/login-profile/`. Other supported browsers, including Dia,
-Firefox, and Zen, use their normal profile. Chrome 136 and newer do not enable
-DevTools for the default Chrome profile. If you want a specific isolated login
-profile for any supported browser, set:
+By default, Chrome, Firefox, and Zen use isolated profiles next to the auth file
+when no explicit profile is configured. With the default auth file, those are
+`~/.ytm-radio/login-profile/`, `~/.ytm-radio/login-profile-firefox/`, and
+`~/.ytm-radio/login-profile-zen/`. Other supported browsers use their normal
+profile. Chrome 136 and newer do not enable DevTools for the default Chrome
+profile. If you want a specific isolated login profile for any supported
+browser, set:
 
 ```elisp
 (setq ytm-radio-helper-login-profile-directory
@@ -482,10 +492,11 @@ profile for any supported browser, set:
 Set `ytm-radio-helper-login-profile-directory` to nil to use the helper's
 browser-specific default behavior.
 
-Firefox and Zen are supported through WebDriver BiDi. If the selected browser
-is already running without the helper's remote control port, close it before
-login or configure an isolated profile directory so ytm-radio can start a
-separate instance.
+Firefox and Zen are supported through WebDriver BiDi. Their automatic isolated
+profiles let ytm-radio start a separate login instance while the normal browser
+is running. The helper closes that separate instance after importing the login
+session. `M-x ytm-radio-prepare-login` initializes a fresh isolated profile in
+ordinary browser mode before the first automated import.
 
 The default local browser remote-control port is `29317`:
 

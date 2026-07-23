@@ -124,6 +124,11 @@ and useful.
 - The browser login window may use Chromium DevTools or WebDriver BiDi for
   Firefox-family browsers, including Firefox and Zen. It must not read browser
   cookie databases directly.
+- Firefox-family login must provide an explicit profile-preparation command
+  that opens the isolated profile without WebDriver, waits for the user to
+  close it, and then imports the prepared session through the normal BiDi path.
+  It must not hide automation from Google or copy session data from a normal
+  browser profile.
 - The helper may be built locally during development or installed as a
   platform-specific release binary. Emacs may download that binary through an
   explicit user command, but it must not silently download executable code while
@@ -131,10 +136,10 @@ and useful.
 - A single optional proxy URL may be applied to helper account requests,
   `yt-dlp` discovery and prefetching, cover image downloads, and mpv playback
   paths. When the helper starts a Chromium-compatible login browser, the proxy
-  is applied to that browser launch. ytm-radio does not rewrite Firefox or Zen
-  profile preferences for WebDriver BiDi login, and it does not alter
-  already-running browser sessions; those paths use browser or system proxy
-  configuration.
+  is applied to that browser launch. Firefox and Zen WebDriver BiDi logins use
+  helper-managed isolated profiles by default so remote-control preferences do
+  not affect normal browser profiles or already-running sessions; those paths
+  use browser or system proxy configuration.
 - Helper stdout must remain machine-readable JSON; diagnostics belong on
   stderr.
 - Helper failures must expose stable error codes and auth/retry metadata rather

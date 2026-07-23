@@ -5,7 +5,7 @@ mod error;
 mod playback;
 mod ytmusic;
 
-use auth::{login_window, AuthConfig};
+use auth::{login_window, prepare_login_profile, AuthConfig};
 use error::HelperError;
 use playback::resolve_stream;
 use serde::Serialize;
@@ -33,6 +33,12 @@ enum Command {
     Help,
     Version,
     AuthCheck,
+    AuthPrepareLoginProfile {
+        output: PathBuf,
+        browser: Option<String>,
+        profile_dir: Option<PathBuf>,
+        timeout_secs: u64,
+    },
     AuthLoginWindow {
         output: PathBuf,
         browser: Option<String>,
@@ -202,6 +208,26 @@ where
                     "configured": true,
                     "source": config.source,
                     "path": path
+                }
+            })
+        }
+        Command::AuthPrepareLoginProfile {
+            output,
+            browser,
+            profile_dir,
+            timeout_secs,
+        } => {
+            let prepared = prepare_login_profile(
+                output,
+                browser.as_deref(),
+                profile_dir.as_deref(),
+                Duration::from_secs(*timeout_secs),
+            )?;
+            json!({
+                "profile": {
+                    "prepared": true,
+                    "browser": prepared.browser,
+                    "path": prepared.path
                 }
             })
         }
@@ -564,6 +590,25 @@ where
     }
 
     let command = match command {
+        Command::AuthPrepareLoginProfile { .. } => {
+            if browse_params.is_some() || initial_only || fresh || mock_data || auth_file.is_some()
+            {
+                return Err("browse options require a browse action".to_string());
+            }
+            if port.is_some() || restart_running || proxy.is_some() {
+                return Err(
+                    "login profile preparation accepts only output, browser, profile, and timeout options"
+                        .to_string(),
+                );
+            }
+            let output = output.ok_or_else(|| "missing --output FILE".to_string())?;
+            Command::AuthPrepareLoginProfile {
+                output,
+                browser,
+                profile_dir,
+                timeout_secs: timeout_secs.unwrap_or(DEFAULT_LOGIN_TIMEOUT_SECS),
+            }
+        }
         Command::AuthLoginWindow { .. } => {
             if browse_params.is_some() || initial_only || fresh || mock_data || auth_file.is_some()
             {
@@ -738,6 +783,12 @@ fn parse_auth_command(args: &mut Vec<String>) -> Result<Command, String> {
     args.remove(0);
     match action.as_str() {
         "check" => Ok(Command::AuthCheck),
+        "prepare-login-profile" => Ok(Command::AuthPrepareLoginProfile {
+            output: PathBuf::new(),
+            browser: None,
+            profile_dir: None,
+            timeout_secs: DEFAULT_LOGIN_TIMEOUT_SECS,
+        }),
         "login-window" => Ok(Command::AuthLoginWindow {
             output: PathBuf::new(),
             browser: None,
@@ -933,6 +984,7 @@ fn usage() -> String {
         "usage:",
         "  ytm-radio-helper version",
         "  ytm-radio-helper auth check --auth FILE",
+        "  ytm-radio-helper auth prepare-login-profile --output FILE [--browser BROWSER] [--profile-dir DIR] [--timeout-secs N]",
         "  ytm-radio-helper auth login-window --output FILE [--browser BROWSER] [--profile-dir DIR] [--port N] [--timeout-secs N] [--restart-running] [--proxy URL]",
         "  ytm-radio-helper browse home --auth FILE [--limit N] [--initial-only] [--fresh]",
         "  ytm-radio-helper browse explore|library|library-songs|library-albums|library-artists|library-playlists|liked --auth FILE [--limit N] [--fresh]",

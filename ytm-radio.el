@@ -249,8 +249,8 @@ WebDriver BiDi."
 (defcustom ytm-radio-helper-login-profile-directory
   nil
   "Optional isolated browser profile directory used for account login.
-When nil, the helper uses browser-specific defaults.  Chrome may use a
-helper-managed non-default profile when its DevTools login flow requires one."
+When nil, the helper uses browser-specific defaults.  Chrome, Firefox, and Zen
+use helper-managed non-default profiles for their remote-control login flows."
   :type '(choice (const :tag "Use helper/browser default profile" nil)
                  directory)
   :group 'ytm-radio)
@@ -1705,6 +1705,17 @@ When FRESH is non-nil, bypass cached helper responses."
             (list "--format" ytm-radio-mpv-ytdl-format))
           (ytm-radio--helper-shared-arguments)))
 
+(defun ytm-radio--helper-login-browser-arguments ()
+  "Return explicitly configured login browser and profile arguments."
+  (append
+   (when (and (stringp ytm-radio-helper-login-profile-directory)
+              (not (string-empty-p ytm-radio-helper-login-profile-directory)))
+     (list "--profile-dir"
+           (expand-file-name ytm-radio-helper-login-profile-directory)))
+   (when (and (stringp ytm-radio-helper-login-browser)
+              (not (string-empty-p ytm-radio-helper-login-browser)))
+     (list "--browser" ytm-radio-helper-login-browser))))
+
 (defun ytm-radio--helper-login-arguments (output &optional restart-running)
   "Return helper arguments for logging in and writing auth to OUTPUT.
 When RESTART-RUNNING is non-nil, ask the helper to restart a running browser
@@ -1722,13 +1733,18 @@ that does not expose DevTools."
      (list "--proxy" proxy))
    (when restart-running
      (list "--restart-running"))
-   (when (and (stringp ytm-radio-helper-login-profile-directory)
-              (not (string-empty-p ytm-radio-helper-login-profile-directory)))
-     (list "--profile-dir"
-           (expand-file-name ytm-radio-helper-login-profile-directory)))
-   (when (and (stringp ytm-radio-helper-login-browser)
-              (not (string-empty-p ytm-radio-helper-login-browser)))
-     (list "--browser" ytm-radio-helper-login-browser))))
+   (ytm-radio--helper-login-browser-arguments)))
+
+(defun ytm-radio--helper-prepare-login-arguments (output)
+  "Return helper arguments for preparing an isolated profile beside OUTPUT."
+  (append
+   (list "auth"
+         "prepare-login-profile"
+         "--output"
+         (expand-file-name output)
+         "--timeout-secs"
+         (number-to-string ytm-radio-helper-login-timeout))
+   (ytm-radio--helper-login-browser-arguments)))
 
 (defun ytm-radio--call-helper-async (arguments success error-callback)
   "Run the external helper with ARGUMENTS asynchronously.
@@ -7251,6 +7267,30 @@ When AFTER-SUCCESS is non-nil, call it after importing auth."
                 "Restart the login browser once to enable import? "))
           (ytm-radio--start-login output t after-success)
         (setq ytm-radio--login-continuation nil)
+        (message "%s" (ytm-radio--helper-error-message diagnostic)))))))
+
+;;;###autoload
+(defun ytm-radio-prepare-login ()
+  "Prepare an isolated Firefox-family profile and import its account session."
+  (interactive)
+  (when (process-live-p ytm-radio--login-process)
+    (user-error "YouTube Music login is already running"))
+  (let ((output (expand-file-name ytm-radio-helper-auth-file)))
+    (message "Sign in to YouTube Music, then close the isolated browser...")
+    (ytm-radio--set-login-status
+     "Sign in, then close the isolated login browser...")
+    (setq
+     ytm-radio--login-process
+     (ytm-radio--call-helper-async
+      (ytm-radio--helper-prepare-login-arguments output)
+      (lambda (_data)
+        (setq ytm-radio--login-process nil)
+        (ytm-radio--set-login-status nil)
+        (message "Login profile prepared; importing account session...")
+        (ytm-radio--start-login output))
+      (lambda (diagnostic)
+        (setq ytm-radio--login-process nil)
+        (ytm-radio--set-login-status nil)
         (message "%s" (ytm-radio--helper-error-message diagnostic)))))))
 
 ;;;###autoload
