@@ -297,7 +297,8 @@ FIELDS are included on both the top-level mutation output and source."
         (ytm-radio-proxy-url nil)
         (ytm-radio-ytdl-raw-options '("cookies-from-browser=chrome"
                                       "proxy=http://127.0.0.1:8888")))
-    (should (equal (ytm-radio--mpv-arguments "sock" "url")
+    (should (equal (ytm-radio--mpv-arguments
+                    "sock" "url" "Song" "/tmp/cover.jpg")
                    '("--cache=yes"
                      "--cache-pause=no"
                      "--demuxer-readahead-secs=60"
@@ -306,6 +307,8 @@ FIELDS are included on both the top-level mutation output and source."
                      "--pause=no"
                      "--really-quiet"
                      "--ytdl-raw-options=cookies-from-browser=chrome,proxy=http://127.0.0.1:8888"
+                     "--force-media-title=Song"
+                     "--cover-art-file=/tmp/cover.jpg"
                      "--no-video"
                      "--input-ipc-server=sock"
                      "url")))))
@@ -317,13 +320,15 @@ FIELDS are included on both the top-level mutation output and source."
         (ytm-radio-mpv-ytdl-format "bestaudio/best")
         (ytm-radio-ytdl-raw-options '("cookies-from-browser=chrome"))
         (ytm-radio-proxy-url "http://127.0.0.1:8888"))
-    (should (equal (ytm-radio--mpv-arguments "sock" "url")
+    (should (equal (ytm-radio--mpv-arguments
+                    "sock" "url" "Song" nil)
                    '("--ytdl-format=bestaudio/best"
                      "--http-proxy=http://127.0.0.1:8888"
                      "--stream-lavf-o-append=http_proxy=http://127.0.0.1:8888"
                      "--pause=no"
                      "--really-quiet"
                      "--ytdl-raw-options=cookies-from-browser=chrome,proxy=http://127.0.0.1:8888"
+                     "--force-media-title=Song"
                      "--no-video"
                      "--input-ipc-server=sock"
                      "url")))))
@@ -355,7 +360,9 @@ FIELDS are included on both the top-level mutation output and source."
                                     "--ytdl-format=worstaudio/best"))
         (ytm-radio-proxy-url nil)
         (ytm-radio-ytdl-raw-options nil))
-    (should (equal (seq-take (ytm-radio--mpv-arguments "sock" "url") 6)
+    (should (equal (seq-take
+                    (ytm-radio--mpv-arguments "sock" "url" "Song" nil)
+                    6)
                    '("--cache=yes"
                      "--demuxer-readahead-secs=60"
                      "--ytdl-format=bestaudio/best"
@@ -372,7 +379,20 @@ FIELDS are included on both the top-level mutation output and source."
         (ytm-radio-ytdl-raw-options nil))
     (should-not
      (member "--ytdl-format=bestaudio/best"
-             (ytm-radio--mpv-arguments "sock" "url")))))
+             (ytm-radio--mpv-arguments "sock" "url" "Song" nil)))))
+
+(ert-deftest ytm-radio-mpv-cover-file-uses-cached-track-thumbnail ()
+  "Expose an existing track thumbnail cache file to mpv."
+  (let ((track (ytm-radio--make-track
+                :id "v1"
+                :title "Song"
+                :thumbnail-url "https://example.com/cover.jpg")))
+    (cl-letf (((symbol-function 'ytm-radio--cover-file)
+               (lambda (url)
+                 (when (equal url "https://example.com/cover.jpg")
+                   "/tmp/cover.jpg"))))
+      (should (equal (ytm-radio--mpv-cover-file track)
+                     "/tmp/cover.jpg")))))
 
 (ert-deftest ytm-radio-playback-url-uses-valid-stream-cache ()
   "Use cached direct stream URLs until they are close to expiry."
@@ -560,6 +580,7 @@ FIELDS are included on both the top-level mutation output and source."
                    :id "b"
                    :title "B"
                    :duration 200
+                   :thumbnail-url "https://example.com/b.jpg"
                    :url "https://music.youtube.com/watch?v=b"))
          (track-c (ytm-radio--make-track
                    :id "c"
@@ -592,6 +613,10 @@ FIELDS are included on both the top-level mutation output and source."
                (lambda (&rest _args) (error "should not start mpv")))
               ((symbol-function 'ytm-radio--mpv-send)
                (lambda (command) (push command commands)))
+              ((symbol-function 'ytm-radio--mpv-cover-file)
+               (lambda (track)
+                 (when (eq track track-b)
+                   "/tmp/b.jpg")))
               ((symbol-function 'ytm-radio--save) #'ignore)
               ((symbol-function 'ytm-radio--render) #'ignore)
               ((symbol-function 'ytm-radio--show-now-playing) #'ignore)
@@ -601,7 +626,10 @@ FIELDS are included on both the top-level mutation output and source."
       (ytm-radio--play-track track-b)
       (should (member '("loadfile"
                         "https://music.youtube.com/watch?v=b"
-                        "replace")
+                        "replace"
+                        -1
+                        ((force-media-title . "B")
+                         (cover-art-files . "/tmp/b.jpg")))
                       commands))
       (should (member '("set_property" "pause" :json-false) commands))
       (should (equal (map-elt ytm-radio--player :current-track) track-b))
@@ -701,7 +729,9 @@ FIELDS are included on both the top-level mutation output and source."
       (should-not (gethash "v1" ytm-radio--stream-url-cache))
       (should (member '("loadfile"
                         "https://music.youtube.com/watch?v=v1"
-                        "replace")
+                        "replace"
+                        -1
+                        ((force-media-title . "Song")))
                       commands))
       (should (member '("set_property" "pause" :json-false) commands))
       (should (eq (map-elt ytm-radio--player :status) 'loading))
@@ -770,7 +800,9 @@ FIELDS are included on both the top-level mutation output and source."
          (file_error . "no audio or video data played")))
       (should (member '("loadfile"
                         "https://music.youtube.com/watch?v=v1"
-                        "replace")
+                        "replace"
+                        -1
+                        ((force-media-title . "Song")))
                       commands))
       (should (eq (map-elt ytm-radio--player :status) 'loading))
       (should (eq (map-elt ytm-radio--player :retry-stage) 'final))

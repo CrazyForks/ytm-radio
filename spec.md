@@ -133,6 +133,12 @@ When ytm-radio reuses an existing mpv IPC process and sends `loadfile`, it must
 also clear mpv's pause state so a previously paused player does not leave the
 newly selected song loaded but silent.
 
+New and reused mpv processes must set `force-media-title` from the current
+track title so MPRIS clients never display a resolved media URL as the title.
+When the track cover already exists in the ytm-radio cache, playback must also
+pass that file through mpv's `cover-art-files` option so MPRIS clients can
+display it without a player-specific integration.
+
 ## Home Continuation
 
 Home continuation tokens are durable state. Cached Home sections without a

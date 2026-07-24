@@ -2660,8 +2660,20 @@ When FRESH is non-nil, bypass cached helper responses."
       (ytm-radio--queue-stream-prefetch track))
     (ytm-radio--start-next-stream-prefetch)))
 
-(defun ytm-radio--mpv-arguments (socket url)
-  "Return mpv arguments for SOCKET and media URL."
+(defun ytm-radio--mpv-media-title (title)
+  "Return TITLE as plain non-empty text suitable for mpv."
+  (when (and (stringp title)
+             (not (string-empty-p title)))
+    (substring-no-properties title)))
+
+(defun ytm-radio--mpv-cover-file (track)
+  "Return TRACK's cached cover file for publishing through mpv."
+  (when-let* ((url (ytm-radio--track-thumbnail-url track))
+              (file (ytm-radio--cover-file url)))
+    (expand-file-name file)))
+
+(defun ytm-radio--mpv-arguments (socket url title cover-file)
+  "Return mpv arguments for SOCKET, media URL, TITLE, and COVER-FILE."
   (append ytm-radio-mpv-network-cache-args
           (delq nil (list (ytm-radio--mpv-ytdl-format-argument)
                           (ytm-radio--mpv-http-proxy-argument)
@@ -2669,6 +2681,11 @@ When FRESH is non-nil, bypass cached helper responses."
                           "--pause=no"))
           ytm-radio-mpv-extra-args
           (delq nil (list (ytm-radio--mpv-raw-options-argument)
+                          (when-let* ((media-title
+                                      (ytm-radio--mpv-media-title title)))
+                            (concat "--force-media-title=" media-title))
+                          (when cover-file
+                            (concat "--cover-art-file=" cover-file))
                           "--no-video"
                           (concat "--input-ipc-server=" socket)
                           url))))
@@ -2775,11 +2792,21 @@ When PRESERVE-RETRY-STAGE is non-nil, retain the current retry stage."
       (ytm-radio--stop-process)
       nil)))
 
-(defun ytm-radio--mpv-load-url (url)
-  "Load URL in the current mpv process and ensure playback is unpaused."
-  (and (ytm-radio--mpv-send (list "loadfile" url "replace"))
-       (ytm-radio--mpv-send
-        (list "set_property" "pause" :json-false))))
+(defun ytm-radio--mpv-load-url (url title cover-file)
+  "Load URL with TITLE and COVER-FILE in mpv, then unpause playback."
+  (let ((options
+         (delq nil
+               (list
+                (when-let* ((media-title (ytm-radio--mpv-media-title title)))
+                  (cons 'force-media-title media-title))
+                (when cover-file
+                  (cons 'cover-art-files cover-file))))))
+    (and (ytm-radio--mpv-send
+          (if options
+              (list "loadfile" url "replace" -1 options)
+            (list "loadfile" url "replace")))
+         (ytm-radio--mpv-send
+          (list "set_property" "pause" :json-false)))))
 
 (defun ytm-radio--load-track-in-current-mpv (track)
   "Load TRACK into the current mpv process when IPC is available."
@@ -2789,7 +2816,10 @@ When PRESERVE-RETRY-STAGE is non-nil, retain the current retry stage."
       (ytm-radio--set-current-track-state
        track 'loading nil playback-url using-stream-cache)
       (ytm-radio--save)
-      (if (ytm-radio--mpv-load-url playback-url)
+      (if (ytm-radio--mpv-load-url
+           playback-url
+           (map-elt track :title)
+           (ytm-radio--mpv-cover-file track))
           (progn
             (ytm-radio--render)
             (ytm-radio--auto-show-now-playing)
@@ -2810,7 +2840,10 @@ When PRESERVE-RETRY-STAGE is non-nil, retain the current retry stage."
         (map-elt ytm-radio--player :position) nil)
   (setq ytm-radio--last-rendered-progress-key nil)
   (if (ytm-radio--mpv-ready-p)
-      (if (ytm-radio--mpv-load-url url)
+      (if (ytm-radio--mpv-load-url
+           url
+           (map-elt track :title)
+           (ytm-radio--mpv-cover-file track))
           (progn
             (ytm-radio--render)
             (ytm-radio--auto-show-now-playing))
@@ -2871,7 +2904,11 @@ When PRESERVE-RETRY-STAGE is non-nil, continue an automatic retry."
                   (ytm-radio--playback-url-choice track))
                  (socket (make-temp-name
                           (file-name-concat temporary-file-directory "ytm-radio-mpv-")))
-                 (args (ytm-radio--mpv-arguments socket playback-url))
+                 (args (ytm-radio--mpv-arguments
+                        socket
+                        playback-url
+                        (map-elt track :title)
+                        (ytm-radio--mpv-cover-file track)))
                  (process (apply #'start-process
                                  "ytm-radio-mpv" nil ytm-radio-mpv-program args)))
       (set-process-sentinel process #'ytm-radio--mpv-sentinel)
