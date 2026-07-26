@@ -42,6 +42,20 @@
                 "  ytm-radio-helper\n")
       (insert ytm-radio-test--helper-download-content))))
 
+(defun ytm-radio-test--contract-helper ()
+  "Return the in-repository debug helper when it is executable."
+  (and (file-executable-p ytm-radio--default-helper-command)
+       ytm-radio--default-helper-command))
+
+(defun ytm-radio-test--contract-helper-envelope (arguments)
+  "Run the debug helper with ARGUMENTS and return (EXIT-CODE . ENVELOPE).
+Helper stderr is discarded so stdout stays machine-readable."
+  (with-temp-buffer
+    (let ((exit-code (apply #'call-process
+                            (ytm-radio-test--contract-helper)
+                            nil (list t nil) nil arguments)))
+      (cons exit-code (ytm-radio--parse-json-buffer (current-buffer))))))
+
 (defun ytm-radio-test--detail-helper-source
     (browse-id kind title &rest fields)
   "Return a raw helper detail source for BROWSE-ID, KIND, and TITLE.
@@ -6511,6 +6525,60 @@ STRING-PIXEL-WIDTH replaces `string-pixel-width' during rendering."
       (helper-version . "0.0.0")
       (data . ((sources . nil)))))
    :type 'user-error))
+
+(ert-deftest ytm-radio-helper-version-matches-cargo-manifest ()
+  "Pin `ytm-radio--helper-version' to the helper Cargo manifest version."
+  (let ((manifest (expand-file-name "helper/Cargo.toml" ytm-radio--directory)))
+    (skip-unless (file-readable-p manifest))
+    (with-temp-buffer
+      (insert-file-contents manifest)
+      (goto-char (point-min))
+      (should (re-search-forward "^version = \"\\([^\"]+\\)\"" nil t))
+      (should (equal (match-string 1) ytm-radio--helper-version)))))
+
+(ert-deftest ytm-radio-helper-contract-accepts-mock-browse-envelope ()
+  "Validate a real helper success envelope through the protocol layer."
+  (skip-unless (ytm-radio-test--contract-helper))
+  (pcase-let* ((`(,exit-code . ,envelope)
+                (ytm-radio-test--contract-helper-envelope
+                 '("browse" "home" "--mock" "--limit" "2")))
+               (data (ytm-radio--helper-envelope-data envelope))
+               (sources (ytm-radio--helper-sources data))
+               (source (car sources))
+               (track (car (map-elt source :tracks))))
+    (should (zerop exit-code))
+    (should sources)
+    (should (eq (map-elt source :kind) 'youtube-music-home-section))
+    (should (equal (map-elt track :id) "mock-home-track"))
+    (should (equal (map-elt track :url)
+                   "https://music.youtube.com/watch?v=mock-home-track"))
+    (should (map-elt track :account-auth))))
+
+(ert-deftest ytm-radio-helper-contract-reports-track-status-fields ()
+  "Lock the helper track-status field names consumed by Elisp."
+  (skip-unless (ytm-radio-test--contract-helper))
+  (pcase-let* ((`(,exit-code . ,envelope)
+                (ytm-radio-test--contract-helper-envelope
+                 '("track-status" "abc123_DEF4" "--mock")))
+               (data (ytm-radio--helper-envelope-data envelope)))
+    (should (zerop exit-code))
+    (should (equal (map-elt data 'video-id) "abc123_DEF4"))
+    (should (eq (map-elt data 'in-library) t))
+    (should (equal (map-elt data 'like-status) "like"))))
+
+(ert-deftest ytm-radio-helper-contract-emits-structured-error-envelope ()
+  "Validate a real helper error envelope through the protocol layer."
+  (skip-unless (ytm-radio-test--contract-helper))
+  (with-temp-buffer
+    (let ((exit-code (call-process (ytm-radio-test--contract-helper)
+                                   nil (list t nil) nil
+                                   "browse" "nope")))
+      (should-not (zerop exit-code))
+      (let ((helper-error
+             (ytm-radio--helper-process-error (current-buffer) "fallback")))
+        (should (equal (map-elt helper-error 'code) "invalid-request"))
+        (should-not (map-elt helper-error 'auth-required))
+        (should (stringp (map-elt helper-error 'message)))))))
 
 (ert-deftest ytm-radio-source-from-helper-normalizes-tracks ()
   "Normalize helper sources into durable sources."

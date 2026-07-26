@@ -1233,7 +1233,7 @@ prompting."
     (ytm-radio--doctor-data-line)
     (ytm-radio--doctor-auth-line)
     ""
-    "Set YTM_RADIO_TIMINGS=1 before running Emacs to see helper timings in stderr.")
+    "Run the helper with YTM_RADIO_TIMINGS=1 in a terminal to see timing diagnostics on stderr.")
    "\n"))
 
 (defun ytm-radio--trim-buffer (buffer)
@@ -1773,12 +1773,12 @@ helper error."
     (user-error "Unsupported helper schema %S" (map-elt envelope 'schema)))
   (unless (equal (map-elt envelope 'protocol) ytm-radio--helper-protocol-version)
     (user-error
-     "Unsupported ytm-radio helper protocol %S; install helper %s"
+     "Unsupported ytm-radio helper protocol %S; run M-x ytm-radio-install-helper to install helper %s"
      (map-elt envelope 'protocol)
      ytm-radio--helper-version))
   (unless (equal (map-elt envelope 'helper-version) ytm-radio--helper-version)
     (user-error
-     "Unsupported ytm-radio helper version %S; install helper %s"
+     "Unsupported ytm-radio helper version %S; run M-x ytm-radio-install-helper to install helper %s"
      (map-elt envelope 'helper-version)
      ytm-radio--helper-version))
   (or (map-elt envelope 'data)
@@ -2944,8 +2944,6 @@ When PRESERVE-RETRY-STAGE is non-nil, continue an automatic retry."
                     :noquery t
                     :filter #'ytm-radio--mpv-filter)))
           (process-put ipc 'pending "")
-          (process-put ipc 'request-id 0)
-          (process-put ipc 'callbacks (make-hash-table :test 'eql))
           (setf (map-elt ytm-radio--player :ipc-process) ipc)
           (ytm-radio--mpv-send (list "observe_property" 1 "pause"))
           (ytm-radio--mpv-send (list "observe_property" 2 "core-idle"))

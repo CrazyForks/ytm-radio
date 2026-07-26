@@ -19,6 +19,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check release version consistency
+        shell: bash
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          if [ -z "$tag" ]; then
+            tag="${{ inputs.tag }}"
+          fi
+          version="${tag#v}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' helper/Cargo.toml | head -n 1)"
+          elisp_version="$(sed -n 's/^(defconst ytm-radio--helper-version "\(.*\)"$/\1/p' ytm-radio.el | head -n 1)"
+          echo "tag=$version cargo=$cargo_version elisp=$elisp_version"
+          if [ -z "$version" ] || [ "$version" != "$cargo_version" ] || [ "$version" != "$elisp_version" ]; then
+            echo "Release tag, helper/Cargo.toml version, and ytm-radio--helper-version must all match" >&2
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

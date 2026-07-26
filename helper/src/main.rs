@@ -10,7 +10,7 @@ use error::HelperError;
 use playback::resolve_stream;
 use serde::Serialize;
 use serde_json::json;
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 use serde_json::Value;
 use std::env;
 use std::path::PathBuf;
@@ -260,7 +260,7 @@ where
                 }
             })
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         Command::Browse(target) if options.mock_data => {
             mock_browse(target, options.limit, options.initial_only)
         }
@@ -275,7 +275,7 @@ where
                 proxy,
             )?
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         Command::BrowseId { browse_id, .. } if options.mock_data => {
             mock_browse_id(browse_id, options.limit)
         }
@@ -290,7 +290,7 @@ where
                 proxy,
             )?
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         Command::Continuation { token } if options.mock_data => {
             mock_continuation(token, options.limit)
         }
@@ -298,13 +298,13 @@ where
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             continuation(token, options.limit, &auth, Some(&cache_path), proxy)?
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         Command::Search { query } if options.mock_data => mock_search(query, options.limit),
         Command::Search { query } => {
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             search(query, options.limit, &auth, Some(&cache_path), proxy)?
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         Command::Rate { video_id, rating } if options.mock_data => {
             json!({ "video-id": video_id, "rating": rating })
         }
@@ -312,13 +312,13 @@ where
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             rate(video_id, rating, &auth, Some(&cache_path), proxy)?
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         Command::Radio { video_id } if options.mock_data => mock_radio(video_id, options.limit),
         Command::Radio { video_id } => {
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             radio(video_id, options.limit, &auth, Some(&cache_path), proxy)?
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         Command::PlaylistOptions { video_id } if options.mock_data => {
             mock_playlist_options(video_id)
         }
@@ -326,7 +326,7 @@ where
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             playlist_options(video_id, &auth, Some(&cache_path), proxy)?
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         Command::AddToPlaylist {
             video_id,
             playlist_id,
@@ -340,7 +340,7 @@ where
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             add_to_playlist(video_id, playlist_id, &auth, Some(&cache_path), proxy)?
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         Command::Library { video_id, action } if options.mock_data => {
             json!({
                 "video-id": video_id,
@@ -354,7 +354,7 @@ where
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             library(video_id, action, &auth, Some(&cache_path), proxy)?
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         Command::ItemLibrary {
             browse_id, action, ..
         } if options.mock_data => {
@@ -380,7 +380,7 @@ where
                 proxy,
             )?
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         Command::Subscription {
             browse_id, action, ..
         } if options.mock_data => {
@@ -406,7 +406,7 @@ where
                 proxy,
             )?
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         Command::TrackStatus { video_id } if options.mock_data => {
             json!({ "video-id": video_id, "in-library": true, "like-status": "like" })
         }
@@ -414,7 +414,7 @@ where
             let (auth, cache_path) = load_auth_with_cache_path(&options)?;
             track_status(video_id, &auth, Some(&cache_path), proxy)?
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         Command::Stream { video_id, .. } if options.mock_data => {
             json!({ "url": format!("https://media.example/{video_id}") })
         }
@@ -497,9 +497,9 @@ where
 
     let mut auth_file = None;
     let mut limit = 100;
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     let mut mock_data = false;
-    #[cfg(not(test))]
+    #[cfg(not(any(test, debug_assertions)))]
     let mock_data = false;
     let mut browser = None;
     let mut output = None;
@@ -526,7 +526,7 @@ where
                     return Err("limit must be greater than zero".to_string());
                 }
             }
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             "--mock" => mock_data = true,
             "--browser" => browser = Some(option_value(&args, &mut index)?.to_string()),
             "--output" => output = Some(PathBuf::from(option_value(&args, &mut index)?)),
@@ -1007,7 +1007,7 @@ fn usage() -> String {
     .join("\n")
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn mock_browse(target: &BrowseTarget, limit: usize, initial_only: bool) -> Value {
     if matches!(target, BrowseTarget::Home) {
         return mock_home_browse(limit, initial_only);
@@ -1104,7 +1104,7 @@ fn mock_browse(target: &BrowseTarget, limit: usize, initial_only: bool) -> Value
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn mock_search(query: &str, limit: usize) -> Value {
     let items = vec![
         json!({
@@ -1170,7 +1170,7 @@ fn mock_search(query: &str, limit: usize) -> Value {
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn mock_radio(video_id: &str, limit: usize) -> Value {
     let items = (0..limit.min(3))
         .map(|index| {
@@ -1205,7 +1205,7 @@ fn mock_radio(video_id: &str, limit: usize) -> Value {
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn mock_playlist_options(_video_id: &str) -> Value {
     json!({
         "title": "Add to playlist",
@@ -1231,7 +1231,7 @@ fn mock_playlist_options(_video_id: &str) -> Value {
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn mock_library_browse(limit: usize) -> Value {
     let songs = mock_browse(&BrowseTarget::LibrarySongs, limit, false)
         .pointer("/sources/0")
@@ -1274,7 +1274,7 @@ fn mock_library_browse(limit: usize) -> Value {
     json!({ "sources": [songs, albums, playlists] })
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn mock_home_browse(limit: usize, initial_only: bool) -> Value {
     let item_limit = limit.clamp(1, 2);
     let mut listen_again = vec![json!({
@@ -1332,7 +1332,7 @@ fn mock_home_browse(limit: usize, initial_only: bool) -> Value {
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn mock_continuation(token: &str, _limit: usize) -> Value {
     if token == "mock-home-more" {
         json!({
@@ -1363,7 +1363,7 @@ fn mock_continuation(token: &str, _limit: usize) -> Value {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn mock_explore_browse(limit: usize) -> Value {
     let item_limit = limit.clamp(1, 2);
     let mut new_releases = vec![json!({
@@ -1416,7 +1416,7 @@ fn mock_explore_browse(limit: usize) -> Value {
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn mock_browse_id(browse_id: &str, limit: usize) -> Value {
     let item_limit = limit.clamp(1, 2);
     let kind = if browse_id.starts_with("MPRE") {

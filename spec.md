@@ -167,3 +167,19 @@ request-shape problems.
 When retried read requests still exhaust all attempts, the helper error must
 include the underlying error source chain and the attempt count so the Emacs
 message can distinguish DNS, proxy, TLS, timeout, and connection failures.
+
+Authenticated stream resolution bounds its yt-dlp subprocess with a hard
+timeout and kills the subprocess when the deadline passes. The timeout error is
+a retryable network error because stream resolution is read-only. No helper
+command may block Emacs-side state indefinitely.
+
+## Helper Version Lockstep
+
+Elisp accepts helper envelopes only when schema, protocol, and the exact helper
+binary version all match its pinned constants. A release is usable only when
+the git tag, `helper/Cargo.toml`, and `ytm-radio--helper-version` agree; the
+release workflow rejects mismatched tags, and the Elisp test suite pins the
+constant to the Cargo manifest. Contract tests run the in-repository debug
+helper against the Elisp protocol layer so field-shape drift fails `make check`
+instead of surfacing at runtime. Release helper builds do not accept the
+internal `--mock` option; it exists only in debug and test builds.

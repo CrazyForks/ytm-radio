@@ -4,10 +4,19 @@ use crate::auth::AuthConfig;
 use crate::error::{HelperError, Result};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Hard ceiling for one yt-dlp stream resolution.
+///
+/// Stream resolution is the only helper request without an inherent network
+/// timeout: reqwest bounds YouTube Music HTTP calls and login has an explicit
+/// deadline, but a stalled yt-dlp subprocess would otherwise hang the Emacs
+/// playback state machine indefinitely.
+const YT_DLP_TIMEOUT_SECS: u64 = 120;
 
 pub fn resolve_stream(
     video_id: &str,
@@ -31,13 +40,17 @@ pub fn resolve_stream(
     command
         .arg("-g")
         .arg(format!("https://music.youtube.com/watch?v={video_id}"))
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
-    let output = command
-        .output()
+    let child = command
+        .spawn()
         .map_err(|error| HelperError::helper_failure(format!("cannot start yt-dlp: {error}")))?;
+    let output = wait_with_output_timeout(child, Duration::from_secs(YT_DLP_TIMEOUT_SECS))?;
     if !output.status.success() {
-        let diagnostic = last_diagnostic(&output.stderr);
+        let diagnostic =
+            last_diagnostic(&output.stderr).unwrap_or_else(|| "unknown yt-dlp failure".to_string());
         return Err(HelperError::remote_response(format!(
             "yt-dlp could not resolve the authenticated stream: {diagnostic}"
         )));
@@ -50,14 +63,81 @@ pub fn resolve_stream(
         .ok_or_else(|| HelperError::helper_failure("yt-dlp returned no playable stream URL"))
 }
 
-fn last_diagnostic(stderr: &[u8]) -> String {
+fn last_diagnostic(stderr: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(stderr);
     text.lines()
         .rev()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(|line| line.chars().take(500).collect())
-        .unwrap_or_else(|| "unknown yt-dlp failure".to_string())
+}
+
+/// Wait for CHILD collecting stdout/stderr, killing it after TIMEOUT.
+///
+/// A timeout is reported as a retryable network error: stream resolution is
+/// read-only, so repeating it cannot apply an account action twice, and a
+/// stalled extraction is indistinguishable from a stuck network read.
+fn wait_with_output_timeout(mut child: Child, timeout: Duration) -> Result<Output> {
+    let stdout_reader = spawn_pipe_reader(child.stdout.take());
+    let stderr_reader = spawn_pipe_reader(child.stderr.take());
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = join_pipe_reader(stdout_reader);
+                    let stderr = join_pipe_reader(stderr_reader);
+                    let message = match last_diagnostic(&stderr) {
+                        Some(diagnostic) => format!(
+                            "yt-dlp did not finish within {} seconds: {diagnostic}",
+                            timeout.as_secs()
+                        ),
+                        None => {
+                            format!("yt-dlp did not finish within {} seconds", timeout.as_secs())
+                        }
+                    };
+                    return Err(HelperError::network(message));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_pipe_reader(stdout_reader);
+                let _ = join_pipe_reader(stderr_reader);
+                return Err(HelperError::helper_failure(format!(
+                    "cannot wait for yt-dlp: {error}"
+                )));
+            }
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: join_pipe_reader(stdout_reader),
+        stderr: join_pipe_reader(stderr_reader),
+    })
+}
+
+fn spawn_pipe_reader<R>(pipe: Option<R>) -> Option<thread::JoinHandle<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    pipe.map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = pipe.read_to_end(&mut buffer);
+            buffer
+        })
+    })
+}
+
+fn join_pipe_reader(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default()
 }
 
 struct TemporaryCookieFile {

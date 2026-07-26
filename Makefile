@@ -5,7 +5,9 @@ COMPAT_PATH ?= $(HOME)/.emacs.d/straight/repos/compat
 
 .PHONY: check compile test checkdoc package-lint helper-check helper-test clean
 
-check: compile test checkdoc package-lint helper-check
+# helper-check runs before test so the Elisp helper-contract tests find a
+# freshly built debug helper instead of skipping.
+check: compile helper-check test checkdoc package-lint
 
 compile:
 	$(EMACS) -Q --batch -L . -f batch-byte-compile ytm-radio.el test/ytm-radio-test.el
