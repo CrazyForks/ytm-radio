@@ -70,3 +70,11 @@ pipe-holding descendants. The release workflow also built whatever ref
 triggered it while uploading assets to the requested tag; both jobs now
 check out the tag they publish, so the version-consistency gate inspects the
 same commit the binaries are built from.
+
+Deliberately deferred: Windows has no process-group kill, so a descendant
+spawned by yt-dlp can outlive a timeout there. The helper itself still
+cannot block past its deadlines on any platform, the residue is an orphan
+process under the user's own account, and full tree cleanup would require
+Job Object FFI that this project cannot test because CI only runs helper
+tests on Linux. Revisit if a real Windows user base appears or CI gains a
+Windows test lane.
