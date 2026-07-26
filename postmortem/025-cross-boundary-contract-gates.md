@@ -58,3 +58,15 @@ together, or `make check` and the release workflow fail loudly. Renaming a
 helper output field fails the Elisp contract tests instead of surfacing as a
 runtime rendering bug. A wedged yt-dlp resolves into a structured retryable
 error within the deadline instead of a permanent `loading` state.
+
+## Follow-up
+
+External review found two gaps in this change. Killing only the direct
+yt-dlp process left descendants holding the output pipes, so the reader
+threads could still block past the deadline; yt-dlp now runs in its own Unix
+process group, the deadline kills the whole group, and pipe draining is
+time-bounded on every platform, with regression tests that spawn
+pipe-holding descendants. The release workflow also built whatever ref
+triggered it while uploading assets to the requested tag; both jobs now
+check out the tag they publish, so the version-consistency gate inspects the
+same commit the binaries are built from.

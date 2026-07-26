@@ -17,7 +17,12 @@ jobs:
     name: helper quality
     runs-on: ubuntu-24.04
     steps:
+      # Build exactly the tagged commit: a workflow_dispatch run otherwise
+      # checks out the triggering branch while uploading to the requested
+      # tag, which could overwrite release assets with mismatched binaries.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Check release version consistency
         shell: bash
@@ -75,6 +80,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:

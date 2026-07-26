@@ -1433,6 +1433,7 @@ dependencies = [
 name = "ytm-radio-helper"
 version = "0.1.10"
 dependencies = [
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
